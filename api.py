@@ -19,6 +19,8 @@ from langgraph.types import Command
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
+from config import make_agent_config
+
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
@@ -48,6 +50,8 @@ class Session:
     slack_message_ts: Optional[str] = None
     slack_channel: Optional[str] = None  # channel to post responses back to
     slack_thread_ts: Optional[str] = None  # thread to reply in
+    pending_hitl_actor: Optional[str] = None      # set on click, cleared on finalize
+    pending_hitl_approved: Optional[bool] = None  # set on click, cleared on finalize
     event_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
 
 
@@ -68,8 +72,27 @@ def _get_session(session_id: str) -> Session:
 # Agent runner helpers (run in thread pool to avoid blocking event loop)
 # ---------------------------------------------------------------------------
 
+def _finalize_hitl_message(session: Session, result_text: str = ""):
+    """If a HITL click was registered on this session, swap the 'processing' Slack
+    message for the final verdict and clear the pending state."""
+    if not (_notifier and session.slack_message_ts and session.pending_hitl_actor is not None):
+        return
+    _notifier.update_hitl_resolved(
+        session.slack_message_ts,
+        approved=bool(session.pending_hitl_approved),
+        actor=session.pending_hitl_actor,
+        result=result_text,
+    )
+    session.pending_hitl_actor = None
+    session.pending_hitl_approved = None
+    session.slack_message_ts = None
+
+
 def _handle_result(result: dict, session: Session, loop):
     """Process an agent result — put events on the session queue and send Slack msgs."""
+    # Resolve any in-flight HITL message before posting a new one
+    _finalize_hitl_message(session)
+
     interrupts = result.get("__interrupt__", [])
 
     if interrupts:
@@ -152,7 +175,7 @@ def _do_approve(session: Session, loop):
     """Approve a HITL interrupt — usable from both API handlers and Slack Bolt threads."""
     session.status = SessionStatus.RUNNING
     session.event_queue = asyncio.Queue()
-    config = {"configurable": {"thread_id": session.thread_id}}
+    config = make_agent_config(session.thread_id)
     loop.run_in_executor(
         _executor,
         _resume_agent_sync,
@@ -168,7 +191,7 @@ def _do_reject(session: Session, reason: str, loop):
     """Reject a HITL interrupt — usable from both API handlers and Slack Bolt threads."""
     session.status = SessionStatus.RUNNING
     session.event_queue = asyncio.Queue()
-    config = {"configurable": {"thread_id": session.thread_id}}
+    config = make_agent_config(session.thread_id)
     loop.run_in_executor(
         _executor,
         _resume_agent_sync,
@@ -261,7 +284,7 @@ def _run_for_slack(text: str, session: Session, client, channel: str, thread_ts:
         text=":hourglass_flowing_sand: Working on it...",
     )
     try:
-        config = {"configurable": {"thread_id": session.thread_id}}
+        config = make_agent_config(session.thread_id)
         result = _agent.invoke({"messages": [{"role": "user", "content": text}]}, config=config)
         _post_agent_result_to_slack(result, session, client, channel, thread_ts, thinking["ts"])
     except Exception as e:
@@ -284,12 +307,14 @@ def _resume_for_slack(command, session: Session, client):
         text=":hourglass_flowing_sand: Continuing...",
     )
     try:
-        config = {"configurable": {"thread_id": session.thread_id}}
+        config = make_agent_config(session.thread_id)
         result = _agent.invoke(command, config=config)
+        _finalize_hitl_message(session)
         _post_agent_result_to_slack(result, session, client, channel, thread_ts, thinking["ts"])
     except Exception as e:
         session.status = SessionStatus.ERROR
         log.exception("Slack resume error (session=%s)", session.id)
+        _finalize_hitl_message(session, result_text=f"Error: {e}")
         client.chat_update(channel=channel, ts=thinking["ts"], text=f":red_circle: Error: {e}")
 
 
@@ -381,9 +406,9 @@ def _start_slack_bolt(main_loop: asyncio.AbstractEventLoop):
                 return
 
             if _notifier and session.slack_message_ts:
-                _notifier.update_hitl_resolved(
-                    session.slack_message_ts, approved=True, actor=actor
-                )
+                _notifier.mark_hitl_processing(session.slack_message_ts, actor, "Approval")
+            session.pending_hitl_actor = actor
+            session.pending_hitl_approved = True
 
             if session.source == "slack":
                 session.status = SessionStatus.RUNNING
@@ -412,9 +437,9 @@ def _start_slack_bolt(main_loop: asyncio.AbstractEventLoop):
 
             reason = ""
             if _notifier and session.slack_message_ts:
-                _notifier.update_hitl_resolved(
-                    session.slack_message_ts, approved=False, actor=actor
-                )
+                _notifier.mark_hitl_processing(session.slack_message_ts, actor, "Rejection")
+            session.pending_hitl_actor = actor
+            session.pending_hitl_approved = False
 
             if session.source == "slack":
                 session.status = SessionStatus.RUNNING
@@ -546,7 +571,7 @@ async def chat(req: ChatRequest):
         _run_agent_sync,
         _agent,
         [{"role": "user", "content": req.message}],
-        {"configurable": {"thread_id": session.thread_id}},
+        make_agent_config(session.thread_id),
         session,
         loop,
     )
@@ -591,6 +616,10 @@ async def approve(req: ApproveRequest):
     session = _get_session(req.session_id)
     if session.status != SessionStatus.INTERRUPTED:
         raise HTTPException(409, f"Session not interrupted (status={session.status})")
+    if _notifier and session.slack_message_ts:
+        _notifier.mark_hitl_processing(session.slack_message_ts, "api-user", "Approval")
+    session.pending_hitl_actor = "api-user"
+    session.pending_hitl_approved = True
     _do_approve(session, asyncio.get_event_loop())
     return {"session_id": session.id, "status": "running"}
 
@@ -602,7 +631,9 @@ async def reject(req: RejectRequest):
     if session.status != SessionStatus.INTERRUPTED:
         raise HTTPException(409, f"Session not interrupted (status={session.status})")
     if _notifier and session.slack_message_ts:
-        _notifier.update_hitl_resolved(session.slack_message_ts, approved=False, result=req.reason)
+        _notifier.mark_hitl_processing(session.slack_message_ts, "api-user", "Rejection")
+    session.pending_hitl_actor = "api-user"
+    session.pending_hitl_approved = False
     _do_reject(session, req.reason, asyncio.get_event_loop())
     return {"session_id": session.id, "status": "running"}
 
@@ -621,7 +652,7 @@ async def edit(req: EditRequest):
         _resume_agent_sync,
         _agent,
         Command(resume={"decisions": [{"type": "edit", "args": req.args}] * session.pending_decisions}),
-        {"configurable": {"thread_id": session.thread_id}},
+        make_agent_config(session.thread_id),
         session,
         loop,
     )

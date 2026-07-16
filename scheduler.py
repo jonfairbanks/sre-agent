@@ -233,7 +233,7 @@ def _analyse_with_haiku(snapshot: str) -> "HealthReport":
 
     response = client.messages.create(
         model="claude-haiku-4-5-20251001",
-        max_tokens=1200,
+        max_tokens=4096,
         system=system,
         tools=[tool],
         tool_choice={"type": "tool", "name": "report_health"},
@@ -245,19 +245,40 @@ def _analyse_with_haiku(snapshot: str) -> "HealthReport":
         ],
     )
 
+    stop_reason = getattr(response, "stop_reason", None)
     tool_input = next(
         (block.input for block in response.content if getattr(block, "type", None) == "tool_use"),
         None,
     )
+
     if tool_input is None:
-        # Model failed to call the tool — surface a safe degraded report.
+        # Forced tool_choice should guarantee a tool_use block, so its absence almost
+        # always means the model ran out of output tokens before finishing the call.
+        # Log the shape (block types + stop_reason — never the snapshot/secrets) so
+        # this is diagnosable, and surface a clearly-labelled degraded report.
+        block_types = [getattr(b, "type", "?") for b in response.content]
+        log.error(
+            "Haiku returned no tool_use block (stop_reason=%s, blocks=%s)",
+            stop_reason, block_types,
+        )
+        hint = " (analysis hit the output token limit)" if stop_reason == "max_tokens" else ""
         return HealthReport(
             overall_severity="warning",
-            summary="Health analysis returned no structured output; review the cluster manually.",
+            summary=f"Health analysis did not return a structured result{hint}; review the cluster manually.",
             findings=[],
             recommended_actions=[],
         )
-    return HealthReport.model_validate(tool_input)
+
+    try:
+        return HealthReport.model_validate(tool_input)
+    except Exception as e:
+        log.error("Failed to validate HealthReport from Haiku (stop_reason=%s): %s", stop_reason, e)
+        return HealthReport(
+            overall_severity="warning",
+            summary="Health analysis returned a malformed result; review the cluster manually.",
+            findings=[],
+            recommended_actions=[],
+        )
 
 
 # ---------------------------------------------------------------------------

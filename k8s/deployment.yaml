@@ -35,11 +35,6 @@ spec:
                 secretKeyRef:
                   name: sre-agent-secrets
                   key: ANTHROPIC_API_KEY
-            - name: LANGSMITH_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: sre-agent-secrets
-                  key: LANGSMITH_API_KEY
             - name: SLACK_BOT_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -50,33 +45,19 @@ spec:
                 secretKeyRef:
                   name: sre-agent-secrets
                   key: SLACK_APP_TOKEN
-            - name: LANGSMITH_PROJECT
-              value: "sre-agent"
             - name: LANGSMITH_TRACING
               value: "true"
-            - name: LANGSMITH_ENDPOINT
-              value: "https://api.smith.langchain.com"
-            - name: LANGSMITH_WORKSPACE
-              valueFrom:
-                secretKeyRef:
-                  name: sre-agent-secrets
-                  key: LANGSMITH_WORKSPACE_ID
-            - name: LANGSMITH_WORKSPACE_ID
-              valueFrom:
-                secretKeyRef:
-                  name: sre-agent-secrets
-                  key: LANGSMITH_WORKSPACE_ID
             - name: LANGCHAIN_TRACING_V2
               value: "true"
+            - name: LANGSMITH_PROJECT
+              value: "sre-agent"
             - name: LANGCHAIN_PROJECT
               value: "sre-agent"
-            - name: LANGCHAIN_ENDPOINT
-              value: "https://api.smith.langchain.com"
-            - name: LANGCHAIN_API_KEY
+            - name: LANGSMITH_RUNS_ENDPOINTS
               valueFrom:
                 secretKeyRef:
                   name: sre-agent-secrets
-                  key: LANGSMITH_API_KEY
+                  key: LANGSMITH_RUNS_ENDPOINTS
             - name: SLACK_CHANNEL
               value: "#sre_alerts"
             - name: MONITOR_INTERVAL_MINUTES

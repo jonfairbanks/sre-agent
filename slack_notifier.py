@@ -103,14 +103,15 @@ class SlackNotifier:
         def _trunc(s: str, n: int) -> str:
             return s[:n] + "\n_(truncated)_" if len(s) > n else s
 
-        attachments = [{
-            "color": "#e53e3e" if has_critical else "#d69e2e" if has_issues else "#38a169",
-            "blocks": [
-                {"type": "header", "text": {"type": "plain_text", "text": f"{emoji}  {title}"}},
-                {"type": "section", "text": {"type": "mrkdwn", "text": _trunc(report.summary, 2700)}},
-            ],
-        }]
+        # Header + summary go in top-level blocks. When top-level `blocks` are set,
+        # Slack uses `text` only as the notification fallback (not rendered in-body),
+        # which avoids the title showing twice (once as text, once as the header).
+        blocks = [
+            {"type": "header", "text": {"type": "plain_text", "text": f"{emoji}  {title}"}},
+            {"type": "section", "text": {"type": "mrkdwn", "text": _trunc(report.summary, 2700)}},
+        ]
 
+        attachments = []
         # One attachment per severity group, in priority order.
         for sev in ("critical", "warning", "info"):
             group = [f for f in report.findings if f.severity == sev]
@@ -152,6 +153,7 @@ class SlackNotifier:
             resp = self._client.chat_postMessage(
                 channel=self.channel,
                 text=f"{emoji} {title}",
+                blocks=blocks,
                 attachments=attachments,
             )
             return resp["ts"]
