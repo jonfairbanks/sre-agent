@@ -281,6 +281,22 @@ def _analyse_with_haiku(snapshot: str) -> "HealthReport":
         )
 
 
+def run_structured_health_check() -> tuple["HealthReport", dict]:
+    """Run the bounded, deterministic health check and return (report, raw_data).
+
+    This is the canonical health-check implementation shared by the scheduler
+    and the interactive Slack path: zero-token data collection via the
+    kubernetes client, then a *single* forced-tool Haiku call. It performs a
+    fixed number of steps and therefore can never hit the agent's recursion
+    limit — unlike routing a "health check" request through the full Deep
+    Agents orchestrator.
+    """
+    data = _collect_cluster_data()
+    snapshot = _format_snapshot(data)
+    report = _analyse_with_haiku(snapshot)
+    return report, data
+
+
 # ---------------------------------------------------------------------------
 # Scheduler
 # ---------------------------------------------------------------------------
@@ -339,9 +355,7 @@ class MonitoringScheduler:
     def _do_check(self, session_id: str):
         """Synchronous: collect data + one Haiku call. Runs in thread pool."""
         try:
-            data = _collect_cluster_data()
-            snapshot = _format_snapshot(data)
-            report = _analyse_with_haiku(snapshot)
+            report, data = run_structured_health_check()
 
             log.info(
                 "Health check complete (session=%s, severity=%s, findings=%d, unhealthy_pods=%d)",

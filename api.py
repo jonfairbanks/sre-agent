@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -25,6 +26,19 @@ load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("sre-agent")
+
+# A "health check / audit" request is served by the bounded, single-Haiku-call
+# structured path (scheduler.run_structured_health_check), NOT the full Deep
+# Agents orchestrator — the orchestrator fans out to subagents and can blow past
+# the langgraph recursion limit. Anything not matching this falls through to the
+# agent as normal.
+_HEALTH_CHECK_RE = re.compile(
+    r"\b(health\s*[-]?\s*(check|audit|report|status)"
+    r"|(cluster|cluster's)\s+health"
+    r"|audit\s+(the\s+)?cluster"
+    r"|(is|how'?s)\s+(the\s+)?cluster\s+(health|healthy|doing))\b",
+    re.IGNORECASE,
+)
 
 # ---------------------------------------------------------------------------
 # Session state
@@ -293,6 +307,47 @@ def _run_for_slack(text: str, session: Session, client, channel: str, thread_ts:
         client.chat_update(channel=channel, ts=thinking["ts"], text=f":red_circle: Error: {e}")
 
 
+def _run_structured_health_check_for_slack(text: str, session: Session, client, channel: str, thread_ts: str):
+    """Serve a health-check mention via the bounded single-Haiku path (no orchestrator).
+
+    This performs a fixed number of steps (zero-token collection + one forced-tool
+    Haiku call) so it can never hit the recursion limit that the full agent does.
+    """
+    thinking = client.chat_postMessage(
+        channel=channel,
+        thread_ts=thread_ts,
+        text=":mag: Running a cluster health check...",
+    )
+    try:
+        from scheduler import run_structured_health_check
+
+        report, data = run_structured_health_check()
+        log.info(
+            "Slack health check complete (session=%s, severity=%s, findings=%d)",
+            session.id, report.overall_severity, len(report.findings),
+        )
+        if _notifier and _notifier.enabled:
+            _notifier.send_structured_report(
+                report, source="slack", channel=channel, thread_ts=thread_ts,
+            )
+            # The structured report is posted as its own threaded message; drop the
+            # transient placeholder (best-effort — ignore missing chat:write scope).
+            try:
+                client.chat_delete(channel=channel, ts=thinking["ts"])
+            except Exception:
+                client.chat_update(channel=channel, ts=thinking["ts"],
+                                   text=":white_check_mark: Health check complete.")
+        else:
+            client.chat_update(channel=channel, ts=thinking["ts"],
+                               text=report.summary or "(no findings)")
+        session.last_response = report.summary
+        session.status = SessionStatus.DONE
+    except Exception as e:
+        session.status = SessionStatus.ERROR
+        log.exception("Slack health check error (session=%s)", session.id)
+        client.chat_update(channel=channel, ts=thinking["ts"], text=f":red_circle: Error: {e}")
+
+
 def _resume_for_slack(command, session: Session, client):
     """Resume a HITL-interrupted session and post the result back to the original thread."""
     if not _agent:
@@ -378,8 +433,13 @@ def _start_slack_bolt(main_loop: asyncio.AbstractEventLoop):
                 session.slack_thread_ts = thread_ts
 
             log.info("Slack mention from %s: %s", event.get("user"), text[:80])
-            # Submit to executor so this handler returns immediately (prevents Slack retries)
-            _executor.submit(_run_for_slack, text, session, client, channel, thread_ts)
+            # Submit to executor so this handler returns immediately (prevents Slack retries).
+            # Health-check/audit requests use the bounded single-Haiku path so they can
+            # never hit the orchestrator's recursion limit; everything else goes to the agent.
+            if _HEALTH_CHECK_RE.search(text):
+                _executor.submit(_run_structured_health_check_for_slack, text, session, client, channel, thread_ts)
+            else:
+                _executor.submit(_run_for_slack, text, session, client, channel, thread_ts)
 
         @bolt.action("sre_approve")
         def handle_approve(ack, body, client):
