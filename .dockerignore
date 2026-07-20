@@ -1,6 +1,7 @@
 .env
 gcp-pull-key.json
 k8s/secret.yaml
+endpoints.json
 .git
 __pycache__
 *.pyc

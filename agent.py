@@ -3,10 +3,77 @@ from deepagents import create_deep_agent
 from deepagents.backends import FilesystemBackend
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.store.memory import InMemoryStore
+from langchain.agents.middleware import (
+    ModelCallLimitMiddleware,
+    ToolCallLimitMiddleware,
+    wrap_model_call,
+)
 
-from config import MODEL, DEFAULT_NAMESPACES
+from config import (
+    MODEL,
+    DEFAULT_NAMESPACES,
+    PROMPT_CACHING,
+    MODEL_CALL_RUN_LIMIT,
+    MODEL_CALL_THREAD_LIMIT,
+    TOOL_CALL_RUN_LIMIT,
+    FS_TOOL_RUN_LIMIT,
+)
 from tools import READ_TOOLS
 from subagents import ALL_SUBAGENTS
+
+# Read-heavy filesystem tools that caused the original runaway-loop cost
+# incident (agent grep/read_file-ing files in a cycle). Capped tightly below.
+_FS_READ_TOOLS = ("grep", "read_file", "ls", "glob")
+
+
+@wrap_model_call
+def anthropic_prompt_caching(request, handler):
+    """Enable Anthropic prompt caching for every model call.
+
+    Injects ``cache_control={"type": "ephemeral"}`` into the model settings so
+    langchain-anthropic places a cache breakpoint on the last message block.
+    Caching is cumulative from the start of the prompt, so this caches the large
+    static system prompt + tool definitions + prior turns — the parts re-sent on
+    every iteration of the agent loop — instead of re-billing them each call.
+    """
+    settings = {**(request.model_settings or {}), "cache_control": {"type": "ephemeral"}}
+    return handler(request.override(model_settings=settings))
+
+
+def _build_middleware() -> list:
+    """Middleware stack: prompt caching + hard runaway-loop / cost limits."""
+    middleware: list = []
+
+    if PROMPT_CACHING:
+        middleware.append(anthropic_prompt_caching)
+
+    # Backstop against runaway model spend (per-run and per-thread).
+    middleware.append(
+        ModelCallLimitMiddleware(
+            run_limit=MODEL_CALL_RUN_LIMIT,
+            thread_limit=MODEL_CALL_THREAD_LIMIT,
+            exit_behavior="end",
+        )
+    )
+
+    # Global tool-call cap per run.
+    middleware.append(
+        ToolCallLimitMiddleware(run_limit=TOOL_CALL_RUN_LIMIT, exit_behavior="end")
+    )
+
+    # Tighter per-tool caps on the read-heavy filesystem tools. exit_behavior
+    # "continue" blocks the over-limit tool but lets the agent keep going and
+    # summarise what it has, rather than killing the whole run.
+    for tool_name in _FS_READ_TOOLS:
+        middleware.append(
+            ToolCallLimitMiddleware(
+                tool_name=tool_name,
+                run_limit=FS_TOOL_RUN_LIMIT,
+                exit_behavior="continue",
+            )
+        )
+
+    return middleware
 
 SYSTEM_PROMPT = f"""You are an autonomous SRE (Site Reliability Engineering) bot specializing in Kubernetes.
 
@@ -85,6 +152,7 @@ def create_sre_agent(extra_tools: list | None = None):
         system_prompt=SYSTEM_PROMPT,
         subagents=ALL_SUBAGENTS,
         backend=FilesystemBackend(root_dir=".", virtual_mode=True),
+        middleware=_build_middleware(),
         checkpointer=checkpointer,
         store=store,
     )

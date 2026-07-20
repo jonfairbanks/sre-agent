@@ -70,6 +70,7 @@ from .kubernetes_write import (
     kubectl_rollback_deployment,
     kubectl_apply_custom_resource,
     kubectl_delete_resource,
+    kubectl_delete_custom_resource,
     kubectl_scale_bulk,
     kubectl_delete_resources_bulk,
 )
@@ -148,6 +149,7 @@ WRITE_TOOLS = [
     kubectl_rollback_deployment,
     kubectl_apply_custom_resource,
     kubectl_delete_resource,
+    kubectl_delete_custom_resource,
     kubectl_scale_bulk,
     kubectl_delete_resources_bulk,
     *HELM_WRITE_TOOLS,

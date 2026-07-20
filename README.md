@@ -5,8 +5,11 @@ An autonomous Kubernetes SRE agent. It monitors cluster health, diagnoses issues
 ## Features
 
 - **Autonomous health audits** — pods, scaling, resources, logs, security, reliability, config hygiene, and batch jobs analyzed in parallel by specialized subagents
-- **Human-in-the-loop (HITL)** — every write operation (restart, scale, patch) pauses for explicit approval
-- **Slack integration** — alerts, health reports, and HITL approve/reject buttons via Socket Mode (no public ingress needed)
+- **Human-in-the-loop (HITL)** — every write operation (restart, scale, patch, delete) pauses for explicit approval. Approving or rejecting in Slack confirms the decision inline (who decided, and the outcome) and removes the buttons, so an action can't be double-triggered
+- **Slack integration** — alerts, health reports, and HITL approve/reject buttons via Socket Mode (no public ingress needed). Mention the bot in a channel and it replies in-thread
+- **Fast interactive health checks** — a "run a health check" mention is served by the same bounded path as the scheduler (direct cluster reads + a single structured-output call), so it returns in seconds and can never hit the agent's recursion limit — unlike routing it through the full orchestrator
+- **Custom resource support** — the change-executor can create, update, and delete CRD instances, so it can remove an operator's top-level custom resource (e.g. an `lgps.apps.langchain.ai`) instead of fighting the operator's reconciliation loop
+- **Model gateway support** — route Claude calls through a LangChain/LangSmith model gateway by setting `ANTHROPIC_BASE_URL`; unset, it calls Anthropic directly
 - **Scheduled monitoring** — periodic cluster health checks on a configurable interval. The scheduler collects cluster state directly via the Kubernetes client (no LLM tokens), then makes a single structured-output call to summarize findings
 - **Structured findings** — health analysis returns a typed `HealthReport` (see `schemas.py`) rather than free text, so Slack rendering reads typed fields instead of parsing markdown
 - **Two interfaces** — CLI for interactive use, FastAPI + web UI for in-cluster deployment
@@ -19,6 +22,10 @@ Slack health report showing a cluster audit with critical and warning findings:
 ![Slack health report](docs/slack-health-report.png)
 
 ![Slack health report 2](docs/slack_health_2.png)
+
+HITL approval in Slack — after you approve or reject, the decision is confirmed inline (with who decided) and the buttons are removed so the action can't be re-triggered:
+
+![Slack HITL approval confirmation](docs/confirmation.png)
 
 ## Architecture
 
@@ -63,7 +70,8 @@ python api.py         # API + web UI at http://localhost:8080
 
 | Variable | Required | Description |
 | -------- | -------- | ----------- |
-| `ANTHROPIC_API_KEY` | Yes | Claude API key |
+| `ANTHROPIC_API_KEY` | Yes | Claude API key. When routing through a gateway (see `ANTHROPIC_BASE_URL`), set this to your gateway key |
+| `ANTHROPIC_BASE_URL` | No | Route Claude calls through a model gateway, e.g. `https://gateway.smith.langchain.com/anthropic`; unset = call Anthropic directly |
 | `LANGSMITH_API_KEY` | Yes | LangSmith tracing key |
 | `LANGSMITH_TRACING` | Yes | Set to `true` to enable tracing |
 | `LANGSMITH_PROJECT` | No | Project name (default: `sre-agent`) |
@@ -148,7 +156,9 @@ tools/
   kubernetes_read.py        Read-only kubectl tools
   kubernetes_write.py       Write tools (all require HITL approval), including
                             kubectl_scale_bulk and kubectl_delete_resources_bulk
-                            for batching multiple resources into a single approval
+                            for batching multiple resources into a single approval,
+                            and kubectl_delete_custom_resource for deleting CRD
+                            instances (operator-owned resources)
   kubernetes_security.py    RBAC, pod security, NetworkPolicy, image tag tools
   kubernetes_reliability.py PDB, probe, endpoint, single-replica tools
   kubernetes_hygiene.py     Resource limits, PV, selector mismatch tools

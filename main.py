@@ -128,9 +128,10 @@ def main():
 
     # Import here so env vars are loaded first
     from agent import create_sre_agent
+    from config import make_agent_config
 
     agent = create_sre_agent()
-    config = {"configurable": {"thread_id": "sre-main"}}
+    config = make_agent_config("sre-main")
     session_messages = []
 
     console.print(f"\n[dim]LangSmith project: {os.getenv('LANGSMITH_PROJECT', 'default')}[/dim]")

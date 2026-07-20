@@ -25,6 +25,10 @@ SEVERITY_COLOR = {
 class SlackNotifier:
     def __init__(self, bot_token: str, channel: str):
         self.channel = channel
+        # chat.update requires a channel ID, not a name like "#sre_alerts".
+        # Cached from the first successful post to self.channel (Slack returns the
+        # resolved ID in resp["channel"]) so HITL button updates don't 404.
+        self._channel_id = None
         self._client = None
         if bot_token:
             try:
@@ -73,12 +77,18 @@ class SlackNotifier:
         self,
         report,
         source: str = "scheduled",
+        channel: Optional[str] = None,
+        thread_ts: Optional[str] = None,
     ) -> Optional[str]:
         """Render a typed HealthReport into Slack Block Kit — no text parsing.
 
         `report` is a schemas.HealthReport. Findings are grouped by severity and
         rendered directly from typed fields, which removes the regex-on-markdown
         fragility of send_health_report.
+
+        `channel`/`thread_ts` default to the notifier's channel and no thread
+        (the scheduled path). The interactive Slack path passes them to reply in
+        the originating thread.
         """
         if not self.enabled:
             log.info(
@@ -103,14 +113,15 @@ class SlackNotifier:
         def _trunc(s: str, n: int) -> str:
             return s[:n] + "\n_(truncated)_" if len(s) > n else s
 
-        attachments = [{
-            "color": "#e53e3e" if has_critical else "#d69e2e" if has_issues else "#38a169",
-            "blocks": [
-                {"type": "header", "text": {"type": "plain_text", "text": f"{emoji}  {title}"}},
-                {"type": "section", "text": {"type": "mrkdwn", "text": _trunc(report.summary, 2700)}},
-            ],
-        }]
+        # Header + summary go in top-level blocks. When top-level `blocks` are set,
+        # Slack uses `text` only as the notification fallback (not rendered in-body),
+        # which avoids the title showing twice (once as text, once as the header).
+        blocks = [
+            {"type": "header", "text": {"type": "plain_text", "text": f"{emoji}  {title}"}},
+            {"type": "section", "text": {"type": "mrkdwn", "text": _trunc(report.summary, 2700)}},
+        ]
 
+        attachments = []
         # One attachment per severity group, in priority order.
         for sev in ("critical", "warning", "info"):
             group = [f for f in report.findings if f.severity == sev]
@@ -148,12 +159,18 @@ class SlackNotifier:
             "blocks": [{"type": "context", "elements": [{"type": "mrkdwn", "text": f"Source: {source}"}]}],
         })
 
+        post_kwargs = {
+            "channel": channel or self.channel,
+            "text": f"{emoji} {title}",
+            "blocks": blocks,
+            "attachments": attachments,
+        }
+        if thread_ts:
+            post_kwargs["thread_ts"] = thread_ts
         try:
-            resp = self._client.chat_postMessage(
-                channel=self.channel,
-                text=f"{emoji} {title}",
-                attachments=attachments,
-            )
+            resp = self._client.chat_postMessage(**post_kwargs)
+            if not channel:  # posted to the default channel — cache its resolved ID
+                self._channel_id = resp.get("channel") or self._channel_id
             return resp["ts"]
         except Exception as e:
             log.error("Slack post failed: %s", e)
@@ -322,19 +339,26 @@ class SlackNotifier:
         if not self.enabled or not message_ts:
             return
         try:
+            # The buttons live in an attachment (see _post). chat.update leaves
+            # omitted fields intact, so we must REPLACE `attachments` (not just set
+            # top-level blocks) to actually remove the buttons.
             self._client.chat_update(
-                channel=self.channel,
+                channel=self._channel_id or self.channel,
                 ts=message_ts,
-                blocks=[
-                    {
-                        "type": "section",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": f":hourglass_flowing_sand: *{action} from* `{actor}` *received — processing…*",
-                        },
-                    },
-                ],
                 text=f":hourglass_flowing_sand: {action} processing",
+                blocks=[],
+                attachments=[{
+                    "color": "#d69e2e",
+                    "blocks": [
+                        {
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": f":hourglass_flowing_sand: *{action} from* `{actor}` *received — processing…*",
+                            },
+                        },
+                    ],
+                }],
             )
         except Exception as e:
             log.warning("Failed to mark HITL processing: %s", e)
@@ -357,20 +381,26 @@ class SlackNotifier:
                 [{"type": "section", "text": {"type": "mrkdwn", "text": f"Result: {result[:500]}"}}]
                 if result else []
             )
+            # Replace the attachment (which holds the buttons) so they're removed;
+            # setting only top-level blocks would leave the buttoned attachment intact.
             self._client.chat_update(
-                channel=self.channel,
+                channel=self._channel_id or self.channel,
                 ts=message_ts,
-                blocks=[
-                    {
-                        "type": "section",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": f"{emoji} *Change {verdict}*{by_text}",
-                        },
-                    },
-                    *result_section,
-                ],
                 text=f"{emoji} Change {verdict}",
+                blocks=[],
+                attachments=[{
+                    "color": "#2f855a" if approved else "#c53030",
+                    "blocks": [
+                        {
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": f"{emoji} *Change {verdict}*{by_text}",
+                            },
+                        },
+                        *result_section,
+                    ],
+                }],
             )
         except Exception as e:
             log.warning("Failed to update HITL message: %s", e)
@@ -392,6 +422,7 @@ class SlackNotifier:
                 text=text,
                 attachments=[{"color": color, "blocks": blocks}],
             )
+            self._channel_id = resp.get("channel") or self._channel_id
             return resp["ts"]
         except Exception as e:
             log.error("Slack post failed: %s", e)
