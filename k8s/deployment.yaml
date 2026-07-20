@@ -35,6 +35,16 @@ spec:
                 secretKeyRef:
                   name: sre-agent-secrets
                   key: ANTHROPIC_API_KEY
+            - name: LC_GATEWAY_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: sre-agent-secrets
+                  key: LC_GATEWAY_KEY
+            - name: ANTHROPIC_BASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: sre-agent-secrets
+                  key: ANTHROPIC_BASE_URL
             - name: SLACK_BOT_TOKEN
               valueFrom:
                 secretKeyRef:
