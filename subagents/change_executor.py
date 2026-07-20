@@ -7,10 +7,12 @@ from tools import (
     kubectl_get_hpa,
     kubectl_top_pods,
     kubectl_describe_deployment,
+    kubectl_get_custom_resources,
     # Write tools — ALL require HITL approval
     kubectl_scale_deployment,
     kubectl_scale_bulk,
     kubectl_delete_resources_bulk,
+    kubectl_delete_custom_resource,
     kubectl_patch_resource_limits,
     kubectl_patch_hpa,
     kubectl_delete_pod,
@@ -25,6 +27,7 @@ CHANGE_EXECUTOR_INTERRUPT_ON = {
     "kubectl_scale_deployment": True,
     "kubectl_scale_bulk": True,
     "kubectl_delete_resources_bulk": True,
+    "kubectl_delete_custom_resource": True,
     "kubectl_patch_resource_limits": True,
     "kubectl_patch_hpa": True,
     "kubectl_delete_pod": True,
@@ -54,6 +57,14 @@ change_executor_subagent = {
         "Do NOT split by resource type — one call, one approval for the entire batch.\n"
         "NEVER call kubectl_delete_resources_bulk or kubectl_scale_bulk more than once "
         "for the same user request.\n\n"
+        "## Operator-managed / custom resources\n"
+        "If resources keep getting recreated after you delete them, or they have "
+        "ownerReferences to a custom resource, an operator is reconciling them. Deleting "
+        "the child Deployments/Pods is futile — delete the OWNING custom resource instead "
+        "with kubectl_delete_custom_resource (or a resource_type:'custom' entry in "
+        "kubectl_delete_resources_bulk), which stops reconciliation and cascade-deletes "
+        "children via ownerReferences. Use kubectl_get_custom_resources / kubectl_get_crds "
+        "(from the main agent) to find the CR's group, version, and plural.\n\n"
         "## Single changes\n"
         "For individual changes:\n"
         "1. BEFORE: read current state (describe the resource to be modified)\n"
@@ -75,10 +86,12 @@ change_executor_subagent = {
         kubectl_get_hpa,
         kubectl_top_pods,
         kubectl_describe_deployment,
+        kubectl_get_custom_resources,
         # Write tools (all require HITL)
         kubectl_scale_deployment,
         kubectl_scale_bulk,
         kubectl_delete_resources_bulk,
+        kubectl_delete_custom_resource,
         kubectl_patch_resource_limits,
         kubectl_patch_hpa,
         kubectl_delete_pod,

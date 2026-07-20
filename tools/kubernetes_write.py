@@ -465,9 +465,45 @@ def kubectl_delete_resource(
             return (
                 f"ERROR: unsupported resource_type '{resource_type}'. "
                 f"Supported: deployment, statefulset, daemonset, service, configmap, "
-                f"ingress, hpa, replicaset."
+                f"ingress, hpa, replicaset. "
+                f"For CRD instances use kubectl_delete_custom_resource."
             )
         return f"Deleted {resource_type}/{resource_name} in {namespace}."
+    return _safe(_run)
+
+
+@tool
+def kubectl_delete_custom_resource(
+    group: str,
+    version: str,
+    plural: str,
+    name: str,
+    namespace: str = "",
+) -> str:
+    """
+    Delete a CustomResource instance (CRD instance).
+
+    Use this to remove an operator's custom resource — e.g. deleting the
+    top-level CR that an operator reconciles. Deleting standard resources
+    (Deployments/Pods/etc.) is futile while the owning CR still exists, since
+    the operator recreates them.
+
+    group: API group, e.g. 'langchain.com'
+    version: API version, e.g. 'v1alpha1'
+    plural: plural resource name, e.g. 'langgraphplatforms'
+    name: resource name
+    namespace: leave empty for cluster-scoped CRDs
+    Use kubectl_get_crds / kubectl_get_custom_resources to discover coordinates.
+    REQUIRES HUMAN APPROVAL before execution.
+    """
+    def _run():
+        if namespace:
+            custom_objects().delete_namespaced_custom_object(
+                group, version, namespace, plural, name
+            )
+            return f"Deleted {plural}.{group}/{version} '{name}' in {namespace}"
+        custom_objects().delete_cluster_custom_object(group, version, plural, name)
+        return f"Deleted cluster-scoped {plural}.{group}/{version} '{name}'"
     return _safe(_run)
 
 
@@ -515,12 +551,15 @@ def kubectl_delete_resources_bulk(targets_json: str) -> str:
     Delete multiple Kubernetes resources in one operation.
     targets_json: JSON array of objects with keys:
       - resource_type (str): deployment, statefulset, daemonset, service, configmap,
-                             ingress, hpa, pvc, pod
+                             ingress, hpa, pvc, pod, or "custom" for a CRD instance
       - resource_name (str)
-      - namespace (str, default "default")
+      - namespace (str, default "default"; empty for cluster-scoped custom resources)
+      - group, version, plural (str): REQUIRED when resource_type is "custom"
     Example:
       '[{"resource_type":"deployment","resource_name":"web","namespace":"prod"},
-        {"resource_type":"pvc","resource_name":"data-0","namespace":"prod"}]'
+        {"resource_type":"pvc","resource_name":"data-0","namespace":"prod"},
+        {"resource_type":"custom","group":"langchain.com","version":"v1alpha1",
+         "plural":"langgraphplatforms","resource_name":"lgp","namespace":"prod"}]'
     REQUIRES HUMAN APPROVAL before execution.
     """
     def _run():
@@ -553,6 +592,27 @@ def kubectl_delete_resources_bulk(targets_json: str) -> str:
                     core_v1().delete_namespaced_persistent_volume_claim(name, ns, body=body)
                 elif rt == "pod":
                     core_v1().delete_namespaced_pod(name, ns, body=body)
+                elif rt == "custom":
+                    group = t.get("group", "")
+                    version = t.get("version", "")
+                    plural = t.get("plural", "")
+                    if not (group and version and plural):
+                        results.append(
+                            f"✗ custom/{name}: requires group, version, and plural"
+                        )
+                        continue
+                    if ns:
+                        custom_objects().delete_namespaced_custom_object(
+                            group, version, ns, plural, name
+                        )
+                    else:
+                        custom_objects().delete_cluster_custom_object(
+                            group, version, plural, name
+                        )
+                    results.append(
+                        f"✓ deleted {plural}.{group}/{name}" + (f" in {ns}" if ns else "")
+                    )
+                    continue
                 else:
                     results.append(f"✗ unsupported resource_type '{rt}'")
                     continue
