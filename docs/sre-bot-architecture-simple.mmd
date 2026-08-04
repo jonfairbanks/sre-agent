@@ -1,0 +1,64 @@
+flowchart LR
+    subgraph entry["Entry points"]
+        CLI["main.py<br/>CLI"]
+        WEB["api.py<br/>Web UI, REST, SSE"]
+        BOLT["Slack Bolt<br/>Socket Mode"]
+        SCHED["MonitoringScheduler<br/>every N minutes"]
+    end
+
+    ROUTER["Intent router<br/>health checks and audits<br/>take the fast path"]
+
+    subgraph fast["Fast path, scheduler.py"]
+        COLLECT["Collect cluster data<br/>direct client, zero tokens"]
+        HAIKU["One Haiku call<br/>forced tool use"]
+        REPORT["Typed HealthReport"]
+    end
+
+    subgraph agent["Agent path, agent.py"]
+        ORCH["Orchestrator<br/>Sonnet, plans and delegates"]
+        LIM["Guards: prompt caching,<br/>recursion and call limits"]
+        RO["Read-only subagents<br/>Haiku, 8 analysts"]
+        CE["change-executor<br/>only holder of write tools"]
+    end
+
+    GATE{{"Human approval<br/>per write tool call"}}
+
+    subgraph toolset["Tools"]
+        RT["44 read tools"]
+        WT["11 write tools"]
+    end
+
+    K8C["tools/k8s_client.py<br/>in-cluster or local"]
+    K8S[("Kubernetes API")]
+    SLK["Slack workspace"]
+
+    CLI --> ORCH
+    WEB --> ROUTER
+    BOLT --> ROUTER
+    SCHED --> COLLECT
+    ROUTER -->|"health check or audit"| COLLECT
+    ROUTER -->|"everything else"| ORCH
+
+    COLLECT --> HAIKU
+    HAIKU --> REPORT
+    REPORT --> SLK
+
+    ORCH -.- LIM
+    ORCH --> RO
+    ORCH --> CE
+    ORCH --> RT
+    RO --> RT
+    CE --> GATE
+    GATE -->|"approved"| WT
+    GATE -.->|"asks, then reports"| SLK
+    ORCH --> SLK
+
+    COLLECT --> K8C
+    RT --> K8C
+    WT --> K8C
+    K8C --> K8S
+
+    classDef bounded fill:#e6f4ea,stroke:#2f855a
+    classDef write fill:#fde8e8,stroke:#c53030
+    class COLLECT,HAIKU,REPORT,SCHED bounded
+    class CE,GATE,WT write

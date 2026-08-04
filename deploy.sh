@@ -2,13 +2,16 @@
 # deploy.sh — build, push to ECR, and deploy the SRE bot to EKS
 set -euo pipefail
 
-AWS_ACCOUNT="640174622193"
-AWS_REGION="us-east-1"
-ECR_REPO="sre-agent"
+# Target account, region, and cluster come from the environment so no
+# account-specific identifiers live in this public repo. Export them once, e.g.
+#   export AWS_ACCOUNT=123456789012 AWS_REGION=us-east-2 CLUSTER=my-cluster
+AWS_ACCOUNT="${AWS_ACCOUNT:?set AWS_ACCOUNT, e.g. export AWS_ACCOUNT=123456789012}"
+AWS_REGION="${AWS_REGION:-us-east-1}"
+CLUSTER="${CLUSTER:?set CLUSTER, e.g. export CLUSTER=my-eks-cluster}"
+ECR_REPO="${ECR_REPO:-sre-agent}"
 IMAGE="${AWS_ACCOUNT}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}"
 TAG="${1:-latest}"
-CLUSTER="langsmith-eks-gtm-east"
-NAMESPACE="sre-agent"
+NAMESPACE="${NAMESPACE:-sre-agent}"
 
 echo "==> Checking AWS auth..."
 aws sts get-caller-identity --query 'Account' --output text > /dev/null
@@ -56,6 +59,13 @@ fi
 
 echo "==> Applying Kubernetes manifests..."
 kubectl apply -k "${K8S_DIR}"
+
+# deployment.yaml ships a placeholder image so no account-specific registry is
+# committed. Point it at the real one here, before waiting on the rollout, so
+# the placeholder is never actually pulled.
+echo "==> Setting image to ${IMAGE}:${TAG}..."
+kubectl set image deployment/sre-agent \
+  "sre-agent=${IMAGE}:${TAG}" -n "${NAMESPACE}"
 
 echo "==> Waiting for rollout..."
 kubectl rollout status deployment/sre-agent -n "${NAMESPACE}" --timeout=120s

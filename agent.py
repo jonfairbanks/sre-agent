@@ -1,8 +1,6 @@
 """Main SRE orchestrator agent."""
 from deepagents import create_deep_agent
 from deepagents.backends import FilesystemBackend
-from langgraph.checkpoint.memory import MemorySaver
-from langgraph.store.memory import InMemoryStore
 from langchain.agents.middleware import (
     ModelCallLimitMiddleware,
     ToolCallLimitMiddleware,
@@ -11,6 +9,7 @@ from langchain.agents.middleware import (
 
 from config import (
     MODEL,
+    DATABASE_URL,
     DEFAULT_NAMESPACES,
     PROMPT_CACHING,
     MODEL_CALL_RUN_LIMIT,
@@ -138,10 +137,28 @@ Unless told otherwise, check these namespaces: {', '.join(DEFAULT_NAMESPACES) or
 """
 
 
-def create_sre_agent(extra_tools: list | None = None):
-    """Create and return the main SRE orchestrator agent."""
-    checkpointer = MemorySaver()
-    store = InMemoryStore()
+def create_sre_agent(
+    extra_tools: list | None = None,
+    checkpointer=None,
+    store=None,
+):
+    """Create and return the main SRE orchestrator agent.
+
+    ``checkpointer`` and ``store`` are injected by ``api.py`` so the web process
+    shares one Postgres pool with the session table and audit log. When omitted
+    (e.g. ``python main.py``) they are built on demand — Postgres if
+    ``DATABASE_URL`` is set, in-memory otherwise.
+
+    The checkpointer is what makes HITL work at all: without it, a subagent
+    interrupt has nowhere to persist, and with only an in-memory one a restart
+    strands every pending approval.
+    """
+    if checkpointer is None or store is None:
+        from persistence import init_persistence
+
+        default_checkpointer, default_store, _db = init_persistence(DATABASE_URL)
+        checkpointer = checkpointer or default_checkpointer
+        store = store or default_store
 
     tools = READ_TOOLS + (extra_tools or [])
 

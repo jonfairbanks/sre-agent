@@ -80,7 +80,12 @@ python api.py         # API + web UI at http://localhost:8080
 | `SLACK_APP_TOKEN` | No | `xapp-...` Socket Mode token |
 | `SLACK_CHANNEL` | No | Channel for alerts (default: `#sre-alerts`) |
 | `MONITOR_INTERVAL_MINUTES` | No | Health check frequency (default: `30`) |
-| `MONITORING_ENABLED` | No | Set to `true` to enable scheduled checks (default: `false`) |
+| `MONITORING_ENABLED` | No | Set to `false` to stop scheduled checks (default: `true`) |
+| `MONITOR_DIGEST_EVERY_N_CHECKS` | No | Post a report every N checks even when nothing changed; `0` disables (default: `12`) |
+| `MONITOR_NOTIFY_ON_RESOLVED` | No | Announce findings that cleared (default: `true`) |
+| `MONITOR_ACK_HOURS` | No | How long the Slack **Ack** button mutes a finding (default: `24`) |
+| `DATABASE_URL` | No | Postgres DSN for durable state. Unset = in-memory, and pending approvals do not survive a restart |
+| `SLACK_APPROVER_IDS` | No | Comma-separated Slack user IDs allowed to approve changes. **Empty means anyone who can see the message may approve** |
 | `DEFAULT_NAMESPACES` | No | Comma-separated namespaces to watch (default: auto-discover) |
 | `PROMETHEUS_URL` | No | Prometheus endpoint for richer metrics |
 | `API_PORT` | No | Port for API server (default: `8080`) |
@@ -112,14 +117,22 @@ echo -n "sk-ant-..." | base64   # ANTHROPIC_API_KEY
 echo -n "lsv2_..."  | base64   # LANGSMITH_API_KEY
 echo -n "xoxb-..."  | base64   # SLACK_BOT_TOKEN
 echo -n "xapp-..."  | base64   # SLACK_APP_TOKEN
+# POSTGRES_PASSWORD must be alphanumeric. deployment.yaml interpolates it into
+# DATABASE_URL, and a /, + or @ would corrupt the DSN.
+LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 40 | base64
 # Paste values into k8s/secret.yaml
 
-# 4. Apply
+# 4. Apply (includes the Postgres StatefulSet backing durable state)
 kubectl apply -k k8s/
+kubectl rollout status statefulset/sre-agent-postgres -n sre-agent
 
 # 5. Access the UI
 kubectl port-forward svc/sre-agent 8080:80 -n sre-agent
 # Open http://localhost:8080
+
+# 6. Confirm state is durable (not silently degraded to in-memory)
+curl -s localhost:8080/health | jq '{state_backend, durable_state}'
+# => {"state_backend": "postgres", "durable_state": true}
 ```
 
 ### RBAC
@@ -148,9 +161,14 @@ api.py                FastAPI server (SSE streaming, HITL endpoints, web UI)
 main.py               CLI entry point
 config.py             Env-based configuration
 schemas.py            Pydantic models (Finding, HealthReport) — structured-output contract
-scheduler.py          Periodic health check scheduler (structured HealthReport via tool-use)
+scheduler.py          Periodic health check scheduler (structured HealthReport via tool-use),
+                      diffed against stored state so only changes are posted
+persistence.py        Postgres checkpointer/store, sessions, HITL audit, finding state,
+                      with in-memory fallback when DATABASE_URL is unset or unreachable
+monitor_state.py      Stable finding fingerprints and run-to-run diffing (pure functions)
 slack_notifier.py     Slack Block Kit messages and HITL action handling
-                      (send_structured_report renders typed findings directly)
+                      (send_structured_report renders typed findings directly, and
+                      labels them NEW / ESCALATED / ongoing / RESOLVED from a diff)
 deploy.sh             Build, push to ECR, and deploy to EKS
 tools/
   kubernetes_read.py        Read-only kubectl tools
@@ -177,6 +195,11 @@ subagents/
   config_auditor.py
   change_executor.py      Only subagent with write tools
 k8s/                  Kustomize manifests for cluster deployment
+                      (postgres.yaml = StatefulSet + Service + NetworkPolicy)
+tests/
+  test_monitor_state.py   Fingerprint stability and diff semantics
+  test_slack_render.py    Block Kit rendering for every diff shape
+  test_persistence.py     Postgres integration (skipped without TEST_DATABASE_URL)
 evals/
   create_dataset.py         Script to upload eval examples to LangSmith
   sre-agent-k8s-eval.jsonl  Pre-built JSONL dataset (upload directly via LangSmith UI)
@@ -184,8 +207,81 @@ evals/
   upload_online_evals.py    Script to register online evaluators
 ```
 
+## Durable state
+
+Checkpoints, sessions, the HITL audit log, and monitoring finding-state live in
+Postgres (`k8s/postgres.yaml` deploys a StatefulSet into the `sre-agent`
+namespace). Without it, a pod restart stranded every pending approval. The Slack
+Approve button stayed live but the session behind it was gone, so the click
+dead-ended and the proposed change could neither be applied nor rejected.
+
+`DATABASE_URL` is assembled in `k8s/deployment.yaml` from `POSTGRES_PASSWORD`
+via `$(VAR)` interpolation, so the credential lives in exactly one place. Use an
+alphanumeric password, because a `/`, `+`, or `@` would corrupt the DSN it is
+interpolated into.
+
+If Postgres is unreachable the process logs loudly and **degrades to in-memory
+state rather than refusing to boot**, so a cluster problem cannot also remove
+your ability to ask the bot about it. `/health` exposes `durable_state`. Alert
+on it, because that degradation is otherwise invisible.
+
+Note the trade-off. The bot's durability now depends on a database inside the
+cluster it monitors. A cluster-wide outage takes the audit trail with it.
+
+### Audit trail
+
+`GET /api/audit?limit=50` returns recent HITL decisions, showing who approved
+or rejected which tool call, with the actual arguments. One row per tool call, so a
+batched change records each resource separately. Denied attempts are recorded too.
+
+Two known gaps are worth calling out.
+
+- `POST /api/approve` is unauthenticated, so audit rows from the web UI can only
+  attribute to `api-user`. Slack clicks carry a real identity.
+- `SLACK_APPROVER_IDS` defaults to empty, which means **any** workspace member
+  who can see `#sre-alerts` can approve a cluster mutation. Set it to your
+  on-call rotation.
+
+## Monitoring behaviour
+
+Scheduled checks are stateful. Each run is diffed against the previous one and
+Slack is only notified when something is **new**, **escalated**, or **newly
+resolved**. Otherwise the run is logged and stays quiet. A digest posts every
+`MONITOR_DIGEST_EVERY_N_CHECKS` runs regardless, so a silent channel still
+proves the bot is alive.
+
+Findings are identified by `namespace/kind/name:reason`, not by the model's
+free-text title (which it rewords between runs) and not by raw pod name (which
+changes on every restart). See `monitor_state.fingerprint`. That is what lets
+one ongoing incident report as "ongoing 6h · seen 12×" instead of as a fresh
+alert every interval.
+
+The **Ack** button on a report mutes its findings for `MONITOR_ACK_HOURS`. Acked
+findings stay tracked, so history remains correct when the ack lapses, and they
+resolve silently. Acking is not gated by `SLACK_APPROVER_IDS`, because it
+changes no cluster state.
+
+Interactive health checks (`@sre-bot health check`) read this history to annotate
+age and counts but do not advance it; only scheduled runs do, so ad-hoc requests
+cannot inflate the counters.
+
+## Tests
+
+```bash
+python -m pytest tests/ -q          # unit tests; Postgres tests skip
+
+# With Postgres for the integration tests:
+docker run --rm -d --name pg -p 55433:5432 \
+  -e POSTGRES_PASSWORD=testpw -e POSTGRES_USER=sre_agent \
+  -e POSTGRES_DB=sre_agent postgres:16-alpine
+TEST_DATABASE_URL=postgresql://sre_agent:testpw@127.0.0.1:55433/sre_agent \
+  python -m pytest tests/ -q
+```
+
 ## Security notes
 
 - `k8s/secret.yaml` is in `.gitignore` — never commit it
 - The container runs as a non-root user (`uid 1000`)
+- Postgres traffic is unencrypted cluster-internal traffic; a NetworkPolicy in
+  `k8s/postgres.yaml` restricts port 5432 to the `sre-agent` pod
 - If you suspect keys were exposed, rotate them immediately via the respective provider dashboards

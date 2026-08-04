@@ -41,6 +41,52 @@ FS_TOOL_RUN_LIMIT = int(os.getenv("FS_TOOL_RUN_LIMIT", "25"))
 # full input tokens on every model call.
 PROMPT_CACHING = os.getenv("PROMPT_CACHING", "true").lower() in ("1", "true", "yes")
 
+# ---------------------------------------------------------------------------
+# Durable state
+# ---------------------------------------------------------------------------
+# Postgres DSN backing the langgraph checkpointer/store, the session table, the
+# HITL audit log, and monitoring finding-state. When unset the process falls
+# back to in-memory equivalents (fine for `python main.py` locally, but pending
+# HITL approvals and monitoring state do NOT survive a restart).
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+
+# ---------------------------------------------------------------------------
+# Monitoring
+# ---------------------------------------------------------------------------
+# Whether the background scheduler runs at all. This env var was previously
+# documented and set in k8s/deployment.yaml but read by NO code, so the
+# scheduler started unconditionally and MONITORING_ENABLED="false" was silently
+# ignored. Defaults to true to preserve that de-facto behaviour when unset.
+MONITORING_ENABLED = os.getenv("MONITORING_ENABLED", "true").lower() in ("1", "true", "yes")
+
+# ---------------------------------------------------------------------------
+# Monitoring notification policy
+# ---------------------------------------------------------------------------
+# The scheduled health check posts to Slack only when the diff against the
+# previous run contains something new, escalated, or newly resolved. Without
+# this a steady-state cluster problem is re-reported every interval forever,
+# which is what made the scheduler too noisy to leave enabled.
+MONITOR_NOTIFY_ON_RESOLVED = os.getenv("MONITOR_NOTIFY_ON_RESOLVED", "true").lower() in ("1", "true", "yes")
+
+# Force a full report every N checks even when nothing changed, so a quiet
+# channel still proves the bot is alive. 0 disables the digest entirely.
+MONITOR_DIGEST_EVERY_N_CHECKS = int(os.getenv("MONITOR_DIGEST_EVERY_N_CHECKS", "12"))
+
+# How long the Slack "Ack" button suppresses a finding from notifications.
+MONITOR_ACK_HOURS = int(os.getenv("MONITOR_ACK_HOURS", "24"))
+
+# ---------------------------------------------------------------------------
+# HITL authorization
+# ---------------------------------------------------------------------------
+# Comma-separated Slack user IDs (e.g. "U123ABC,U456DEF") allowed to approve or
+# reject cluster mutations. EMPTY MEANS ANY workspace user who can see the
+# message may approve — which is the pre-existing behaviour, preserved as the
+# default so enabling durability does not silently lock anyone out. Set this to
+# lock approvals down to a named on-call group.
+SLACK_APPROVER_IDS = {
+    uid.strip() for uid in os.getenv("SLACK_APPROVER_IDS", "").split(",") if uid.strip()
+}
+
 
 def make_agent_config(thread_id: str) -> dict:
     """Build the langgraph invoke config for an agent run.
