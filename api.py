@@ -21,6 +21,7 @@ from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
 from config import (
+    CORS_ALLOW_ORIGINS,
     DATABASE_URL,
     MONITOR_ACK_HOURS,
     MONITORING_ENABLED,
@@ -843,9 +844,13 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="SRE Bot", version="1.0.0", lifespan=lifespan)
+# Empty by default. The bundled UI is same-origin so it needs no CORS grant, and
+# a wildcard here let any page read /api/audit through an open port-forward.
+# NOTE: this blocks the browser path only. Anything that can reach the port
+# directly still has unauthenticated access to every /api route.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ALLOW_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )

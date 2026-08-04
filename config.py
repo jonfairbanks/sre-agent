@@ -18,6 +18,15 @@ DEFAULT_NAMESPACES = [
 
 API_PORT = int(os.getenv("API_PORT", "8080"))
 
+# Browser origins allowed to call /api/*. Defaults to EMPTY, meaning no
+# cross-origin access. The built-in web UI is served by this same app at "/", so
+# its requests are same-origin and need no grant. A previous "*" meant any page
+# the operator visited while `kubectl port-forward` was open could read
+# /api/audit, which exposes the arguments of approved cluster mutations.
+CORS_ALLOW_ORIGINS = [
+    o.strip() for o in os.getenv("CORS_ALLOW_ORIGINS", "").split(",") if o.strip()
+]
+
 # ---------------------------------------------------------------------------
 # Cost / runaway-loop safety limits
 # ---------------------------------------------------------------------------
