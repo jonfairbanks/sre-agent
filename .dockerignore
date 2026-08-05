@@ -12,3 +12,8 @@ dist
 build
 .venv
 venv
+*.pem
+*.key
+*.crt
+credentials.json
+.DS_Store

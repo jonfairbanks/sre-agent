@@ -23,7 +23,13 @@ spec:
         fsGroup: 1000
       containers:
         - name: sre-agent
-          image: 640174622193.dkr.ecr.us-east-1.amazonaws.com/sre-agent:latest
+          # Placeholder. deploy.sh overrides this with the real registry via
+          # `kubectl set image` so no account-specific value is ever committed.
+          # Deploying by hand? Run:
+          #   kubectl set image deployment/sre-agent \
+          #     sre-agent=<account>.dkr.ecr.<region>.amazonaws.com/sre-agent:latest \
+          #     -n sre-agent
+          image: REPLACE_WITH_YOUR_REGISTRY/sre-agent:latest
           imagePullPolicy: Always
           ports:
             - name: http
@@ -71,13 +77,28 @@ spec:
             - name: SLACK_CHANNEL
               value: "#sre_alerts"
             - name: MONITOR_INTERVAL_MINUTES
-              value: "60"                 # run every hour when enabled
+              value: "60"                 # hourly
             - name: MONITORING_ENABLED
-              value: "false"              # set to "true" to re-enable scheduled checks
+              value: "true"               # set to "false" to stop scheduled checks
             - name: API_PORT
               value: "8080"
             - name: DEFAULT_NAMESPACES
               value: ""                   # set to "ns1,ns2" to limit scope and reduce token usage
+            # Monitoring is now stateful: a Slack post happens only when the diff
+            # against the previous check contains something new, escalated, or
+            # newly resolved. The digest forces a report every N checks anyway so
+            # a quiet channel still proves the bot is alive.
+            - name: MONITOR_DIGEST_EVERY_N_CHECKS
+              value: "12"                 # at 60m interval => once every 12h
+            - name: MONITOR_NOTIFY_ON_RESOLVED
+              value: "true"
+            - name: MONITOR_ACK_HOURS
+              value: "24"                 # how long the Slack "Ack" button mutes a finding
+            # Comma-separated Slack user IDs allowed to approve/reject cluster
+            # changes. EMPTY MEANS ANY workspace user who can see the message can
+            # approve — set this to lock approvals to your on-call rotation.
+            - name: SLACK_APPROVER_IDS
+              value: ""
             # - name: PROMETHEUS_URL
             #   value: "http://prometheus-server.monitoring.svc.cluster.local:9090"
           resources:

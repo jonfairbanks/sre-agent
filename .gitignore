@@ -1,6 +1,7 @@
 .env
 gcp-pull-key.json
 __pycache__/
+.DS_Store
 *.pyc
 *.pyo
 .pytest_cache/
@@ -17,3 +18,11 @@ endpoints.json
 *.key
 *.crt
 credentials.json
+
+# Blog authoring artifacts (local only)
+build_blog_docx.py
+*.docx
+
+# OpenWiki generated documentation and its automation (local only)
+openwiki/
+.github/workflows/openwiki-update.yml

@@ -5,6 +5,9 @@ import os
 import re
 from typing import Optional
 
+from config import MONITOR_ACK_HOURS
+from monitor_state import humanize_age
+
 log = logging.getLogger("sre-agent.slack")
 
 SEVERITY_EMOJI = {
@@ -79,6 +82,8 @@ class SlackNotifier:
         source: str = "scheduled",
         channel: Optional[str] = None,
         thread_ts: Optional[str] = None,
+        diff=None,
+        report_id: Optional[str] = None,
     ) -> Optional[str]:
         """Render a typed HealthReport into Slack Block Kit — no text parsing.
 
@@ -89,6 +94,12 @@ class SlackNotifier:
         `channel`/`thread_ts` default to the notifier's channel and no thread
         (the scheduled path). The interactive Slack path passes them to reply in
         the originating thread.
+
+        `diff` is an optional monitor_state.ReportDiff. When supplied, findings
+        are labelled NEW / ESCALATED / ongoing-with-age and a resolved section is
+        appended, so a reader can tell at a glance what actually changed since
+        the last check instead of re-reading an identical wall of text. Acked
+        findings are omitted entirely. `report_id` enables the Ack button.
         """
         if not self.enabled:
             log.info(
@@ -97,8 +108,18 @@ class SlackNotifier:
             )
             return None
 
-        has_issues = report.has_issues
-        has_critical = report.overall_severity == "critical"
+        # With a diff, the headline reflects what is *currently active and not
+        # acked* rather than the raw report — an all-acked report is not "critical".
+        if diff is not None:
+            active_sevs = {(d.finding.severity or "").lower() for d in diff.active}
+            has_critical = "critical" in active_sevs
+            has_issues = bool(active_sevs & {"critical", "warning", "info"})
+            recovered = not diff.active and bool(diff.resolved)
+        else:
+            has_issues = report.has_issues
+            has_critical = report.overall_severity == "critical"
+            recovered = False
+
         emoji = (
             ":red_circle:" if has_critical
             else ":large_yellow_circle:" if has_issues
@@ -107,6 +128,7 @@ class SlackNotifier:
         title = "Cluster Health Report" + (
             " — Critical Issues Found" if has_critical
             else " — Issues Found" if has_issues
+            else " — Recovered" if recovered
             else " — All Clear"
         )
 
@@ -122,17 +144,43 @@ class SlackNotifier:
         ]
 
         attachments = []
+
+        def _status_prefix(delta) -> str:
+            """Lead each finding with what changed about it since the last check."""
+            if delta.status == "new":
+                repeat = (
+                    f" · returned, {delta.times_seen}× total"
+                    if delta.times_seen > 1 else ""
+                )
+                return f":new: *NEW*{repeat} — "
+            if delta.status == "escalated":
+                prev = (delta.previous_severity or "?").lower()
+                return f":arrow_upper_right: *ESCALATED* {prev}→{delta.finding.severity} — "
+            return f"_ongoing {humanize_age(delta.age)} · seen {delta.times_seen}×_ — "
+
+        # With a diff we render the deltas (so each line carries its history);
+        # without one we fall back to the plain findings list.
+        grouped: dict[str, list] = {}
+        if diff is not None:
+            for delta in diff.active:
+                grouped.setdefault((delta.finding.severity or "").lower(), []).append(delta)
+        else:
+            for f in report.findings:
+                grouped.setdefault((f.severity or "").lower(), []).append(f)
+
         # One attachment per severity group, in priority order.
         for sev in ("critical", "warning", "info"):
-            group = [f for f in report.findings if f.severity == sev]
+            group = grouped.get(sev) or []
             if not group:
                 continue
             sev_emoji = SEVERITY_EMOJI.get(sev, ":white_circle:")
             color = SEVERITY_COLOR.get(sev, "#718096")
             lines = []
-            for f in group:
+            for item in group:
+                f = item.finding if diff is not None else item
                 ns = f" · `{f.namespace}`" if f.namespace else ""
-                lines.append(f"• *{f.title}*{ns} — {f.detail}")
+                prefix = _status_prefix(item) if diff is not None else ""
+                lines.append(f"• {prefix}*{f.title}*{ns} — {f.detail}")
             attachments.append({
                 "color": color,
                 "blocks": [{
@@ -140,6 +188,25 @@ class SlackNotifier:
                     "text": {
                         "type": "mrkdwn",
                         "text": _trunc(f"{sev_emoji} *{sev.upper()}*\n" + "\n".join(lines), 2700),
+                    },
+                }],
+            })
+
+        if diff is not None and diff.resolved:
+            lines = [
+                f"• *{r.title}*" + (f" · `{r.namespace}`" if r.namespace else "")
+                for r in diff.resolved
+            ]
+            attachments.append({
+                "color": "#38a169",
+                "blocks": [{
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": _trunc(
+                            ":white_check_mark: *RESOLVED SINCE LAST CHECK*\n" + "\n".join(lines),
+                            2700,
+                        ),
                     },
                 }],
             })
@@ -154,9 +221,36 @@ class SlackNotifier:
                 }],
             })
 
+        # Ack mutes every finding in this report for a window, so a known issue
+        # someone is already working on stops interrupting the channel.
+        if report_id and diff is not None and diff.active:
+            attachments.append({
+                "color": "#4a5568",
+                "blocks": [{
+                    "type": "actions",
+                    "elements": [{
+                        "type": "button",
+                        "text": {
+                            "type": "plain_text",
+                            "text": f"Ack these for {MONITOR_ACK_HOURS}h",
+                        },
+                        "action_id": "sre_ack",
+                        "value": report_id,
+                    }],
+                }],
+            })
+
+        context_bits = [f"Source: {source}"]
+        if diff is not None:
+            context_bits.append(diff.summary_line())
+            if diff.suppressed:
+                context_bits.append(f"{len(diff.suppressed)} acked (hidden)")
         attachments.append({
             "color": "#2d3748",
-            "blocks": [{"type": "context", "elements": [{"type": "mrkdwn", "text": f"Source: {source}"}]}],
+            "blocks": [{
+                "type": "context",
+                "elements": [{"type": "mrkdwn", "text": " · ".join(context_bits)}],
+            }],
         })
 
         post_kwargs = {

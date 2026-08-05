@@ -20,7 +20,14 @@ from langgraph.types import Command
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
-from config import make_agent_config
+from config import (
+    CORS_ALLOW_ORIGINS,
+    DATABASE_URL,
+    MONITOR_ACK_HOURS,
+    MONITORING_ENABLED,
+    SLACK_APPROVER_IDS,
+    make_agent_config,
+)
 
 load_dotenv()
 
@@ -59,6 +66,10 @@ class Session:
     status: SessionStatus = SessionStatus.IDLE
     interrupt_data: Any = None
     pending_decisions: int = 1           # number of tool calls awaiting approval
+    # Structured {"name": tool, "args": {...}} for each pending call. Kept
+    # alongside interrupt_data (which is display-only stringified interrupts)
+    # because the audit log has to record *what* was approved, not a repr.
+    pending_actions: list = field(default_factory=list)
     last_response: str = ""
     source: str = "api"                  # 'api' | 'scheduler' | 'slack'
     slack_message_ts: Optional[str] = None
@@ -68,18 +79,153 @@ class Session:
     pending_hitl_approved: Optional[bool] = None  # set on click, cleared on finalize
     event_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
 
+    def to_row(self) -> dict:
+        """Durable fields only — event_queue is per-process and not persisted."""
+        return {
+            "id": self.id,
+            "thread_id": self.thread_id,
+            "status": self.status.value,
+            "source": self.source,
+            "pending_decisions": self.pending_decisions,
+            "pending_actions": self.pending_actions,
+            "interrupt_data": self.interrupt_data,
+            "last_response": self.last_response,
+            "slack_message_ts": self.slack_message_ts,
+            "slack_channel": self.slack_channel,
+            "slack_thread_ts": self.slack_thread_ts,
+        }
+
+    @classmethod
+    def from_row(cls, row: dict) -> "Session":
+        """Rebuild a session from Postgres with a fresh event queue."""
+        return cls(
+            id=row["id"],
+            thread_id=row["thread_id"],
+            status=SessionStatus(row["status"]),
+            source=row.get("source") or "api",
+            pending_decisions=row.get("pending_decisions") or 1,
+            pending_actions=list(row.get("pending_actions") or []),
+            interrupt_data=row.get("interrupt_data"),
+            last_response=row.get("last_response") or "",
+            slack_message_ts=row.get("slack_message_ts"),
+            slack_channel=row.get("slack_channel"),
+            slack_thread_ts=row.get("slack_thread_ts"),
+        )
+
 
 _sessions: dict[str, Session] = {}
 _executor = ThreadPoolExecutor(max_workers=4)
 _notifier = None   # set in lifespan
 _agent = None      # set in lifespan
 _scheduler = None  # set in lifespan
+_db = None         # set in lifespan (persistence.PostgresDatabase | NullDatabase)
+
+
+def _save(session: Session) -> None:
+    """Write a session through to Postgres.
+
+    Best-effort by design: losing durability is bad, but it must never take down
+    an in-flight cluster diagnosis. Failures are logged and surfaced by /health.
+    """
+    if _db is None:
+        return
+    try:
+        _db.save_session(session.to_row())
+    except Exception:
+        log.exception("Failed to persist session %s", session.id)
+
+
+def _track(session: Session) -> Session:
+    _sessions[session.id] = session
+    _save(session)
+    return session
+
+
+def _recover_session(session_id: str) -> Optional[Session]:
+    """Return a session from memory, falling back to Postgres.
+
+    This is what makes a Slack Approve button survive a pod restart: the
+    langgraph checkpoint still holds the interrupted graph under `thread_id`, so
+    once the Session row is rehydrated the resume proceeds normally.
+    """
+    if session_id in _sessions:
+        return _sessions[session_id]
+    if _db is None:
+        return None
+    try:
+        row = _db.load_session(session_id)
+    except Exception:
+        log.exception("Failed to load session %s", session_id)
+        return None
+    if not row:
+        return None
+    session = Session.from_row(row)
+    _sessions[session_id] = session
+    log.info(
+        "Recovered session %s from Postgres (status=%s, pending=%d)",
+        session.id, session.status, session.pending_decisions,
+    )
+    return session
 
 
 def _get_session(session_id: str) -> Session:
-    if session_id not in _sessions:
+    session = _recover_session(session_id)
+    if session is None:
         raise HTTPException(404, f"Session '{session_id}' not found")
-    return _sessions[session_id]
+    return session
+
+
+def _extract_action_requests(interrupts) -> list[dict]:
+    """Pull structured {"name", "args"} pairs out of langgraph interrupts."""
+    actions: list[dict] = []
+    for interrupt in interrupts:
+        val = interrupt.value if hasattr(interrupt, "value") else {}
+        if not isinstance(val, dict):
+            continue
+        for req in val.get("action_requests", []) or []:
+            if isinstance(req, dict):
+                actions.append({
+                    "name": req.get("name") or req.get("action") or "",
+                    "args": req.get("args") or req.get("arguments") or {},
+                })
+    return actions
+
+
+def _audit(session: Session, decision: str, actor: str = "", actor_id: str = "",
+           result: str = "") -> None:
+    """Append one immutable audit row per tool call covered by this decision."""
+    if _db is None:
+        return
+    actions = session.pending_actions or []
+    try:
+        if not actions:
+            _db.record_decision(
+                session_id=session.id, thread_id=session.thread_id,
+                decision=decision, actor=actor, actor_id=actor_id,
+                source=session.source, result=result,
+            )
+            return
+        for action in actions:
+            _db.record_decision(
+                session_id=session.id, thread_id=session.thread_id,
+                decision=decision, actor=actor, actor_id=actor_id,
+                source=session.source, tool_name=action.get("name", ""),
+                tool_args=action.get("args") or {}, result=result,
+            )
+    except Exception:
+        log.exception("Failed to write HITL audit row (session=%s)", session.id)
+
+
+def _approver_allowed(user_id: str) -> bool:
+    """Whether a Slack user may approve/reject a cluster mutation.
+
+    An empty SLACK_APPROVER_IDS keeps the historical behaviour — anyone who can
+    see the message can click — so turning on durability does not lock out an
+    existing on-call rotation. Set it to restrict approvals to named users.
+    """
+    if not SLACK_APPROVER_IDS:
+        return True
+    return user_id in SLACK_APPROVER_IDS
 
 
 # ---------------------------------------------------------------------------
@@ -100,6 +246,7 @@ def _finalize_hitl_message(session: Session, result_text: str = ""):
     session.pending_hitl_actor = None
     session.pending_hitl_approved = None
     session.slack_message_ts = None
+    _save(session)
 
 
 def _handle_result(result: dict, session: Session, loop):
@@ -112,13 +259,13 @@ def _handle_result(result: dict, session: Session, loop):
     if interrupts:
         session.status = SessionStatus.INTERRUPTED
         session.interrupt_data = [str(i) for i in interrupts]
+        session.pending_actions = _extract_action_requests(interrupts)
+        # Resume must send exactly one decision per pending tool call.
+        session.pending_decisions = max(len(session.pending_actions), 1)
 
-        # Count pending tool calls so resume sends the right number of decisions
-        n = 0
-        for interrupt in interrupts:
-            val = interrupt.value if hasattr(interrupt, "value") else {}
-            n += len(val.get("action_requests", [])) if isinstance(val, dict) else 0
-        session.pending_decisions = max(n, 1)
+        # Persist before notifying: the Slack button must never point at a
+        # session that was not written down.
+        _save(session)
 
         # Notify via Slack
         if _notifier and _notifier.enabled:
@@ -127,6 +274,7 @@ def _handle_result(result: dict, session: Session, loop):
                 "\n".join(session.interrupt_data),
             )
             session.slack_message_ts = ts
+            _save(session)
 
         asyncio.run_coroutine_threadsafe(
             session.event_queue.put({"type": "interrupt", "data": session.interrupt_data}),
@@ -140,6 +288,9 @@ def _handle_result(result: dict, session: Session, loop):
             response = last.content if hasattr(last, "content") else str(last)
         session.last_response = response
         session.status = SessionStatus.DONE
+        session.pending_actions = []
+        session.interrupt_data = None
+        _save(session)
 
         # For scheduler-originated sessions, send Slack health report
         if session.source == "scheduler" and _notifier and _notifier.enabled:
@@ -168,6 +319,7 @@ def _run_agent_sync(agent, messages: list[dict], config: dict, session: Session,
     except Exception as e:
         log.exception("Agent error (session=%s)", session.id)
         session.status = SessionStatus.ERROR
+        _save(session)
         asyncio.run_coroutine_threadsafe(
             session.event_queue.put({"type": "error", "data": str(e)}), loop
         )
@@ -180,6 +332,7 @@ def _resume_agent_sync(agent, command: Command, config: dict, session: Session, 
     except Exception as e:
         log.exception("Resume error (session=%s)", session.id)
         session.status = SessionStatus.ERROR
+        _save(session)
         asyncio.run_coroutine_threadsafe(
             session.event_queue.put({"type": "error", "data": str(e)}), loop
         )
@@ -188,6 +341,7 @@ def _resume_agent_sync(agent, command: Command, config: dict, session: Session, 
 def _do_approve(session: Session, loop):
     """Approve a HITL interrupt — usable from both API handlers and Slack Bolt threads."""
     session.status = SessionStatus.RUNNING
+    _save(session)
     session.event_queue = asyncio.Queue()
     config = make_agent_config(session.thread_id)
     loop.run_in_executor(
@@ -204,6 +358,7 @@ def _do_approve(session: Session, loop):
 def _do_reject(session: Session, reason: str, loop):
     """Reject a HITL interrupt — usable from both API handlers and Slack Bolt threads."""
     session.status = SessionStatus.RUNNING
+    _save(session)
     session.event_queue = asyncio.Queue()
     config = make_agent_config(session.thread_id)
     loop.run_in_executor(
@@ -260,16 +415,14 @@ def _post_agent_result_to_slack(result: dict, session: Session, client, channel:
         session.interrupt_data = [str(i) for i in interrupts]
         session.slack_channel = channel
         session.slack_thread_ts = thread_ts
-
-        n = 0
-        for interrupt in interrupts:
-            val = interrupt.value if hasattr(interrupt, "value") else {}
-            n += len(val.get("action_requests", [])) if isinstance(val, dict) else 0
-        session.pending_decisions = max(n, 1)
+        session.pending_actions = _extract_action_requests(interrupts)
+        session.pending_decisions = max(len(session.pending_actions), 1)
+        _save(session)
 
         if _notifier and _notifier.enabled:
             ts = _notifier.send_hitl_request(session.id, "\n".join(session.interrupt_data))
             session.slack_message_ts = ts
+            _save(session)
 
         alerts_channel = os.getenv("SLACK_CHANNEL", "#sre-alerts")
         client.chat_update(
@@ -285,6 +438,9 @@ def _post_agent_result_to_slack(result: dict, session: Session, client, channel:
             response = last.content if hasattr(last, "content") else str(last)
         session.last_response = response
         session.status = SessionStatus.DONE
+        session.pending_actions = []
+        session.interrupt_data = None
+        _save(session)
         _post_long_response(client, channel, thread_ts, thinking_ts, response or "(no response)")
 
 
@@ -303,6 +459,7 @@ def _run_for_slack(text: str, session: Session, client, channel: str, thread_ts:
         _post_agent_result_to_slack(result, session, client, channel, thread_ts, thinking["ts"])
     except Exception as e:
         session.status = SessionStatus.ERROR
+        _save(session)
         log.exception("Slack agent error (session=%s)", session.id)
         client.chat_update(channel=channel, ts=thinking["ts"], text=f":red_circle: Error: {e}")
 
@@ -319,16 +476,27 @@ def _run_structured_health_check_for_slack(text: str, session: Session, client, 
         text=":mag: Running a cluster health check...",
     )
     try:
-        from scheduler import run_structured_health_check
+        from scheduler import annotate_with_history, run_structured_health_check
 
         report, data = run_structured_health_check()
+        # Read-only diff: annotates each finding with age / occurrence count
+        # without advancing the counters, which stay owned by the scheduler so
+        # ad-hoc requests cannot inflate them. Skipped entirely without a
+        # database, since with no history every finding would be labelled NEW
+        # on every run, which is worse than showing no label at all.
+        diff = (
+            annotate_with_history(report, _db)
+            if (_db is not None and _db.available) else None
+        )
         log.info(
-            "Slack health check complete (session=%s, severity=%s, findings=%d)",
+            "Slack health check complete (session=%s, severity=%s, findings=%d, %s)",
             session.id, report.overall_severity, len(report.findings),
+            diff.summary_line() if diff else "no history",
         )
         if _notifier and _notifier.enabled:
             _notifier.send_structured_report(
                 report, source="slack", channel=channel, thread_ts=thread_ts,
+                diff=diff,
             )
             # The structured report is posted as its own threaded message; drop the
             # transient placeholder (best-effort — ignore missing chat:write scope).
@@ -342,8 +510,10 @@ def _run_structured_health_check_for_slack(text: str, session: Session, client, 
                                text=report.summary or "(no findings)")
         session.last_response = report.summary
         session.status = SessionStatus.DONE
+        _save(session)
     except Exception as e:
         session.status = SessionStatus.ERROR
+        _save(session)
         log.exception("Slack health check error (session=%s)", session.id)
         client.chat_update(channel=channel, ts=thinking["ts"], text=f":red_circle: Error: {e}")
 
@@ -368,6 +538,7 @@ def _resume_for_slack(command, session: Session, client):
         _post_agent_result_to_slack(result, session, client, channel, thread_ts, thinking["ts"])
     except Exception as e:
         session.status = SessionStatus.ERROR
+        _save(session)
         log.exception("Slack resume error (session=%s)", session.id)
         _finalize_hitl_message(session, result_text=f"Error: {e}")
         client.chat_update(channel=channel, ts=thinking["ts"], text=f":red_circle: Error: {e}")
@@ -414,23 +585,23 @@ def _start_slack_bolt(main_loop: asyncio.AbstractEventLoop):
             thread_ts = event.get("thread_ts") or event["ts"]
             session_id = f"slack-{thread_ts}"
 
-            if session_id not in _sessions:
-                session = Session(
+            session = _recover_session(session_id)
+            if session is None:
+                session = _track(Session(
                     id=session_id,
                     thread_id=session_id,
                     source="slack",
                     slack_channel=channel,
                     slack_thread_ts=thread_ts,
-                )
-                _sessions[session_id] = session
+                ))
             else:
-                session = _sessions[session_id]
                 if session.status in (SessionStatus.RUNNING, SessionStatus.INTERRUPTED):
                     log.info("Ignoring duplicate Slack event for session %s (status=%s)", session_id, session.status)
                     return
                 session.status = SessionStatus.RUNNING
                 session.slack_channel = channel
                 session.slack_thread_ts = thread_ts
+                _save(session)
 
             log.info("Slack mention from %s: %s", event.get("user"), text[:80])
             # Submit to executor so this handler returns immediately (prevents Slack retries).
@@ -441,37 +612,79 @@ def _start_slack_bolt(main_loop: asyncio.AbstractEventLoop):
             else:
                 _executor.submit(_run_for_slack, text, session, client, channel, thread_ts)
 
+        def _resolve_click(body, client, verb: str):
+            """Shared guard for approve/reject clicks.
+
+            Returns ``(session, actor, actor_id)`` or None once it has already
+            told the user why the click did nothing. Every rejection path
+            replies — a silent return leaves someone believing they stopped a
+            cluster change when they did not.
+            """
+            session_id = body["actions"][0]["value"]
+            user = body.get("user", {}) or {}
+            actor = user.get("name") or "unknown"
+            actor_id = user.get("id") or ""
+            channel_id = (body.get("channel") or {}).get("id")
+
+            def deny(text: str):
+                try:
+                    client.chat_postEphemeral(channel=channel_id, user=actor_id, text=text)
+                except Exception:
+                    log.exception("Failed to post ephemeral reply to %s", actor_id)
+
+            if not _approver_allowed(actor_id):
+                log.warning(
+                    "Unauthorized %s attempt by %s (%s) on session %s",
+                    verb, actor, actor_id, session_id,
+                )
+                deny(
+                    f":no_entry: You are not authorised to {verb} cluster changes. "
+                    "Approvals are restricted to the users in SLACK_APPROVER_IDS."
+                )
+                # Record the attempt — a denied approval is exactly the kind of
+                # event an audit trail exists for.
+                denied = _recover_session(session_id)
+                if denied is not None:
+                    _audit(
+                        denied, f"{verb}-denied", actor=actor, actor_id=actor_id,
+                        result="actor not in SLACK_APPROVER_IDS",
+                    )
+                return None
+
+            session = _recover_session(session_id)
+            if session is None:
+                deny(
+                    f":warning: Session `{session_id}` not found. It predates the current "
+                    "database, or its record was removed."
+                )
+                return None
+            if session.status != SessionStatus.INTERRUPTED:
+                deny(
+                    f":warning: Session `{session_id}` is not waiting for approval "
+                    f"(status={session.status.value})."
+                )
+                return None
+            return session, actor, actor_id
+
         @bolt.action("sre_approve")
         def handle_approve(ack, body, client):
             ack()
-            session_id = body["actions"][0]["value"]
-            actor = body.get("user", {}).get("name", "unknown")
-            log.info("Slack approve from %s for session %s", actor, session_id)
-
-            if session_id not in _sessions:
-                client.chat_postEphemeral(
-                    channel=body["channel"]["id"],
-                    user=body["user"]["id"],
-                    text=f":warning: Session `{session_id}` not found — it may have expired.",
-                )
+            resolved = _resolve_click(body, client, "approve")
+            if resolved is None:
                 return
-
-            session = _sessions[session_id]
-            if session.status != SessionStatus.INTERRUPTED:
-                client.chat_postEphemeral(
-                    channel=body["channel"]["id"],
-                    user=body["user"]["id"],
-                    text=f":warning: Session `{session_id}` is not waiting for approval (status={session.status}).",
-                )
-                return
+            session, actor, actor_id = resolved
+            log.info("Slack approve from %s for session %s", actor, session.id)
+            _audit(session, "approve", actor=actor, actor_id=actor_id)
 
             if _notifier and session.slack_message_ts:
                 _notifier.mark_hitl_processing(session.slack_message_ts, actor, "Approval")
             session.pending_hitl_actor = actor
             session.pending_hitl_approved = True
+            _save(session)
 
             if session.source == "slack":
                 session.status = SessionStatus.RUNNING
+                _save(session)
                 _executor.submit(
                     _resume_for_slack,
                     Command(resume={"decisions": [{"type": "approve"}] * session.pending_decisions}),
@@ -484,25 +697,23 @@ def _start_slack_bolt(main_loop: asyncio.AbstractEventLoop):
         @bolt.action("sre_reject")
         def handle_reject(ack, body, client):
             ack()
-            session_id = body["actions"][0]["value"]
-            actor = body.get("user", {}).get("name", "unknown")
-            log.info("Slack reject from %s for session %s", actor, session_id)
-
-            if session_id not in _sessions:
+            resolved = _resolve_click(body, client, "reject")
+            if resolved is None:
                 return
-
-            session = _sessions[session_id]
-            if session.status != SessionStatus.INTERRUPTED:
-                return
+            session, actor, actor_id = resolved
+            log.info("Slack reject from %s for session %s", actor, session.id)
+            _audit(session, "reject", actor=actor, actor_id=actor_id)
 
             reason = ""
             if _notifier and session.slack_message_ts:
                 _notifier.mark_hitl_processing(session.slack_message_ts, actor, "Rejection")
             session.pending_hitl_actor = actor
             session.pending_hitl_approved = False
+            _save(session)
 
             if session.source == "slack":
                 session.status = SessionStatus.RUNNING
+                _save(session)
                 _executor.submit(
                     _resume_for_slack,
                     Command(resume={"decisions": [{"type": "reject", "message": reason}] * session.pending_decisions}),
@@ -511,6 +722,50 @@ def _start_slack_bolt(main_loop: asyncio.AbstractEventLoop):
                 )
             else:
                 _do_reject(session, reason, main_loop)
+
+        @bolt.action("sre_ack")
+        def handle_ack(ack, body, client):
+            """Mute every finding in a monitoring report for MONITOR_ACK_HOURS.
+
+            Not gated by SLACK_APPROVER_IDS: acking changes no cluster state, it
+            only silences notifications, and an on-call engineer should be able
+            to quiet a known issue without needing mutation rights.
+            """
+            ack()
+            report_id = body["actions"][0]["value"]
+            user = body.get("user", {}) or {}
+            actor = user.get("name") or "unknown"
+            channel_id = (body.get("channel") or {}).get("id")
+
+            acked = 0
+            if _db is not None:
+                try:
+                    acked = _db.ack_report(report_id, MONITOR_ACK_HOURS)
+                except Exception:
+                    log.exception("Ack failed (report=%s)", report_id)
+
+            log.info("Slack ack from %s for report %s (%d findings)", actor, report_id, acked)
+            if acked:
+                client.chat_postMessage(
+                    channel=channel_id,
+                    thread_ts=(body.get("message") or {}).get("ts"),
+                    text=(
+                        f":mute: {actor} acked {acked} finding(s) for {MONITOR_ACK_HOURS}h — "
+                        "they will stay tracked but will not re-alert until then."
+                    ),
+                )
+            else:
+                try:
+                    client.chat_postEphemeral(
+                        channel=channel_id,
+                        user=user.get("id", ""),
+                        text=(
+                            ":warning: Nothing to ack — these findings were already "
+                            "resolved, or this report predates the current database."
+                        ),
+                    )
+                except Exception:
+                    log.exception("Failed to post ephemeral ack reply")
 
         handler = SocketModeHandler(bolt, app_token)
         log.info("Starting Slack Bolt Socket Mode handler")
@@ -528,46 +783,74 @@ from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _notifier, _agent, _scheduler
+    global _notifier, _agent, _scheduler, _db
 
-    # 1. Slack notifier
+    # 1. Durable state (Postgres, or in-memory fallback). Built first so the
+    #    agent, session table, audit log, and scheduler all share one pool.
+    from persistence import init_persistence
+    checkpointer, store, _db = init_persistence(DATABASE_URL)
+
+    # 2. Slack notifier
     from slack_notifier import make_notifier
     _notifier = make_notifier()
 
-    # 2. Slack tool
+    # 3. Slack tool
     from tools.slack import make_slack_notification_tool
     slack_tool = make_slack_notification_tool(_notifier)
 
-    # 3. Agent (with Slack tool injected)
+    # 4. Agent (with Slack tool injected)
     from agent import create_sre_agent
-    _agent = create_sre_agent(extra_tools=[slack_tool])
+    _agent = create_sre_agent(
+        extra_tools=[slack_tool], checkpointer=checkpointer, store=store
+    )
 
-    # 4. Slack Bolt Socket Mode in background thread
+    # 5. Slack Bolt Socket Mode in background thread
     main_loop = asyncio.get_event_loop()
     threading.Thread(target=_start_slack_bolt, args=(main_loop,), daemon=True).start()
 
-    # 5. Monitoring scheduler
+    # 6. Monitoring scheduler. MONITORING_ENABLED is now actually honoured — it
+    #    was previously documented and set in the manifest but read by no code,
+    #    so scheduled checks ran regardless of the flag.
     from scheduler import MonitoringScheduler
     interval = int(os.getenv("MONITOR_INTERVAL_MINUTES", "30"))
-    _scheduler = MonitoringScheduler(_agent, _notifier, interval_minutes=interval)
-    await _scheduler.start()
+    _scheduler = MonitoringScheduler(_agent, _notifier, interval_minutes=interval, db=_db)
+    if MONITORING_ENABLED:
+        await _scheduler.start()
+    else:
+        log.info("MONITORING_ENABLED is false — scheduled health checks not started")
 
     if _notifier.enabled:
         _notifier.send_alert("ok", "SRE Bot Started", "The autonomous SRE bot is online and monitoring the cluster.")
 
-    log.info("SRE Bot ready (scheduler=%dm, slack=%s)", interval, _notifier.enabled)
+    if not _db.available:
+        log.warning(
+            "Running with NO durable state — pending HITL approvals will not survive a "
+            "restart and no audit trail is being written. Set DATABASE_URL to fix."
+        )
+
+    log.info(
+        "SRE Bot ready (scheduler=%dm, slack=%s, state=%s, approvers=%s)",
+        interval, _notifier.enabled, _db.kind,
+        f"{len(SLACK_APPROVER_IDS)} allowlisted" if SLACK_APPROVER_IDS else "unrestricted",
+    )
     yield
 
     # Shutdown
     if _scheduler:
         await _scheduler.stop()
+    if _db is not None:
+        _db.close()
     log.info("SRE Bot shutdown")
 
 
 app = FastAPI(title="SRE Bot", version="1.0.0", lifespan=lifespan)
+# Empty by default. The bundled UI is same-origin so it needs no CORS grant, and
+# a wildcard here let any page read /api/audit through an open port-forward.
+# NOTE: this blocks the browser path only. Anything that can reach the port
+# directly still has unauthenticated access to every /api route.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ALLOW_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -602,28 +885,59 @@ class EditRequest(BaseModel):
 
 @app.get("/health")
 def health():
+    # Deliberately still "ok" when Postgres is down: this is the liveness probe,
+    # and crash-looping the bot because its database is unreachable would remove
+    # the operator's ability to ask it what is wrong. `durable_state` is the
+    # field to alert on — it makes the degradation visible instead of silent.
     return {
         "status": "ok",
         "in_cluster": os.path.exists("/var/run/secrets/kubernetes.io/serviceaccount/token"),
         "slack_enabled": _notifier.enabled if _notifier else False,
         "scheduler_running": _scheduler._running if _scheduler else False,
+        "state_backend": _db.kind if _db else "uninitialized",
+        "durable_state": _db.available if _db else False,
+        "approvals_restricted": bool(SLACK_APPROVER_IDS),
+    }
+
+
+@app.get("/api/audit")
+def audit_trail(limit: int = 50):
+    """Recent HITL decisions — who approved or rejected which cluster change."""
+    if _db is None or not _db.available:
+        raise HTTPException(503, "No audit database configured (set DATABASE_URL)")
+    rows = _db.recent_decisions(limit)
+    return {
+        "count": len(rows),
+        "decisions": [
+            {
+                "ts": r["ts"].isoformat() if r.get("ts") else None,
+                "session_id": r.get("session_id"),
+                "actor": r.get("actor"),
+                "actor_id": r.get("actor_id"),
+                "decision": r.get("decision"),
+                "source": r.get("source"),
+                "tool_name": r.get("tool_name"),
+                "tool_args": r.get("tool_args"),
+                "result": r.get("result"),
+            }
+            for r in rows
+        ],
     }
 
 
 @app.post("/api/chat")
 async def chat(req: ChatRequest):
     """Start or continue a conversation. Returns session_id for SSE streaming."""
-    if req.session_id and req.session_id in _sessions:
-        session = _sessions[req.session_id]
-    else:
+    session = _recover_session(req.session_id) if req.session_id else None
+    if session is None:
         session_id = str(uuid.uuid4())
-        session = Session(id=session_id, thread_id=session_id, source="api")
-        _sessions[session_id] = session
+        session = _track(Session(id=session_id, thread_id=session_id, source="api"))
 
     if session.status == SessionStatus.RUNNING:
         raise HTTPException(409, "Session is already running")
 
     session.status = SessionStatus.RUNNING
+    _save(session)
     session.event_queue = asyncio.Queue()
     loop = asyncio.get_event_loop()
     loop.run_in_executor(
@@ -678,6 +992,9 @@ async def approve(req: ApproveRequest):
         raise HTTPException(409, f"Session not interrupted (status={session.status})")
     if _notifier and session.slack_message_ts:
         _notifier.mark_hitl_processing(session.slack_message_ts, "api-user", "Approval")
+    # NOTE: this endpoint is unauthenticated, so the audit trail can only record
+    # "api-user". Slack clicks carry a real identity; HTTP approvals do not.
+    _audit(session, "approve", actor="api-user")
     session.pending_hitl_actor = "api-user"
     session.pending_hitl_approved = True
     _do_approve(session, asyncio.get_event_loop())
@@ -692,6 +1009,7 @@ async def reject(req: RejectRequest):
         raise HTTPException(409, f"Session not interrupted (status={session.status})")
     if _notifier and session.slack_message_ts:
         _notifier.mark_hitl_processing(session.slack_message_ts, "api-user", "Rejection")
+    _audit(session, "reject", actor="api-user", result=req.reason)
     session.pending_hitl_actor = "api-user"
     session.pending_hitl_approved = False
     _do_reject(session, req.reason, asyncio.get_event_loop())
@@ -704,7 +1022,11 @@ async def edit(req: EditRequest):
     session = _get_session(req.session_id)
     if session.status != SessionStatus.INTERRUPTED:
         raise HTTPException(409, f"Session not interrupted (status={session.status})")
+    # An edit is an approval with modified arguments — record what was actually
+    # authorised, not just that something was.
+    _audit(session, "edit", actor="api-user", result=json.dumps(req.args)[:2000])
     session.status = SessionStatus.RUNNING
+    _save(session)
     session.event_queue = asyncio.Queue()
     loop = asyncio.get_event_loop()
     loop.run_in_executor(

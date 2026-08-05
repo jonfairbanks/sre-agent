@@ -18,6 +18,15 @@ DEFAULT_NAMESPACES = [
 
 API_PORT = int(os.getenv("API_PORT", "8080"))
 
+# Browser origins allowed to call /api/*. Defaults to EMPTY, meaning no
+# cross-origin access. The built-in web UI is served by this same app at "/", so
+# its requests are same-origin and need no grant. A previous "*" meant any page
+# the operator visited while `kubectl port-forward` was open could read
+# /api/audit, which exposes the arguments of approved cluster mutations.
+CORS_ALLOW_ORIGINS = [
+    o.strip() for o in os.getenv("CORS_ALLOW_ORIGINS", "").split(",") if o.strip()
+]
+
 # ---------------------------------------------------------------------------
 # Cost / runaway-loop safety limits
 # ---------------------------------------------------------------------------
@@ -40,6 +49,52 @@ FS_TOOL_RUN_LIMIT = int(os.getenv("FS_TOOL_RUN_LIMIT", "25"))
 # definitions + growing message history so a multi-step loop is not re-billed
 # full input tokens on every model call.
 PROMPT_CACHING = os.getenv("PROMPT_CACHING", "true").lower() in ("1", "true", "yes")
+
+# ---------------------------------------------------------------------------
+# Durable state
+# ---------------------------------------------------------------------------
+# Postgres DSN backing the langgraph checkpointer/store, the session table, the
+# HITL audit log, and monitoring finding-state. When unset the process falls
+# back to in-memory equivalents (fine for `python main.py` locally, but pending
+# HITL approvals and monitoring state do NOT survive a restart).
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+
+# ---------------------------------------------------------------------------
+# Monitoring
+# ---------------------------------------------------------------------------
+# Whether the background scheduler runs at all. This env var was previously
+# documented and set in k8s/deployment.yaml but read by NO code, so the
+# scheduler started unconditionally and MONITORING_ENABLED="false" was silently
+# ignored. Defaults to true to preserve that de-facto behaviour when unset.
+MONITORING_ENABLED = os.getenv("MONITORING_ENABLED", "true").lower() in ("1", "true", "yes")
+
+# ---------------------------------------------------------------------------
+# Monitoring notification policy
+# ---------------------------------------------------------------------------
+# The scheduled health check posts to Slack only when the diff against the
+# previous run contains something new, escalated, or newly resolved. Without
+# this a steady-state cluster problem is re-reported every interval forever,
+# which is what made the scheduler too noisy to leave enabled.
+MONITOR_NOTIFY_ON_RESOLVED = os.getenv("MONITOR_NOTIFY_ON_RESOLVED", "true").lower() in ("1", "true", "yes")
+
+# Force a full report every N checks even when nothing changed, so a quiet
+# channel still proves the bot is alive. 0 disables the digest entirely.
+MONITOR_DIGEST_EVERY_N_CHECKS = int(os.getenv("MONITOR_DIGEST_EVERY_N_CHECKS", "12"))
+
+# How long the Slack "Ack" button suppresses a finding from notifications.
+MONITOR_ACK_HOURS = int(os.getenv("MONITOR_ACK_HOURS", "24"))
+
+# ---------------------------------------------------------------------------
+# HITL authorization
+# ---------------------------------------------------------------------------
+# Comma-separated Slack user IDs (e.g. "U123ABC,U456DEF") allowed to approve or
+# reject cluster mutations. EMPTY MEANS ANY workspace user who can see the
+# message may approve — which is the pre-existing behaviour, preserved as the
+# default so enabling durability does not silently lock anyone out. Set this to
+# lock approvals down to a named on-call group.
+SLACK_APPROVER_IDS = {
+    uid.strip() for uid in os.getenv("SLACK_APPROVER_IDS", "").split(",") if uid.strip()
+}
 
 
 def make_agent_config(thread_id: str) -> dict:
