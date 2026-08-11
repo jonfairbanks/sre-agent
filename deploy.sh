@@ -57,15 +57,30 @@ if grep -q "REPLACE_WITH_BASE64" "${K8S_DIR}/secret.yaml"; then
   exit 1
 fi
 
-echo "==> Applying Kubernetes manifests..."
-kubectl apply -k "${K8S_DIR}"
-
 # deployment.yaml ships a placeholder image so no account-specific registry is
-# committed. Point it at the real one here, before waiting on the rollout, so
-# the placeholder is never actually pulled.
-echo "==> Setting image to ${IMAGE}:${TAG}..."
-kubectl set image deployment/sre-agent \
-  "sre-agent=${IMAGE}:${TAG}" -n "${NAMESPACE}"
+# committed. Substitute it BEFORE applying: patching afterwards created a
+# ReplicaSet with an unparseable image, which failed InvalidImageName and stayed
+# in the rollout history as a broken `kubectl rollout undo` target.
+echo "==> Rendering manifests with image ${IMAGE}:${TAG}..."
+PLACEHOLDER="REPLACE_WITH_YOUR_REGISTRY/sre-agent:latest"
+RENDERED="$(kubectl kustomize "${K8S_DIR}")"
+SUBBED="$(printf '%s' "${RENDERED}" | sed "s|${PLACEHOLDER}|${IMAGE}:${TAG}|g")"
+
+# Fail closed on both halves: the placeholder must be gone, and the real image
+# must be present. Either check alone would let a renamed placeholder through and
+# silently deploy whatever image happened to be in the manifest.
+if printf '%s' "${SUBBED}" | grep -q "REPLACE_WITH_YOUR_REGISTRY"; then
+  echo "ERROR: image placeholder still present after substitution. Aborting."
+  exit 1
+fi
+if ! printf '%s' "${SUBBED}" | grep -qF "${IMAGE}:${TAG}"; then
+  echo "ERROR: expected image ${IMAGE}:${TAG} not found in rendered manifests."
+  echo "       Has the placeholder in k8s/deployment.yaml been renamed?"
+  exit 1
+fi
+
+echo "==> Applying Kubernetes manifests..."
+printf '%s' "${SUBBED}" | kubectl apply -f -
 
 echo "==> Waiting for rollout..."
 kubectl rollout status deployment/sre-agent -n "${NAMESPACE}" --timeout=120s
