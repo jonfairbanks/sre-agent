@@ -7,6 +7,7 @@ This replaces the previous approach that ran the full Deep Agents orchestrator
 """
 from __future__ import annotations
 import asyncio
+import json
 import logging
 import os
 import uuid
@@ -55,6 +56,7 @@ def _collect_cluster_data() -> dict:
         "deployments": [],
         "node_metrics": [],
         "pod_metrics": {},
+        "pvc_usage": {},
         "errors": [],
     }
 
@@ -210,7 +212,60 @@ def _collect_cluster_data() -> dict:
     except Exception as e:
         result["errors"].append(f"pod metrics: {e}")
 
+    # --- PVC utilisation (kubelet Summary API) ---
+    # metrics-server does not expose volume usage, and kubectl_get_pvc reports the
+    # *requested* size, not consumption. Without this a filling volume is invisible
+    # until pods start failing, which is exactly how the 2026-08 incident presented:
+    # the report showed unhealthy pods and gave no path to the full PVCs behind them.
+    try:
+        for node in result["nodes"]:
+            node_name = node["name"]
+            try:
+                # _preload_content=False because the client otherwise coerces the
+                # JSON body into a Python repr that json.loads cannot read.
+                resp = core_v1().connect_get_node_proxy_with_path(
+                    node_name, "stats/summary", _preload_content=False
+                )
+                summary = json.loads(resp.data)
+            except Exception as e:
+                result["errors"].append(f"pvc usage ({node_name}): {e}")
+                continue
+
+            for pod in summary.get("pods", []) or []:
+                for vol in pod.get("volume", []) or []:
+                    ref = vol.get("pvcRef") or {}
+                    name, ns = ref.get("name"), ref.get("namespace")
+                    if not name or not ns:
+                        continue  # ephemeral volume, not backed by a PVC
+                    used, capacity = vol.get("usedBytes"), vol.get("capacityBytes")
+                    if not capacity:
+                        continue
+                    result["pvc_usage"][f"{ns}/{name}"] = {
+                        "used_bytes": used or 0,
+                        "capacity_bytes": capacity,
+                        "percent": round((used or 0) / capacity * 100, 1),
+                        "inodes_used": vol.get("inodesUsed"),
+                        "inodes_free": vol.get("inodesFree"),
+                    }
+    except Exception as e:
+        result["errors"].append(f"pvc usage: {e}")
+
     return result
+
+
+# Only volumes at or above this fill level are listed in the snapshot, so a
+# cluster with many healthy PVCs does not crowd out the rest of the report.
+PVC_USAGE_ALERT_PERCENT = int(os.getenv("PVC_USAGE_ALERT_PERCENT", "70"))
+
+
+def _fmt_bytes(n) -> str:
+    """Render a byte count in the largest sensible binary unit."""
+    if n is None:
+        return "?"
+    for unit, size in (("Ti", 1024 ** 4), ("Gi", 1024 ** 3), ("Mi", 1024 ** 2)):
+        if n >= size:
+            return f"{n / size:.1f}{unit}"
+    return f"{n}B"
 
 
 def _cpu_millicores(value: str):
@@ -398,6 +453,30 @@ def _format_snapshot(data: dict) -> str:
                 _fmt_mem_ki,
             )
             lines.append(f"  {m['name']}  cpu={cpu}  memory={mem}")
+
+    # PVC utilisation. Only the filling ones, plus a count of the rest, so the
+    # model sees the risk without the snapshot growing with every healthy volume.
+    pvc_usage = data.get("pvc_usage") or {}
+    if pvc_usage:
+        hot = sorted(
+            ((k, v) for k, v in pvc_usage.items() if v["percent"] >= PVC_USAGE_ALERT_PERCENT),
+            key=lambda kv: kv[1]["percent"], reverse=True,
+        )
+        if hot:
+            lines.append(
+                f"\n=== PVC UTILIZATION (>={PVC_USAGE_ALERT_PERCENT}%, "
+                f"{len(hot)} of {len(pvc_usage)} volumes) ==="
+            )
+            for key, v in hot:
+                lines.append(
+                    f"  {key}  {_fmt_bytes(v['used_bytes'])}/{_fmt_bytes(v['capacity_bytes'])}"
+                    f"  {v['percent']}%"
+                )
+        else:
+            lines.append(
+                f"\n=== PVC UTILIZATION === all {len(pvc_usage)} volumes below "
+                f"{PVC_USAGE_ALERT_PERCENT}%"
+            )
 
     # HPAs
     if data["hpas"]:
