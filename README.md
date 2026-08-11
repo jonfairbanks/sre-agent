@@ -84,6 +84,7 @@ python api.py         # API + web UI at http://localhost:8080
 | `MONITOR_DIGEST_EVERY_N_CHECKS` | No | Post a report every N checks even when nothing changed; `0` disables (default: `12`) |
 | `MONITOR_NOTIFY_ON_RESOLVED` | No | Announce findings that cleared (default: `true`) |
 | `MONITOR_ACK_HOURS` | No | How long the Slack **Ack** button mutes a finding (default: `24`) |
+| `PVC_USAGE_ALERT_PERCENT` | No | PVCs at or above this fill level are listed individually in the health snapshot (default: `70`) |
 | `DATABASE_URL` | No | Postgres DSN for durable state. Unset = in-memory, and pending approvals do not survive a restart |
 | `SLACK_APPROVER_IDS` | No | Comma-separated Slack user IDs allowed to approve changes. **Empty means anyone who can see the message may approve** |
 | `DEFAULT_NAMESPACES` | No | Comma-separated namespaces to watch (default: auto-discover) |
