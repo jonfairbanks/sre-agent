@@ -21,6 +21,7 @@ from tools import (
     kubectl_uncordon_node,
     kubectl_rollout_restart,
     kubectl_resize_pvc,
+    kubectl_rollback_deployment,
 )
 
 # All write tool names require human approval
@@ -37,6 +38,7 @@ CHANGE_EXECUTOR_INTERRUPT_ON = {
     "kubectl_uncordon_node": True,
     "kubectl_rollout_restart": True,
     "kubectl_resize_pvc": True,
+    "kubectl_rollback_deployment": True,
 }
 
 change_executor_subagent = {
@@ -53,10 +55,12 @@ change_executor_subagent = {
         "## Bulk operations (same action on multiple resources)\n"
         "When scaling multiple deployments/statefulsets: use kubectl_scale_bulk with a JSON array "
         "of all targets — this is ONE tool call and ONE approval for the entire batch.\n"
-        "When deleting multiple resources: collect ALL resources of ALL types into a SINGLE "
+        "When deleting multiple resources: group them into as few calls as possible into "
         "kubectl_delete_resources_bulk call with one JSON array containing everything "
         "(deployments, statefulsets, pvcs, services, configmaps, pods, etc. mixed together). "
-        "Do NOT split by resource type — one call, one approval for the entire batch.\n"
+        "Do NOT split by resource type. Batches are capped at BULK_DELETE_MAX targets, so if a "
+        "request exceeds that, split it into several calls rather than trying to force one. "
+        "Deletions targeting protected namespaces are refused outright.\n"
         "NEVER call kubectl_delete_resources_bulk or kubectl_scale_bulk more than once "
         "for the same user request.\n\n"
         "## Operator-managed / custom resources\n"
@@ -102,6 +106,7 @@ change_executor_subagent = {
         kubectl_uncordon_node,
         kubectl_rollout_restart,
         kubectl_resize_pvc,
+        kubectl_rollback_deployment,
     ],
     "interrupt_on": CHANGE_EXECUTOR_INTERRUPT_ON,
 }

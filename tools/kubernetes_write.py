@@ -645,6 +645,22 @@ def kubectl_scale_bulk(targets_json: str) -> str:
     return _safe(_run)
 
 
+# One approval click executes the whole batch, and the approval payload renders
+# as a stringified interrupt, so an unbounded list is both unreviewable and
+# unrecoverable. Cap it and make the caller split larger deletions.
+BULK_DELETE_MAX = int(os.getenv("BULK_DELETE_MAX", "25"))
+
+# The agent runs inside the cluster it operates on. Deleting from these would
+# take out the control plane or the agent itself, so they are refused outright
+# rather than left to prompt discipline.
+PROTECTED_NAMESPACES = {
+    ns.strip() for ns in os.getenv(
+        "PROTECTED_NAMESPACES",
+        "kube-system,kube-public,kube-node-lease,sre-agent",
+    ).split(",") if ns.strip()
+}
+
+
 @tool
 def kubectl_delete_resources_bulk(targets_json: str) -> str:
     """
@@ -667,6 +683,29 @@ def kubectl_delete_resources_bulk(targets_json: str) -> str:
             targets = json.loads(targets_json)
         except json.JSONDecodeError as e:
             return f"ERROR: Invalid JSON — {e}"
+
+        if not isinstance(targets, list):
+            return "ERROR: targets_json must be a JSON array"
+        if len(targets) > BULK_DELETE_MAX:
+            return (
+                f"REFUSED: {len(targets)} targets exceeds BULK_DELETE_MAX ({BULK_DELETE_MAX}). "
+                "A single approval should not delete more than that. Split the request into "
+                "smaller batches so each one can actually be reviewed."
+            )
+
+        # Reject the whole batch if any target is protected, rather than deleting
+        # part of it. A partially-applied destructive batch is worse than none.
+        blocked = sorted({
+            t.get("namespace", "default") for t in targets
+            if isinstance(t, dict) and t.get("namespace", "default") in PROTECTED_NAMESPACES
+        })
+        if blocked:
+            return (
+                f"REFUSED: batch targets protected namespace(s): {', '.join(blocked)}. "
+                "Nothing was deleted. Protected namespaces are "
+                f"{', '.join(sorted(PROTECTED_NAMESPACES))} (override with PROTECTED_NAMESPACES)."
+            )
+
         body = k8s_client.V1DeleteOptions()
         results = []
         for t in targets:
