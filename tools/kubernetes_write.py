@@ -1,6 +1,7 @@
 """Write Kubernetes tools — ALL require human approval via HITL before execution."""
 from __future__ import annotations
 import json
+import os
 import traceback
 import yaml
 from langchain.tools import tool
@@ -156,6 +157,105 @@ def kubectl_delete_pod(pod_name: str, namespace: str, force: bool = False) -> st
             body.grace_period_seconds = 0
         core_v1().delete_namespaced_pod(pod_name, namespace, body=body)
         return f"Deleted pod {pod_name} in {namespace}."
+    return _safe(_run)
+
+
+# Binary storage suffixes accepted by the Kubernetes quantity format. Decimal
+# suffixes (K/M/G) are deliberately unsupported rather than guessed at, since
+# confusing 10G with 10Gi silently provisions the wrong amount.
+_STORAGE_UNITS = {"Ki": 1, "Mi": 1024, "Gi": 1024 ** 2, "Ti": 1024 ** 3, "Pi": 1024 ** 4}
+
+# A PVC can only grow, so a typo turning 10Gi into 10Ti provisions 1000x the
+# storage and the corresponding bill. Refuse implausible jumps rather than
+# trusting a model-supplied number.
+PVC_MAX_GROWTH_FACTOR = int(os.getenv("PVC_MAX_GROWTH_FACTOR", "10"))
+
+
+def _storage_ki(value: str):
+    """Normalise a Kubernetes storage quantity to KiB. None if unrecognised."""
+    v = str(value or "").strip()
+    if not v:
+        return None
+    try:
+        for suffix, factor in _STORAGE_UNITS.items():
+            if v.endswith(suffix):
+                return int(v[: -len(suffix)]) * factor
+        return int(v) / 1024  # bare bytes
+    except (ValueError, TypeError):
+        return None
+
+
+@tool
+def kubectl_resize_pvc(
+    pvc_name: str,
+    namespace: str,
+    new_size: str,
+) -> str:
+    """
+    Grow a PersistentVolumeClaim's requested storage, e.g. new_size="20Gi".
+
+    Only growth is possible: Kubernetes rejects shrinking a PVC, and expansion
+    requires the StorageClass to set allowVolumeExpansion: true. Both conditions
+    are checked before any change is attempted. Use binary units (Ki/Mi/Gi/Ti).
+    REQUIRES HUMAN APPROVAL before execution.
+    """
+    def _run():
+        want_ki = _storage_ki(new_size)
+        if want_ki is None:
+            return (
+                f"ERROR: could not parse new_size '{new_size}'. "
+                "Use a binary quantity such as 20Gi or 500Mi."
+            )
+
+        pvc = core_v1().read_namespaced_persistent_volume_claim(pvc_name, namespace)
+        current = ((pvc.spec.resources.requests or {}).get("storage")
+                   if pvc.spec and pvc.spec.resources else None)
+        current_ki = _storage_ki(current)
+
+        if current_ki is None:
+            return f"ERROR: PVC {namespace}/{pvc_name} has no parseable current size ({current!r})"
+        if want_ki == current_ki:
+            return f"No change: {namespace}/{pvc_name} is already {current}"
+        if want_ki < current_ki:
+            return (
+                f"REFUSED: cannot shrink {namespace}/{pvc_name} from {current} to {new_size}. "
+                "Kubernetes does not support reducing a PVC. To use less storage, create a "
+                "smaller PVC and migrate the data."
+            )
+        if want_ki > current_ki * PVC_MAX_GROWTH_FACTOR:
+            return (
+                f"REFUSED: {new_size} is more than {PVC_MAX_GROWTH_FACTOR}x the current "
+                f"{current} for {namespace}/{pvc_name}. If this is intended, raise "
+                "PVC_MAX_GROWTH_FACTOR or resize in smaller steps."
+            )
+
+        # Expansion is only permitted when the backing StorageClass allows it.
+        # Checking first turns a confusing API rejection into a clear message.
+        sc_name = pvc.spec.storage_class_name if pvc.spec else None
+        if sc_name:
+            try:
+                sc = k8s_client.StorageV1Api().read_storage_class(sc_name)
+                if not getattr(sc, "allow_volume_expansion", False):
+                    return (
+                        f"REFUSED: StorageClass '{sc_name}' does not set "
+                        f"allowVolumeExpansion: true, so {namespace}/{pvc_name} cannot be "
+                        "resized in place."
+                    )
+            except ApiException as e:
+                return f"ERROR: could not verify StorageClass '{sc_name}' allows expansion — [{e.status}] {e.reason}"
+
+        # Patch only the storage request. Built explicitly so no other spec field
+        # can be touched, even if extra keys were supplied upstream.
+        core_v1().patch_namespaced_persistent_volume_claim(
+            pvc_name, namespace,
+            {"spec": {"resources": {"requests": {"storage": new_size}}}},
+        )
+        return (
+            f"Resized PVC {namespace}/{pvc_name}: {current} -> {new_size}. "
+            "Volume expansion is asynchronous; for filesystem volumes the pod must "
+            "restart before the larger size is visible inside the container. "
+            "Check `kubectl get pvc -n " + namespace + "` for the updated capacity."
+        )
     return _safe(_run)
 
 

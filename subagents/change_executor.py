@@ -20,6 +20,7 @@ from tools import (
     kubectl_cordon_node,
     kubectl_uncordon_node,
     kubectl_rollout_restart,
+    kubectl_resize_pvc,
 )
 
 # All write tool names require human approval
@@ -35,6 +36,7 @@ CHANGE_EXECUTOR_INTERRUPT_ON = {
     "kubectl_cordon_node": True,
     "kubectl_uncordon_node": True,
     "kubectl_rollout_restart": True,
+    "kubectl_resize_pvc": True,
 }
 
 change_executor_subagent = {
@@ -99,6 +101,7 @@ change_executor_subagent = {
         kubectl_cordon_node,
         kubectl_uncordon_node,
         kubectl_rollout_restart,
+        kubectl_resize_pvc,
     ],
     "interrupt_on": CHANGE_EXECUTOR_INTERRUPT_ON,
 }
