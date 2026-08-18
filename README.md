@@ -117,8 +117,13 @@ docker buildx build --platform linux/amd64 \
   -t your-registry/sre-agent:latest --push .
 # Update image in k8s/deployment.yaml
 
-# 3. Create the secrets file (never commit this)
-#   Values under data: must be base64-encoded; stringData: accepts plain text
+# 3. Create the secrets file from the template (never commit the result)
+cp k8s/secret.yaml.example k8s/secret.yaml
+#   The template uses stringData, so paste plaintext and skip base64 entirely.
+#   Only ANTHROPIC_API_KEY is required; the rest are marked optional: true in
+#   deployment.yaml, so a missing key leaves its env var unset rather than
+#   stopping the pod. If you switch to data:, encode with printf, never
+#   `echo` without -n (the trailing newline produces a token the API rejects).
 echo -n "sk-ant-..." | base64   # ANTHROPIC_API_KEY
 echo -n "lsv2_..."  | base64   # LANGSMITH_API_KEY
 echo -n "xoxb-..."  | base64   # SLACK_BOT_TOKEN
@@ -201,6 +206,7 @@ subagents/
   config_auditor.py
   change_executor.py      Only subagent with write tools
 k8s/                  Kustomize manifests for cluster deployment
+  secret.yaml.example   Template for the secret; copy to secret.yaml and fill in
                       (postgres.yaml = StatefulSet + Service + NetworkPolicy)
 tests/
   test_monitor_state.py   Fingerprint stability and diff semantics

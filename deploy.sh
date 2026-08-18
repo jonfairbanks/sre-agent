@@ -65,15 +65,25 @@ aws eks update-kubeconfig --name "${CLUSTER}" --region "${AWS_REGION}"
 
 echo "==> Checking secrets are populated..."
 K8S_DIR="$(dirname "$0")/k8s"
-if grep -q "REPLACE_WITH_BASE64" "${K8S_DIR}/secret.yaml"; then
+if [ ! -f "${K8S_DIR}/secret.yaml" ]; then
+  echo ""
+  echo "ERROR: k8s/secret.yaml does not exist."
+  echo "  cp k8s/secret.yaml.example k8s/secret.yaml   # then fill in the values"
+  echo ""
+  exit 1
+fi
+# REPLACE_ME is the sentinel in secret.yaml.example; REPLACE_WITH_BASE64 is the
+# older one, still matched so an existing unfilled secret.yaml is caught too.
+if grep -qE "REPLACE_ME|REPLACE_WITH_BASE64" "${K8S_DIR}/secret.yaml"; then
   echo ""
   echo "ERROR: k8s/secret.yaml still contains placeholder values."
-  echo "Run the following to encode your keys, then paste into k8s/secret.yaml:"
+  echo "Fill them in. secret.yaml.example uses stringData, so paste plaintext;"
+  echo "if you switched it to data:, encode with printf (never echo without -n):"
   echo ""
-  echo "  echo -n 'sk-ant-...'   | base64   # ANTHROPIC_API_KEY"
-  echo "  echo -n 'lsv2_pt_...' | base64   # LANGSMITH_API_KEY"
-  echo "  echo -n 'xoxb-...'    | base64   # SLACK_BOT_TOKEN"
-  echo "  echo -n 'xapp-...'    | base64   # SLACK_APP_TOKEN"
+  echo "  printf '%s' 'sk-ant-...' | base64   # ANTHROPIC_API_KEY"
+  echo "  printf '%s' 'lsv2_pt_...' | base64   # LANGSMITH_API_KEY"
+  echo "  printf '%s' 'xoxb-...'    | base64   # SLACK_BOT_TOKEN"
+  echo "  printf '%s' 'xapp-...'    | base64   # SLACK_APP_TOKEN"
   echo ""
   exit 1
 fi
