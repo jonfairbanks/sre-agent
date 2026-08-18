@@ -45,6 +45,17 @@ MODEL_CALL_THREAD_LIMIT = int(os.getenv("MODEL_CALL_THREAD_LIMIT", "120"))
 TOOL_CALL_RUN_LIMIT = int(os.getenv("TOOL_CALL_RUN_LIMIT", "80"))
 FS_TOOL_RUN_LIMIT = int(os.getenv("FS_TOOL_RUN_LIMIT", "25"))
 
+# Max characters any single tool result may contribute to the message history.
+# Every other limit in this file counts CALLS; none bounded bytes, and that is how
+# a run reached a 632,740-token prompt against a 200,000 ceiling while satisfying
+# all of them: 80 tool calls x ~8k tokens = 640k. Summarization cannot rescue that,
+# because it triggers at 170k and therefore has only 30k of headroom, while a
+# single fan-out step was observed adding ~580k.
+# Sized against that 30k headroom rather than a round number: at ~4 chars per
+# token, 12000 chars is ~3k tokens, so an 8-way parallel fan-out adds ~24k and
+# still fits. Only one output observed in production exceeded it (20,451 chars).
+TOOL_OUTPUT_MAX_CHARS = int(os.getenv("TOOL_OUTPUT_MAX_CHARS", "12000"))
+
 # Anthropic prompt caching — caches the large static system prompt + tool
 # definitions + growing message history so a multi-step loop is not re-billed
 # full input tokens on every model call.

@@ -94,6 +94,7 @@ python api.py         # API + web UI at http://localhost:8080
 | `DEFAULT_NAMESPACES` | No | Comma-separated namespaces to watch (default: auto-discover) |
 | `PROMETHEUS_URL` | No | Prometheus endpoint for richer metrics |
 | `API_PORT` | No | Port for API server (default: `8080`) |
+| `TOOL_OUTPUT_MAX_CHARS` | No | Max characters a single tool result may add to context (default: `12000`) |
 | `CORS_ALLOW_ORIGINS` | No | Comma-separated browser origins allowed to call `/api/*`. Empty (default) means none; the bundled UI is same-origin and needs no grant |
 
 ## Deploy to Kubernetes
