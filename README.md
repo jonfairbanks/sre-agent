@@ -298,3 +298,7 @@ TEST_DATABASE_URL=postgresql://sre_agent:testpw@127.0.0.1:55433/sre_agent \
 - Postgres traffic is unencrypted cluster-internal traffic; a NetworkPolicy in
   `k8s/postgres.yaml` restricts port 5432 to the `sre-agent` pod
 - If you suspect keys were exposed, rotate them immediately via the respective provider dashboards
+
+## License
+
+MIT. See [LICENSE](LICENSE).
