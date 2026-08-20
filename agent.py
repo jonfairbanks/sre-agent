@@ -8,15 +8,16 @@ from langchain.agents.middleware import (
 )
 
 from config import (
-    MODEL,
     DATABASE_URL,
     DEFAULT_NAMESPACES,
+    LLM_PROVIDER,
     PROMPT_CACHING,
     MODEL_CALL_RUN_LIMIT,
     MODEL_CALL_THREAD_LIMIT,
     TOOL_CALL_RUN_LIMIT,
     FS_TOOL_RUN_LIMIT,
 )
+from llm import get_main_model
 from tools import READ_TOOLS
 from subagents import ALL_SUBAGENTS
 
@@ -43,7 +44,7 @@ def _build_middleware() -> list:
     """Middleware stack: prompt caching + hard runaway-loop / cost limits."""
     middleware: list = []
 
-    if PROMPT_CACHING:
+    if PROMPT_CACHING and LLM_PROVIDER == "anthropic":
         middleware.append(anthropic_prompt_caching)
 
     # Backstop against runaway model spend (per-run and per-thread).
@@ -164,7 +165,7 @@ def create_sre_agent(
 
     agent = create_deep_agent(
         name="sre-agent",
-        model=MODEL,
+        model=get_main_model(),
         tools=tools,
         system_prompt=SYSTEM_PROMPT,
         subagents=ALL_SUBAGENTS,

@@ -1,0 +1,17 @@
+apiVersion: v2
+name: sre-agent
+description: Kubernetes SRE agent with provider-selectable LLMs and approval-gated remediation
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/jonfairbanks/sre-agent
+sources:
+  - https://github.com/jonfairbanks/sre-agent
+keywords:
+  - sre
+  - kubernetes
+  - ai
+  - anthropic
+  - openai
+maintainers:
+  - name: Jon Fairbanks

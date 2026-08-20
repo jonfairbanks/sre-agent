@@ -1,0 +1,161 @@
+replicaCount: 1
+
+image:
+  repository: ghcr.io/jonfairbanks/sre-agent
+  pullPolicy: IfNotPresent
+  # Defaults to Chart.appVersion when empty.
+  tag: ""
+  # When set, takes precedence over tag (for example, sha256:abc...).
+  digest: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  automount: true
+  annotations: {}
+  name: ""
+
+rbac:
+  # The agent needs cluster-wide reads to inspect all namespaces and nodes.
+  read:
+    create: true
+  # This grants broad cluster-wide mutation rights. Every write remains subject
+  # to the application's HITL gate, but production installs should enable this
+  # only after configuring authenticated approval access.
+  write:
+    create: false
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+service:
+  type: ClusterIP
+  port: 80
+  annotations: {}
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: sre-agent.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
+
+livenessProbe:
+  httpGet:
+    path: /health
+    port: http
+  initialDelaySeconds: 15
+  periodSeconds: 30
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /health
+    port: http
+  initialDelaySeconds: 10
+  periodSeconds: 10
+
+strategy:
+  type: Recreate
+
+terminationGracePeriodSeconds: 30
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+
+volumes:
+  tmp:
+    emptyDir: {}
+  conversationHistory:
+    emptyDir: {}
+
+config:
+  llmProvider: anthropic
+  anthropicModel: claude-sonnet-4-6
+  anthropicSubagentModel: claude-haiku-4-5-20251001
+  openaiModel: gpt-5.6-sol
+  openaiSubagentModel: gpt-5.6-luna
+
+  monitoringEnabled: true
+  monitorIntervalMinutes: 60
+  monitorDigestEveryNChecks: 12
+  monitorNotifyOnResolved: true
+  monitorAckHours: 24
+
+  langsmithTracing: false
+  langsmithProject: sre-agent
+  slackChannel: "#sre-alerts"
+  slackApproverIds: ""
+
+  defaultNamespaces: ""
+  prometheusUrl: ""
+  corsAllowOrigins: ""
+
+  agentRecursionLimit: 60
+  modelCallRunLimit: 40
+  modelCallThreadLimit: 120
+  toolCallRunLimit: 80
+  fsToolRunLimit: 25
+  promptCaching: true
+
+# Use an existing Secret whenever possible. The chart reads the following keys:
+# ANTHROPIC_API_KEY, OPENAI_API_KEY, ANTHROPIC_BASE_URL, OPENAI_BASE_URL,
+# LC_GATEWAY_KEY, LANGSMITH_API_KEY, LANGSMITH_WORKSPACE_ID,
+# LANGSMITH_RUNS_ENDPOINTS, SLACK_BOT_TOKEN, SLACK_APP_TOKEN, DATABASE_URL.
+existingSecret: ""
+
+# Convenience for development. Values are written to a Kubernetes Secret and
+# will be present in Helm release state; production installs should prefer
+# existingSecret with an externally managed Secret.
+secrets:
+  create: false
+  annotations: {}
+  anthropicApiKey: ""
+  openaiApiKey: ""
+  anthropicBaseUrl: ""
+  openaiBaseUrl: ""
+  lcGatewayKey: ""
+  langsmithApiKey: ""
+  langsmithWorkspaceId: ""
+  langsmithRunsEndpoints: ""
+  slackBotToken: ""
+  slackAppToken: ""
+  databaseUrl: ""
+
+extraEnv: []
+extraEnvFrom: []
+
+tests:
+  enabled: true

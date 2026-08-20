@@ -1,0 +1,150 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "sre-agent.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sre-agent.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  strategy:
+    {{- toYaml .Values.strategy | nindent 4 }}
+  selector:
+    matchLabels:
+      {{- include "sre-agent.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        {{- if and .Values.secrets.create (not .Values.existingSecret) }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "sre-agent.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "sre-agent.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automount }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: {{ .Chart.Name }}
+          {{- if .Values.image.digest }}
+          image: "{{ .Values.image.repository }}@{{ .Values.image.digest }}"
+          {{- else }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          {{- end }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: LLM_PROVIDER
+              value: {{ .Values.config.llmProvider | quote }}
+            - name: ANTHROPIC_MODEL
+              value: {{ .Values.config.anthropicModel | quote }}
+            - name: ANTHROPIC_SUBAGENT_MODEL
+              value: {{ .Values.config.anthropicSubagentModel | quote }}
+            - name: OPENAI_MODEL
+              value: {{ .Values.config.openaiModel | quote }}
+            - name: OPENAI_SUBAGENT_MODEL
+              value: {{ .Values.config.openaiSubagentModel | quote }}
+            - name: MONITORING_ENABLED
+              value: {{ .Values.config.monitoringEnabled | quote }}
+            - name: MONITOR_INTERVAL_MINUTES
+              value: {{ .Values.config.monitorIntervalMinutes | quote }}
+            - name: MONITOR_DIGEST_EVERY_N_CHECKS
+              value: {{ .Values.config.monitorDigestEveryNChecks | quote }}
+            - name: MONITOR_NOTIFY_ON_RESOLVED
+              value: {{ .Values.config.monitorNotifyOnResolved | quote }}
+            - name: MONITOR_ACK_HOURS
+              value: {{ .Values.config.monitorAckHours | quote }}
+            - name: LANGSMITH_TRACING
+              value: {{ .Values.config.langsmithTracing | quote }}
+            - name: LANGCHAIN_TRACING_V2
+              value: {{ .Values.config.langsmithTracing | quote }}
+            - name: LANGSMITH_PROJECT
+              value: {{ .Values.config.langsmithProject | quote }}
+            - name: LANGCHAIN_PROJECT
+              value: {{ .Values.config.langsmithProject | quote }}
+            - name: SLACK_CHANNEL
+              value: {{ .Values.config.slackChannel | quote }}
+            - name: SLACK_APPROVER_IDS
+              value: {{ .Values.config.slackApproverIds | quote }}
+            - name: DEFAULT_NAMESPACES
+              value: {{ .Values.config.defaultNamespaces | quote }}
+            - name: PROMETHEUS_URL
+              value: {{ .Values.config.prometheusUrl | quote }}
+            - name: CORS_ALLOW_ORIGINS
+              value: {{ .Values.config.corsAllowOrigins | quote }}
+            - name: AGENT_RECURSION_LIMIT
+              value: {{ .Values.config.agentRecursionLimit | quote }}
+            - name: MODEL_CALL_RUN_LIMIT
+              value: {{ .Values.config.modelCallRunLimit | quote }}
+            - name: MODEL_CALL_THREAD_LIMIT
+              value: {{ .Values.config.modelCallThreadLimit | quote }}
+            - name: TOOL_CALL_RUN_LIMIT
+              value: {{ .Values.config.toolCallRunLimit | quote }}
+            - name: FS_TOOL_RUN_LIMIT
+              value: {{ .Values.config.fsToolRunLimit | quote }}
+            - name: PROMPT_CACHING
+              value: {{ .Values.config.promptCaching | quote }}
+            {{- range $key := list "ANTHROPIC_API_KEY" "OPENAI_API_KEY" "ANTHROPIC_BASE_URL" "OPENAI_BASE_URL" "LC_GATEWAY_KEY" "LANGSMITH_API_KEY" "LANGSMITH_WORKSPACE_ID" "LANGSMITH_RUNS_ENDPOINTS" "SLACK_BOT_TOKEN" "SLACK_APP_TOKEN" "DATABASE_URL" }}
+            - name: {{ $key }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "sre-agent.secretName" $ }}
+                  key: {{ $key }}
+                  optional: true
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.extraEnvFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          livenessProbe:
+            {{- toYaml .Values.livenessProbe | nindent 12 }}
+          readinessProbe:
+            {{- toYaml .Values.readinessProbe | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: conversation-history
+              mountPath: /app/conversation_history
+      volumes:
+        - name: tmp
+          {{- toYaml .Values.volumes.tmp | nindent 10 }}
+        - name: conversation-history
+          {{- toYaml .Values.volumes.conversationHistory | nindent 10 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}

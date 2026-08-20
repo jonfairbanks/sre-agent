@@ -1,0 +1,9 @@
+{{- if and .Values.existingSecret .Values.secrets.create }}
+{{- fail "set either existingSecret or secrets.create=true, not both" }}
+{{- end }}
+{{- if and .Values.secrets.create (eq .Values.config.llmProvider "openai") (not .Values.secrets.openaiApiKey) }}
+{{- fail "secrets.openaiApiKey is required when secrets.create=true and config.llmProvider=openai" }}
+{{- end }}
+{{- if and .Values.secrets.create (eq .Values.config.llmProvider "anthropic") (not .Values.secrets.anthropicApiKey) }}
+{{- fail "secrets.anthropicApiKey is required when secrets.create=true and config.llmProvider=anthropic" }}
+{{- end }}

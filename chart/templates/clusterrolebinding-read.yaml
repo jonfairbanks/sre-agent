@@ -1,0 +1,16 @@
+{{- if .Values.rbac.read.create }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "sre-agent.fullname" . }}-reader
+  labels:
+    {{- include "sre-agent.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "sre-agent.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: ClusterRole
+  name: {{ include "sre-agent.fullname" . }}-reader
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}
