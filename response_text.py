@@ -7,10 +7,11 @@ from typing import Any
 def response_text(message_or_content: Any) -> str:
     """Return text from a LangChain message or a structured content payload.
 
-    OpenAI's Responses API may represent an assistant response as a list of
-    content blocks (for example ``[{"type": "text", "text": "..."}]``).
-    Passing that list to a browser or Slack coerces each dict to an unhelpful
-    object representation, so callers must normalize it before display.
+    Anthropic returns assistant content as a string, while OpenAI's Responses
+    API may return a list of content blocks (for example
+    ``[{"type": "text", "text": "..."}]``). Passing the latter directly to
+    a browser or Slack coerces each dict to an unhelpful object representation,
+    so callers normalize both provider shapes at this boundary.
     """
     content = getattr(message_or_content, "content", message_or_content)
     return _content_text(content)

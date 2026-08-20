@@ -6,11 +6,11 @@ class Message:
         self.content = content
 
 
-def test_response_text_returns_string_content():
+def test_response_text_preserves_anthropic_string_content():
     assert response_text(Message("Cluster is healthy.")) == "Cluster is healthy."
 
 
-def test_response_text_extracts_openai_content_blocks():
+def test_response_text_extracts_openai_responses_content_blocks():
     content = [
         {"type": "reasoning", "summary": "internal"},
         {"type": "text", "text": "CPU usage is within limits."},

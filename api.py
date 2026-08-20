@@ -1071,7 +1071,7 @@ _UI_HTML = """<!DOCTYPE html>
   header h1 { font-size: 18px; font-weight: 600; color: #63b3ed; }
   .badge { background: #2d3748; color: #68d391; font-size: 11px; padding: 2px 8px; border-radius: 12px; }
   #chat { flex: 1; overflow-y: auto; padding: 24px; display: flex; flex-direction: column; gap: 16px; }
-  .msg { max-width: 80%; padding: 12px 16px; border-radius: 12px; line-height: 1.6; font-size: 14px; }
+  .msg { max-width: 80%; padding: 12px 16px; border-radius: 12px; line-height: 1.6; white-space: pre-wrap; font-size: 14px; }
   .msg.user { align-self: flex-end; background: #2b6cb0; color: #fff; }
   .msg.bot { align-self: flex-start; background: #1a1d2e; border: 1px solid #2d3748; }
   .msg.bot p { margin: 0 0 10px; }
@@ -1116,7 +1116,7 @@ _UI_HTML = """<!DOCTYPE html>
   <span class="badge">Kubernetes</span>
   <span class="badge" id="slack-badge">Slack: checking...</span>
   <span class="badge" id="status-badge">Ready</span>
-  <button id="trigger-check" onclick="triggerCheck()" style="margin-left:auto;background:#2d3748;color:#a0aec0;border:1px solid #4a5568;border-radius:6px;padding:4px 12px;font-size:12px;cursor:pointer">▶ Trigger Slack Check</button>
+  <button id="trigger-check" onclick="triggerCheck()" style="margin-left:auto;background:#2d3748;color:#a0aec0;border:1px solid #4a5568;border-radius:6px;padding:4px 12px;font-size:12px;cursor:pointer">▶ Trigger Check Now</button>
 </header>
 <div id="chat"></div>
 <div class="shortcuts">
