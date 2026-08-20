@@ -1071,9 +1071,26 @@ _UI_HTML = """<!DOCTYPE html>
   header h1 { font-size: 18px; font-weight: 600; color: #63b3ed; }
   .badge { background: #2d3748; color: #68d391; font-size: 11px; padding: 2px 8px; border-radius: 12px; }
   #chat { flex: 1; overflow-y: auto; padding: 24px; display: flex; flex-direction: column; gap: 16px; }
-  .msg { max-width: 80%; padding: 12px 16px; border-radius: 12px; line-height: 1.6; white-space: pre-wrap; font-size: 14px; }
+  .msg { max-width: 80%; padding: 12px 16px; border-radius: 12px; line-height: 1.6; font-size: 14px; }
   .msg.user { align-self: flex-end; background: #2b6cb0; color: #fff; }
   .msg.bot { align-self: flex-start; background: #1a1d2e; border: 1px solid #2d3748; }
+  .msg.bot p { margin: 0 0 10px; }
+  .msg.bot p:last-child { margin-bottom: 0; }
+  .msg.bot h1, .msg.bot h2, .msg.bot h3 { color: #f7fafc; line-height: 1.3; margin: 14px 0 8px; }
+  .msg.bot h1 { font-size: 18px; } .msg.bot h2 { font-size: 16px; } .msg.bot h3 { font-size: 14px; }
+  .msg.bot h1:first-child, .msg.bot h2:first-child, .msg.bot h3:first-child { margin-top: 0; }
+  .msg.bot ul, .msg.bot ol { margin: 6px 0 10px 20px; }
+  .msg.bot li { margin: 4px 0; }
+  .msg.bot code { background: #2d3748; border-radius: 4px; padding: 1px 4px; color: #bee3f8; }
+  .msg.bot pre { overflow-x: auto; background: #111827; border-radius: 6px; padding: 10px; margin: 8px 0; white-space: pre-wrap; }
+  .msg.bot pre code { background: none; padding: 0; }
+  .msg.bot a { color: #90cdf4; }
+  .msg.typing { display: flex; align-items: center; gap: 8px; color: #a0aec0; font-style: italic; }
+  .typing-dots { display: inline-flex; gap: 3px; }
+  .typing-dots i { width: 5px; height: 5px; border-radius: 50%; background: #63b3ed; animation: pulse 1.2s infinite ease-in-out; }
+  .typing-dots i:nth-child(2) { animation-delay: 0.15s; }
+  .typing-dots i:nth-child(3) { animation-delay: 0.3s; }
+  @keyframes pulse { 0%, 60%, 100% { opacity: .3; transform: scale(.8); } 30% { opacity: 1; transform: scale(1); } }
   .msg.interrupt { align-self: flex-start; background: #744210; border: 1px solid #d69e2e; color: #fefcbf; width: 100%; max-width: 100%; }
   .msg.error { background: #742a2a; border: 1px solid #fc8181; }
   .interrupt-actions { display: flex; gap: 8px; margin-top: 12px; }
@@ -1085,6 +1102,7 @@ _UI_HTML = """<!DOCTYPE html>
   #msg-input:focus { outline: none; border-color: #63b3ed; }
   #send-btn { background: #2b6cb0; color: #fff; border: none; border-radius: 8px; padding: 10px 20px; cursor: pointer; font-weight: 600; }
   #send-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  #trigger-check:disabled { opacity: 0.45; cursor: not-allowed; }
   .shortcuts { display: flex; gap: 8px; padding: 8px 24px; flex-wrap: wrap; }
   .shortcut { background: #1a1d2e; border: 1px solid #2d3748; color: #a0aec0; border-radius: 6px; padding: 4px 12px; font-size: 12px; cursor: pointer; }
   .shortcut:hover { border-color: #63b3ed; color: #63b3ed; }
@@ -1098,7 +1116,7 @@ _UI_HTML = """<!DOCTYPE html>
   <span class="badge">Kubernetes</span>
   <span class="badge" id="slack-badge">Slack: checking...</span>
   <span class="badge" id="status-badge">Ready</span>
-  <button onclick="triggerCheck()" style="margin-left:auto;background:#2d3748;color:#a0aec0;border:1px solid #4a5568;border-radius:6px;padding:4px 12px;font-size:12px;cursor:pointer">▶ Trigger Check Now</button>
+  <button id="trigger-check" onclick="triggerCheck()" style="margin-left:auto;background:#2d3748;color:#a0aec0;border:1px solid #4a5568;border-radius:6px;padding:4px 12px;font-size:12px;cursor:pointer">▶ Trigger Slack Check</button>
 </header>
 <div id="chat"></div>
 <div class="shortcuts">
@@ -1115,17 +1133,68 @@ _UI_HTML = """<!DOCTYPE html>
 <script>
 let sessionId = null;
 let eventSource = null;
+let progressMessage = null;
+let progressStartedAt = null;
+let slackEnabled = false;
 
 fetch('/health').then(r=>r.json()).then(d=>{
-  document.getElementById('slack-badge').textContent = 'Slack: ' + (d.slack_enabled ? 'on' : 'off');
-  document.getElementById('slack-badge').style.color = d.slack_enabled ? '#68d391' : '#fc8181';
+  slackEnabled = Boolean(d.slack_enabled);
+  document.getElementById('slack-badge').textContent = 'Slack: ' + (slackEnabled ? 'on' : 'off');
+  document.getElementById('slack-badge').style.color = slackEnabled ? '#68d391' : '#fc8181';
+  const trigger = document.getElementById('trigger-check');
+  trigger.disabled = !slackEnabled;
+  trigger.title = slackEnabled
+    ? 'Run a health check and deliver the summary to Slack.'
+    : 'Slack is disabled, so scheduled check summaries have nowhere to go.';
+}).catch(() => {
+  document.getElementById('slack-badge').textContent = 'Slack: unavailable';
 });
 
-function appendMsg(text, cls) {
+function escapeHtml(text) {
+  return String(text).replace(/[&<>"']/g, c => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'}[c]));
+}
+function renderInline(text) {
+  return text
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/[*][*]([^*]+)[*][*]/g, '<strong>$1</strong>')
+    .replace(/__([^_]+)__/g, '<strong>$1</strong>')
+    .replace(/[*]([^*]+)[*]/g, '<em>$1</em>')
+    .replace(/_([^_]+)_/g, '<em>$1</em>')
+    .replace(/\\[([^\\]]+)\\]\\((https?:\\/\\/[^\\s)]+)\\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+}
+function renderMarkdown(text) {
+  const lines = escapeHtml(text).split('\\n');
+  const html = [];
+  let list = null;
+  let inCode = false;
+  const closeList = () => { if (list) { html.push(`</${list}>`); list = null; } };
+  for (const line of lines) {
+    if (line.startsWith('```')) {
+      closeList();
+      html.push(inCode ? '</code></pre>' : '<pre><code>');
+      inCode = !inCode;
+      continue;
+    }
+    if (inCode) { html.push(line + '\\n'); continue; }
+    const heading = line.match(/^(#{1,3})\\s+(.+)$/);
+    const bullet = line.match(/^\\s*[-*+•]\\s+(.+)$/);
+    const ordered = line.match(/^\\s*\\d+\\.\\s+(.+)$/);
+    if (heading) { closeList(); const level = heading[1].length; html.push(`<h${level}>${renderInline(heading[2])}</h${level}>`); }
+    else if (bullet) { if (list !== 'ul') { closeList(); html.push('<ul>'); list = 'ul'; } html.push(`<li>${renderInline(bullet[1])}</li>`); }
+    else if (ordered) { if (list !== 'ol') { closeList(); html.push('<ol>'); list = 'ol'; } html.push(`<li>${renderInline(ordered[1])}</li>`); }
+    else if (!line.trim()) { closeList(); }
+    else { closeList(); html.push(`<p>${renderInline(line)}</p>`); }
+  }
+  closeList();
+  if (inCode) html.push('</code></pre>');
+  return html.join('');
+}
+function appendMsg(text, cls, markdown = false) {
   const chat = document.getElementById('chat');
   const div = document.createElement('div');
   div.className = 'msg ' + cls;
-  div.textContent = text;
+  if (markdown) div.innerHTML = renderMarkdown(text);
+  else div.textContent = text;
   chat.appendChild(div);
   chat.scrollTop = chat.scrollHeight;
   return div;
@@ -1135,21 +1204,42 @@ function setInputEnabled(v) {
   document.getElementById('send-btn').disabled = !v;
   document.getElementById('msg-input').disabled = !v;
 }
+function beginProgress(label) {
+  endProgress();
+  progressStartedAt = Date.now();
+  progressMessage = appendMsg('', 'bot typing');
+  progressMessage.innerHTML = `<span class="typing-dots"><i></i><i></i><i></i></span><span>${escapeHtml(label)}</span>`;
+}
+function updateProgress(label) {
+  if (!progressMessage) return;
+  const elapsed = Math.max(1, Math.round((Date.now() - progressStartedAt) / 1000));
+  progressMessage.lastElementChild.textContent = `${label} (${elapsed}s)`;
+}
+function endProgress() {
+  if (progressMessage) progressMessage.remove();
+  progressMessage = null;
+  progressStartedAt = null;
+}
 async function sendMessage() {
   const input = document.getElementById('msg-input');
   const text = input.value.trim(); if (!text) return;
   input.value = '';
   appendMsg(text, 'user');
   setInputEnabled(false); setStatus('Running...');
-  const typingMsg = appendMsg('Analyzing...', 'bot typing');
-  const res = await fetch('/api/chat', {
-    method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({message: text, session_id: sessionId}),
-  });
-  const data = await res.json();
-  sessionId = data.session_id;
-  typingMsg.remove();
-  listenForEvents();
+  beginProgress('Analyzing your request…');
+  try {
+    const res = await fetch('/api/chat', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({message: text, session_id: sessionId}),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    const data = await res.json();
+    sessionId = data.session_id;
+    updateProgress('Inspecting the cluster…');
+    listenForEvents();
+  } catch (error) {
+    endProgress(); appendMsg('Error: ' + error.message, 'error'); setStatus('Error'); setInputEnabled(true);
+  }
 }
 function listenForEvents() {
   if (eventSource) eventSource.close();
@@ -1157,15 +1247,18 @@ function listenForEvents() {
   eventSource.onmessage = (e) => {
     const ev = JSON.parse(e.data);
     if (ev.type === 'done') {
-      appendMsg(ev.data, 'bot'); setStatus('Ready'); setInputEnabled(true); eventSource.close();
+      endProgress(); appendMsg(ev.data, 'bot', true); setStatus('Ready'); setInputEnabled(true); eventSource.close();
     } else if (ev.type === 'interrupt') {
-      showInterrupt(ev.data); setStatus('Approval Required'); eventSource.close();
+      endProgress(); showInterrupt(ev.data); setStatus('Approval Required'); eventSource.close();
     } else if (ev.type === 'error') {
-      appendMsg('Error: ' + ev.data, 'msg error'); setStatus('Error'); setInputEnabled(true); eventSource.close();
+      endProgress(); appendMsg('Error: ' + ev.data, 'error'); setStatus('Error'); setInputEnabled(true); eventSource.close();
+    } else if (ev.type === 'heartbeat') {
+      updateProgress('Still working…');
     } else if (ev.type === 'todos') {
       showTodos(ev.data);
     }
   };
+  eventSource.onerror = () => updateProgress('Waiting for the agent…');
 }
 function showInterrupt(data) {
   const chat = document.getElementById('chat');
@@ -1183,10 +1276,15 @@ function showInterrupt(data) {
 }
 async function respond(decision, div, reason) {
   div.remove(); setStatus('Running...');
-  const typingMsg = appendMsg('Continuing...', 'bot typing');
+  beginProgress('Continuing with your decision…');
   const body = decision === 'reject' ? {session_id: sessionId, reason: reason||''} : {session_id: sessionId};
-  await fetch('/api/' + decision, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
-  typingMsg.remove(); listenForEvents();
+  try {
+    const res = await fetch('/api/' + decision, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+    if (!res.ok) throw new Error(await res.text());
+    listenForEvents();
+  } catch (error) {
+    endProgress(); appendMsg('Error: ' + error.message, 'error'); setStatus('Error'); setInputEnabled(true);
+  }
 }
 function showTodos(todos) {
   const icons = {completed:'✅', in_progress:'🔄', pending:'⏳'};
@@ -1199,9 +1297,18 @@ function showTodos(todos) {
   chat.appendChild(div); chat.scrollTop = chat.scrollHeight;
 }
 async function triggerCheck() {
-  appendMsg('Triggering immediate health check...', 'bot');
-  await fetch('/api/trigger-check', {method:'POST'});
-  appendMsg('Health check started. Results will appear in Slack.', 'bot');
+  if (!slackEnabled) return;
+  const trigger = document.getElementById('trigger-check');
+  trigger.disabled = true;
+  try {
+    const res = await fetch('/api/trigger-check', {method:'POST'});
+    if (!res.ok) throw new Error(await res.text());
+    appendMsg('Slack health check started. Its summary will be delivered to Slack.', 'bot');
+  } catch (error) {
+    appendMsg('Error: ' + error.message, 'error');
+  } finally {
+    trigger.disabled = false;
+  }
 }
 function quickSend(text) { document.getElementById('msg-input').value = text; sendMessage(); }
 function onKey(e) { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); } }
