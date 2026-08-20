@@ -1,0 +1,49 @@
+{{- if .Values.tests.enabled }}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: "{{ include "sre-agent.fullname" . }}-test-connection"
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sre-agent.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  {{- with .Values.imagePullSecrets }}
+  imagePullSecrets:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: health
+      {{- if .Values.image.digest }}
+      image: "{{ .Values.image.repository }}@{{ .Values.image.digest }}"
+      {{- else }}
+      image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+      {{- end }}
+      imagePullPolicy: {{ .Values.image.pullPolicy }}
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      command:
+        - python
+        - -c
+        - >-
+          import json, urllib.request;
+          response = urllib.request.urlopen(
+              "http://{{ include "sre-agent.fullname" . }}:{{ .Values.service.port }}/health",
+              timeout=10,
+          );
+          body = json.load(response);
+          assert response.status == 200 and body.get("status") == "ok", body
+{{- end }}

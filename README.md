@@ -9,7 +9,8 @@ An autonomous Kubernetes SRE agent. It monitors cluster health, diagnoses issues
 - **Slack integration** — alerts, health reports, and HITL approve/reject buttons via Socket Mode (no public ingress needed). Mention the bot in a channel and it replies in-thread
 - **Fast interactive health checks** — a "run a health check" mention is served by the same bounded path as the scheduler (direct cluster reads + a single structured-output call), so it returns in seconds and can never hit the agent's recursion limit — unlike routing it through the full orchestrator
 - **Custom resource support** — the change-executor can create, update, and delete CRD instances, so it can remove an operator's top-level custom resource (e.g. an `lgps.apps.langchain.ai`) instead of fighting the operator's reconciliation loop
-- **Model gateway support** — route Claude calls through a LangChain/LangSmith model gateway by setting `ANTHROPIC_BASE_URL`; unset, it calls Anthropic directly
+- **Anthropic and OpenAI support** — select the provider with `LLM_PROVIDER`; each provider supports independent main and lower-cost worker model overrides
+- **Model gateway support** — route provider calls through a compatible gateway with `ANTHROPIC_BASE_URL` or `OPENAI_BASE_URL`; unset, calls go directly to the selected provider
 - **Scheduled monitoring** — periodic cluster health checks on a configurable interval. The scheduler collects cluster state directly via the Kubernetes client (no LLM tokens), then makes a single structured-output call to summarize findings
 - **Structured findings** — health analysis returns a typed `HealthReport` (see `schemas.py`) rather than free text, so Slack rendering reads typed fields instead of parsing markdown
 - **Two interfaces** — CLI for interactive use, FastAPI + web UI for in-cluster deployment
@@ -51,7 +52,7 @@ The main agent only has read tools. All writes are delegated to `change-executor
 
 - Python 3.12+
 - `kubectl` configured and pointing at your cluster (for local dev)
-- Anthropic API key
+- Anthropic or OpenAI API key
 - LangSmith API key (for tracing)
 - Slack app with Bot and App-level tokens (optional, for Slack notifications)
 
@@ -70,8 +71,15 @@ python api.py         # API + web UI at http://localhost:8080
 
 | Variable | Required | Description |
 | -------- | -------- | ----------- |
-| `ANTHROPIC_API_KEY` | Yes | Claude API key. When routing through a gateway (see `ANTHROPIC_BASE_URL`), set this to your gateway key |
-| `ANTHROPIC_BASE_URL` | No | Route Claude calls through a model gateway, e.g. `https://gateway.smith.langchain.com/anthropic`; unset = call Anthropic directly |
+| `LLM_PROVIDER` | No | `anthropic` (default) or `openai` |
+| `ANTHROPIC_API_KEY` | For Anthropic | Claude API key. When routing through a gateway, set this to your gateway key |
+| `ANTHROPIC_MODEL` | No | Main Anthropic model (default: `claude-sonnet-4-6`) |
+| `ANTHROPIC_SUBAGENT_MODEL` | No | Read-only and health-analysis Anthropic model (default: `claude-haiku-4-5-20251001`) |
+| `ANTHROPIC_BASE_URL` | No | Route Anthropic calls through a model gateway; unset = call Anthropic directly |
+| `OPENAI_API_KEY` | For OpenAI | OpenAI API key; required when `LLM_PROVIDER=openai` |
+| `OPENAI_MODEL` | No | Main OpenAI model (default: `gpt-5.6-sol`) |
+| `OPENAI_SUBAGENT_MODEL` | No | Read-only and health-analysis OpenAI model (default: `gpt-5.6-luna`) |
+| `OPENAI_BASE_URL` | No | Route OpenAI calls through a compatible gateway; unset = call OpenAI directly |
 | `LANGSMITH_API_KEY` | Yes | LangSmith tracing key |
 | `LANGSMITH_TRACING` | Yes | Set to `true` to enable tracing |
 | `LANGSMITH_PROJECT` | No | Project name (default: `sre-agent`) |
@@ -92,6 +100,55 @@ python api.py         # API + web UI at http://localhost:8080
 | `CORS_ALLOW_ORIGINS` | No | Comma-separated browser origins allowed to call `/api/*`. Empty (default) means none; the bundled UI is same-origin and needs no grant |
 
 ## Deploy to Kubernetes
+
+### Helm (recommended)
+
+The chart defaults to Anthropic, one replica, cluster-wide read access, tracing
+disabled, and writer RBAC disabled. Provide credentials through an externally
+managed Secret:
+
+```bash
+kubectl create namespace sre-agent
+read -s "ANTHROPIC_API_KEY?Anthropic API key: "
+echo
+kubectl -n sre-agent create secret generic sre-agent-credentials \
+  --from-literal=ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY"
+unset ANTHROPIC_API_KEY
+
+helm upgrade --install sre-agent ./chart \
+  --namespace sre-agent \
+  --set image.tag=openai-test \
+  --set existingSecret=sre-agent-credentials \
+  --wait
+```
+
+For OpenAI:
+
+```bash
+read -s "OPENAI_API_KEY?OpenAI API key: "
+echo
+kubectl -n sre-agent create secret generic sre-agent-credentials \
+  --from-literal=OPENAI_API_KEY="$OPENAI_API_KEY"
+unset OPENAI_API_KEY
+
+helm upgrade --install sre-agent ./chart \
+  --namespace sre-agent \
+  --set image.tag=openai-test \
+  --set config.llmProvider=openai \
+  --set existingSecret=sre-agent-credentials \
+  --wait
+```
+
+See [`chart/README.md`](chart/README.md) and [`chart/values.yaml`](chart/values.yaml)
+for provider models, monitoring, Slack, LangSmith, Postgres, Ingress, image
+digests, and the explicitly opt-in cluster-wide writer role.
+
+The `openai-test` image is public and is intended only for the initial GitOps
+rollout. Version tags are published by `.github/workflows/release.yml` when a
+matching Git tag such as `v0.1.0` is pushed; the tag must match both the chart
+`version` and `appVersion`.
+
+### Raw manifests
 
 The included `deploy.sh` handles build, ECR push, and EKS apply in one step:
 
@@ -114,7 +171,8 @@ docker buildx build --platform linux/amd64 \
 
 # 3. Create the secrets file (never commit this)
 #   Values under data: must be base64-encoded; stringData: accepts plain text
-echo -n "sk-ant-..." | base64   # ANTHROPIC_API_KEY
+echo -n "sk-ant-..." | base64   # ANTHROPIC_API_KEY (Anthropic)
+echo -n "sk-..."     | base64   # OPENAI_API_KEY (OpenAI)
 echo -n "lsv2_..."  | base64   # LANGSMITH_API_KEY
 echo -n "xoxb-..."  | base64   # SLACK_BOT_TOKEN
 echo -n "xapp-..."  | base64   # SLACK_APP_TOKEN
@@ -161,6 +219,7 @@ agent.py              Main SRE orchestrator
 api.py                FastAPI server (SSE streaming, HITL endpoints, web UI)
 main.py               CLI entry point
 config.py             Env-based configuration
+chart/                Helm chart (safe read-only defaults; Anthropic/OpenAI configuration)
 schemas.py            Pydantic models (Finding, HealthReport) — structured-output contract
 scheduler.py          Periodic health check scheduler (structured HealthReport via tool-use),
                       diffed against stored state so only changes are posted
@@ -269,6 +328,7 @@ cannot inflate the counters.
 ## Tests
 
 ```bash
+pip install -r requirements-dev.txt
 python -m pytest tests/ -q          # unit tests; Postgres tests skip
 
 # With Postgres for the integration tests:

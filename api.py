@@ -34,7 +34,7 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("sre-agent")
 
-# A "health check / audit" request is served by the bounded, single-Haiku-call
+# A "health check / audit" request is served by the bounded, single-model-call
 # structured path (scheduler.run_structured_health_check), NOT the full Deep
 # Agents orchestrator — the orchestrator fans out to subagents and can blow past
 # the langgraph recursion limit. Anything not matching this falls through to the
@@ -465,10 +465,10 @@ def _run_for_slack(text: str, session: Session, client, channel: str, thread_ts:
 
 
 def _run_structured_health_check_for_slack(text: str, session: Session, client, channel: str, thread_ts: str):
-    """Serve a health-check mention via the bounded single-Haiku path (no orchestrator).
+    """Serve a health-check mention via the bounded single-model path (no orchestrator).
 
-    This performs a fixed number of steps (zero-token collection + one forced-tool
-    Haiku call) so it can never hit the recursion limit that the full agent does.
+    This performs a fixed number of steps (zero-token collection + one structured
+    model call) so it can never hit the recursion limit that the full agent does.
     """
     thinking = client.chat_postMessage(
         channel=channel,
@@ -605,7 +605,7 @@ def _start_slack_bolt(main_loop: asyncio.AbstractEventLoop):
 
             log.info("Slack mention from %s: %s", event.get("user"), text[:80])
             # Submit to executor so this handler returns immediately (prevents Slack retries).
-            # Health-check/audit requests use the bounded single-Haiku path so they can
+            # Health-check/audit requests use the bounded single-model path so they can
             # never hit the orchestrator's recursion limit; everything else goes to the agent.
             if _HEALTH_CHECK_RE.search(text):
                 _executor.submit(_run_structured_health_check_for_slack, text, session, client, channel, thread_ts)

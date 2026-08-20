@@ -36,11 +36,20 @@ spec:
               containerPort: 8080
               protocol: TCP
           env:
+            - name: LLM_PROVIDER
+              value: "anthropic"          # set to "openai" to use OpenAI models
             - name: ANTHROPIC_API_KEY
               valueFrom:
                 secretKeyRef:
                   name: sre-agent-secrets
                   key: ANTHROPIC_API_KEY
+                  optional: true
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: sre-agent-secrets
+                  key: OPENAI_API_KEY
+                  optional: true
             - name: LC_GATEWAY_KEY
               valueFrom:
                 secretKeyRef:
@@ -51,6 +60,13 @@ spec:
                 secretKeyRef:
                   name: sre-agent-secrets
                   key: ANTHROPIC_BASE_URL
+                  optional: true
+            - name: OPENAI_BASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: sre-agent-secrets
+                  key: OPENAI_BASE_URL
+                  optional: true
             - name: SLACK_BOT_TOKEN
               valueFrom:
                 secretKeyRef:

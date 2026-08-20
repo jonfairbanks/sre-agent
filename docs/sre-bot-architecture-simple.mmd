@@ -10,14 +10,14 @@ flowchart LR
 
     subgraph fast["Fast path, scheduler.py"]
         COLLECT["Collect cluster data<br/>direct client, zero tokens"]
-        HAIKU["One Haiku call<br/>forced tool use"]
+        WORKER["One worker-model call<br/>structured output"]
         REPORT["Typed HealthReport"]
     end
 
     subgraph agent["Agent path, agent.py"]
-        ORCH["Orchestrator<br/>Sonnet, plans and delegates"]
-        LIM["Guards: prompt caching,<br/>recursion and call limits"]
-        RO["Read-only subagents<br/>Haiku, 8 analysts"]
+        ORCH["Orchestrator<br/>provider main model"]
+        LIM["Guards: provider-aware caching,<br/>recursion and call limits"]
+        RO["Read-only subagents<br/>provider worker model, 8 analysts"]
         CE["change-executor<br/>only holder of write tools"]
     end
 
@@ -39,8 +39,8 @@ flowchart LR
     ROUTER -->|"health check or audit"| COLLECT
     ROUTER -->|"everything else"| ORCH
 
-    COLLECT --> HAIKU
-    HAIKU --> REPORT
+    COLLECT --> WORKER
+    WORKER --> REPORT
     REPORT --> SLK
 
     ORCH -.- LIM
@@ -60,5 +60,5 @@ flowchart LR
 
     classDef bounded fill:#e6f4ea,stroke:#2f855a
     classDef write fill:#fde8e8,stroke:#c53030
-    class COLLECT,HAIKU,REPORT,SCHED bounded
+    class COLLECT,WORKER,REPORT,SCHED bounded
     class CE,GATE,WT write

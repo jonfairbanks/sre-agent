@@ -1,0 +1,85 @@
+name: Release image
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: release-image
+    if: github.repository == 'jonfairbanks/sre-agent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Validate release version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          chart_version="$(awk '/^version:/ { print $2; exit }' chart/Chart.yaml)"
+          app_version="$(awk '/^appVersion:/ { gsub(/\"/, "", $2); print $2; exit }' chart/Chart.yaml)"
+          test "$version" = "$chart_version"
+          test "$version" = "$app_version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.21.4
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+      - name: Run unit tests
+        run: python -m pytest tests/ -q
+      - name: Lint Helm chart
+        run: helm lint chart --strict
+
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and publish image
+        id: image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ghcr.io/jonfairbanks/sre-agent:${{ steps.version.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/jonfairbanks/sre-agent
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: mode=max
+          sbom: true
+
+      - name: Summarize release
+        env:
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          {
+            echo "### Published SRE Agent ${VERSION}"
+            echo
+            echo "- Image: \`ghcr.io/jonfairbanks/sre-agent:${VERSION}\`"
+            echo "- Digest: \`${IMAGE_DIGEST}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

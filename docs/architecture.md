@@ -33,14 +33,14 @@ flowchart LR
 
     subgraph fast["Fast path, scheduler.py"]
         COLLECT["Collect cluster data<br/>direct client, zero tokens"]
-        HAIKU["One Haiku call<br/>forced tool use"]
+        WORKER["One worker-model call<br/>structured output"]
         REPORT["Typed HealthReport"]
     end
 
     subgraph agent["Agent path, agent.py"]
-        ORCH["Orchestrator<br/>Sonnet, plans and delegates"]
-        LIM["Guards: prompt caching,<br/>recursion and call limits"]
-        RO["Read-only subagents<br/>Haiku, 8 analysts"]
+        ORCH["Orchestrator<br/>provider main model"]
+        LIM["Guards: provider-aware caching,<br/>recursion and call limits"]
+        RO["Read-only subagents<br/>provider worker model, 8 analysts"]
         CE["change-executor<br/>only holder of write tools"]
     end
 
@@ -62,8 +62,8 @@ flowchart LR
     ROUTER -->|"health check or audit"| COLLECT
     ROUTER -->|"everything else"| ORCH
 
-    COLLECT --> HAIKU
-    HAIKU --> REPORT
+    COLLECT --> WORKER
+    WORKER --> REPORT
     REPORT --> SLK
 
     ORCH -.- LIM
@@ -83,14 +83,14 @@ flowchart LR
 
     classDef bounded fill:#e6f4ea,stroke:#2f855a
     classDef write fill:#fde8e8,stroke:#c53030
-    class COLLECT,HAIKU,REPORT,SCHED bounded
+    class COLLECT,WORKER,REPORT,SCHED bounded
     class CE,GATE,WT write
 ```
 
 Note that the CLI bypasses the router and always goes to the orchestrator; only
 the web and Slack entry points are routed. Everything below adds detail to this
 picture. The component overview adds the checkpointer, filesystem backend, and
-the Anthropic and LangSmith edges, the two request paths expand the routing
+the selected LLM provider and LangSmith edges, the two request paths expand the routing
 decision, and the HITL sequence expands the approval gate.
 
 ## Component overview
@@ -107,18 +107,18 @@ flowchart LR
     ROUTER{"_HEALTH_CHECK_RE<br/>regex intent router"}
 
     subgraph core["Agent core, agent.py"]
-        ORCH["Main orchestrator<br/>create_deep_agent<br/>claude-sonnet-4-6"]
-        MW["Middleware: prompt caching,<br/>model and tool call limits"]
+        ORCH["Main orchestrator<br/>create_deep_agent<br/>provider main model"]
+        MW["Middleware: provider-aware caching,<br/>model and tool call limits"]
         MEM["MemorySaver + InMemoryStore<br/>FilesystemBackend, virtual"]
         ORCH -.- MW
         ORCH -.- MEM
     end
 
-    BOUND["Bounded health check<br/>scheduler.py<br/>collect, then 1 Haiku call"]
+    BOUND["Bounded health check<br/>scheduler.py<br/>collect, then 1 worker call"]
 
     subgraph agents["Subagents"]
-        RO["8 read-only analysts<br/>claude-haiku-4-5<br/>pod, scaling, performance, log,<br/>security, reliability, job, config"]
-        CE["change-executor<br/>claude-sonnet-4-6<br/>every write tool HITL gated"]
+        RO["8 read-only analysts<br/>provider worker model<br/>pod, scaling, performance, log,<br/>security, reliability, job, config"]
+        CE["change-executor<br/>provider main model<br/>every write tool HITL gated"]
     end
 
     subgraph toolset["Tools"]
@@ -132,7 +132,7 @@ flowchart LR
     subgraph ext["External"]
         K8S[("Kubernetes API")]
         SLK["Slack workspace"]
-        ANTH["Anthropic API<br/>optional gateway"]
+        LLM["Anthropic or OpenAI API<br/>optional gateway"]
         LS["LangSmith tracing"]
     end
 
@@ -158,8 +158,8 @@ flowchart LR
     ST --> SLK
     BOUND --> SLK
 
-    core -.->|"all model calls"| ANTH
-    BOUND -.-> ANTH
+    core -.->|"all model calls"| LLM
+    BOUND -.-> LLM
     core -.->|"traces"| LS
 
     classDef write fill:#fde8e8,stroke:#c53030
@@ -181,7 +181,7 @@ flowchart TB
 
     Q -->|yes| B1["_collect_cluster_data<br/>direct kubernetes client<br/>zero LLM tokens"]
     B1 --> B2["_format_snapshot<br/>compact text"]
-    B2 --> B3["one claude-haiku call<br/>forced tool use: report_health"]
+    B2 --> B3["one worker-model call<br/>structured HealthReport"]
     B3 --> B4["validated HealthReport<br/>Pydantic, no regex parsing"]
     B4 --> B5["send_structured_report<br/>Block Kit from typed fields"]
 
@@ -197,9 +197,9 @@ flowchart TB
     class O1,O2,O3,O4,O5 unbounded
 ```
 
-The left path is bounded, costs roughly one Haiku call, and returns a typed
-`HealthReport`. The right path is an unbounded fan-out over many Sonnet and Haiku
-calls, and returns free text that downstream code parses.
+The left path is bounded, costs one worker-model call, and returns a typed
+`HealthReport`. The right path is an unbounded fan-out over many main- and
+worker-model calls, and returns free text that downstream code parses.
 
 ## Human-in-the-loop approval
 
@@ -265,8 +265,8 @@ flowchart LR
     end
 
     subgraph cost["Cost reduction"]
-        PC["Anthropic prompt caching<br/>caches system prompt,<br/>tool defs, history"]
-        HK["Haiku for the 8 read-only<br/>subagents and the<br/>bounded health check"]
+        PC["Provider-aware prompt caching<br/>Anthropic explicit,<br/>OpenAI automatic"]
+        WK["Lower-cost worker model for<br/>8 read-only subagents and the<br/>bounded health check"]
         ZT["Zero-token data collection<br/>in scheduler.py"]
     end
 ```

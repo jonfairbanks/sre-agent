@@ -71,13 +71,12 @@ def tool_coverage(run, example):
     return {'key': 'tool_coverage', 'score': round(score, 3), 'comment': ', '.join(parts)}
 """
 
-# ── 3. Response Quality (LLM-as-judge via Anthropic Haiku) ───────────────────
+# ── 3. Response Quality (LLM-as-judge via selected provider) ────────────────
 
 RESPONSE_QUALITY = """
 import os
 import json
 import re
-import anthropic
 
 def response_quality(run, example):
     agent_text    = (run.get('outputs')     or {}).get('expected_response', '')
@@ -97,13 +96,27 @@ def response_quality(run, example):
         '"actionable": <bool>, "correct_diagnosis": <bool>, "reasoning": "<str>"}'
     )
 
-    client = anthropic.Anthropic(api_key=os.environ.get('ANTHROPIC_API_KEY', ''))
-    msg = client.messages.create(
-        model='claude-haiku-4-5-20251001',
-        max_tokens=300,
-        messages=[{'role': 'user', 'content': prompt}],
-    )
-    text = msg.content[0].text
+    provider = os.environ.get('LLM_PROVIDER', 'anthropic').strip().lower()
+    if provider == 'openai':
+        from openai import OpenAI
+        client = OpenAI(api_key=os.environ.get('OPENAI_API_KEY', ''))
+        response = client.responses.create(
+            model=os.environ.get('OPENAI_SUBAGENT_MODEL', 'gpt-5.6-luna'),
+            input=prompt,
+        )
+        text = response.output_text
+    elif provider == 'anthropic':
+        import anthropic
+        client = anthropic.Anthropic(api_key=os.environ.get('ANTHROPIC_API_KEY', ''))
+        msg = client.messages.create(
+            model=os.environ.get('ANTHROPIC_SUBAGENT_MODEL', 'claude-haiku-4-5-20251001'),
+            max_tokens=300,
+            messages=[{'role': 'user', 'content': prompt}],
+        )
+        text = msg.content[0].text
+    else:
+        return {'key': 'response_quality', 'score': 0,
+                'comment': f'Unsupported LLM_PROVIDER: {provider}'}
     m = re.search(r'\\{.*\\}', text, re.DOTALL)
     if not m:
         return {'key': 'response_quality', 'score': 0,
