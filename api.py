@@ -1135,6 +1135,8 @@ let sessionId = null;
 let eventSource = null;
 let progressMessage = null;
 let progressStartedAt = null;
+let progressLabel = '';
+let progressTimer = null;
 let slackEnabled = false;
 
 fetch('/health').then(r=>r.json()).then(d=>{
@@ -1158,7 +1160,7 @@ function renderInline(text) {
     .replace(/`([^`]+)`/g, '<code>$1</code>')
     .replace(/[*][*]([^*]+)[*][*]/g, '<strong>$1</strong>')
     .replace(/__([^_]+)__/g, '<strong>$1</strong>')
-    .replace(/[*]([^*]+)[*]/g, '<em>$1</em>')
+    .replace(/[*]([^*]+)[*]/g, '<strong>$1</strong>')
     .replace(/_([^_]+)_/g, '<em>$1</em>')
     .replace(/\\[([^\\]]+)\\]\\((https?:\\/\\/[^\\s)]+)\\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
 }
@@ -1207,18 +1209,25 @@ function setInputEnabled(v) {
 function beginProgress(label) {
   endProgress();
   progressStartedAt = Date.now();
+  progressLabel = label;
   progressMessage = appendMsg('', 'bot typing');
   progressMessage.innerHTML = `<span class="typing-dots"><i></i><i></i><i></i></span><span>${escapeHtml(label)}</span>`;
+  updateProgress();
+  progressTimer = window.setInterval(updateProgress, 1000);
 }
 function updateProgress(label) {
   if (!progressMessage) return;
+  if (label) progressLabel = label;
   const elapsed = Math.max(1, Math.round((Date.now() - progressStartedAt) / 1000));
-  progressMessage.lastElementChild.textContent = `${label} (${elapsed}s)`;
+  progressMessage.lastElementChild.textContent = `${progressLabel} (${elapsed}s)`;
 }
 function endProgress() {
+  if (progressTimer) window.clearInterval(progressTimer);
   if (progressMessage) progressMessage.remove();
   progressMessage = null;
   progressStartedAt = null;
+  progressLabel = '';
+  progressTimer = null;
 }
 async function sendMessage() {
   const input = document.getElementById('msg-input');
