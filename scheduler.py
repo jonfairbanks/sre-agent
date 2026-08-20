@@ -7,6 +7,7 @@ This replaces the previous approach that ran the full Deep Agents orchestrator
 """
 from __future__ import annotations
 import asyncio
+import json
 import logging
 import os
 import uuid
@@ -41,6 +42,111 @@ def _age(ts) -> str:
     return f"{s // 86400}d"
 
 
+# Container states that mean the pod is broken right now.
+UNHEALTHY_WAITING_REASONS = {
+    "CrashLoopBackOff", "ImagePullBackOff", "ErrImagePull", "InvalidImageName",
+    "CreateContainerConfigError", "CreateContainerError", "ErrImageNeverPull",
+}
+
+# Terminations that indicate a fault. "Completed" with exit 0 is a graceful stop,
+# which is what a rolling restart looks like, and must not be treated as a failure.
+FAILURE_TERMINATION_REASONS = {
+    "OOMKilled", "Error", "ContainerCannotRun", "DeadlineExceeded", "Evicted",
+}
+
+# How recently a *failed* termination must have happened to still count as a
+# current problem. Restart count alone cannot distinguish a crashloop from a
+# healthy redeploy, so recency plus failure reason is used instead.
+POD_FAILURE_RECENCY_MINUTES = int(os.getenv("POD_FAILURE_RECENCY_MINUTES", "60"))
+
+# Grace period before Pending or not-ready is treated as a fault, so pods that
+# are simply still starting during a rollout are not reported.
+POD_STARTUP_GRACE_MINUTES = int(os.getenv("POD_STARTUP_GRACE_MINUTES", "10"))
+
+# Restart counts at or above this are surfaced as context, never as a fault.
+POD_RESTART_NOTABLE = int(os.getenv("POD_RESTART_NOTABLE", "10"))
+
+# Warning events older than this are dropped. The section is titled "RECENT" but
+# had no age filter, so a warning about a pod that no longer exists was presented
+# as current fact. Kubernetes keeps events for an hour by default, and a stale one
+# is worse than none because it reads as a live fault.
+EVENT_MAX_AGE_MINUTES = int(os.getenv("EVENT_MAX_AGE_MINUTES", "60"))
+
+
+def _minutes_since(ts, now) -> float:
+    return float("inf") if ts is None else (now - ts).total_seconds() / 60.0
+
+
+def _classify_pod(pod, now) -> tuple[bool, str, dict]:
+    """Decide whether a pod is unhealthy *right now*.
+
+    Returns (is_unhealthy, status_label, extra_fields).
+
+    Deliberately does NOT use restart_count as a fault signal. restart_count is
+    cumulative for the life of the pod object and never resets, so a workload that
+    was redeployed 43 times reads identically to one that is crashlooping. That
+    single condition was reporting a fleet of healthy Running pods as critical.
+    """
+    statuses = pod.status.container_statuses or []
+    phase = pod.status.phase or "Unknown"
+    restarts = sum((cs.restart_count or 0) for cs in statuses)
+    age_minutes = _minutes_since(pod.metadata.creation_timestamp, now)
+    ready = all(bool(cs.ready) for cs in statuses) if statuses else False
+
+    # Most recent termination across containers, and whether it was a fault.
+    last_reason, last_exit, last_ago = None, None, float("inf")
+    for cs in statuses:
+        for state in (getattr(cs, "last_state", None), cs.state):
+            term = getattr(state, "terminated", None) if state else None
+            if not term:
+                continue
+            ago = _minutes_since(term.finished_at, now)
+            if ago < last_ago:
+                last_ago, last_reason, last_exit = ago, term.reason, term.exit_code
+
+    failed_termination = last_reason is not None and (
+        last_reason in FAILURE_TERMINATION_REASONS
+        or (last_reason != "Completed" and (last_exit or 0) != 0)
+    )
+
+    extra = {
+        "ready": ready,
+        "last_termination": last_reason,
+        "last_exit_code": last_exit,
+        "last_termination_min_ago": None if last_ago == float("inf") else round(last_ago),
+    }
+
+    # 1. Broken right now: a container is stuck waiting.
+    for cs in statuses:
+        waiting = getattr(cs.state, "waiting", None) if cs.state else None
+        if waiting and waiting.reason in UNHEALTHY_WAITING_REASONS:
+            return True, waiting.reason, extra
+
+    # 2. Failed pod, but only while the failure is still recent. Job pods that
+    #    failed weeks ago and were never garbage collected are not today's problem.
+    if phase == "Failed":
+        recent = last_ago <= POD_FAILURE_RECENCY_MINUTES or last_reason is None
+        return recent, "Failed", extra
+
+    if phase == "Succeeded":
+        return False, "Succeeded", extra
+
+    # 3. Stuck Pending past the startup grace period.
+    if phase == "Pending":
+        return age_minutes > POD_STARTUP_GRACE_MINUTES, "Pending", extra
+
+    # 4. Running but not ready past the grace period.
+    if not ready and age_minutes > POD_STARTUP_GRACE_MINUTES:
+        return True, "NotReady", extra
+
+    # 5. Recently failed and came back: flapping, still worth reporting.
+    if failed_termination and last_ago <= POD_FAILURE_RECENCY_MINUTES:
+        return True, f"Restarted/{last_reason}", extra
+
+    # Healthy. High restart counts with clean exits land here on purpose.
+    return False, phase, extra
+
+
 def _collect_cluster_data() -> dict:
     """Collect raw cluster state using the kubernetes Python client directly.
 
@@ -60,6 +166,7 @@ def _collect_cluster_data() -> dict:
         "deployments": [],
         "node_metrics": [],
         "pod_metrics": {},
+        "pvc_usage": {},
         "errors": [],
     }
 
@@ -84,35 +191,25 @@ def _collect_cluster_data() -> dict:
 
     # --- Pods (all namespaces) ---
     try:
+        now = datetime.now(timezone.utc)
         for p in core_v1().list_pod_for_all_namespaces().items:
-            restarts = sum((cs.restart_count or 0) for cs in (p.status.container_statuses or []))
-            phase = p.status.phase or "Unknown"
-            # Dig into waiting/terminated reason for better status
-            reason = phase
-            for cs in (p.status.container_statuses or []):
-                if cs.state and cs.state.waiting and cs.state.waiting.reason:
-                    reason = cs.state.waiting.reason
-                elif cs.state and cs.state.terminated and cs.state.terminated.reason:
-                    if cs.state.terminated.reason != "Completed":
-                        reason = cs.state.terminated.reason
-
+            unhealthy, status, extra = _classify_pod(p, now)
             pod_info = {
                 "namespace": p.metadata.namespace,
                 "name": p.metadata.name,
-                "status": reason,
-                "restarts": restarts,
+                "status": status,
+                "restarts": sum((cs.restart_count or 0) for cs in (p.status.container_statuses or [])),
                 "age": _age(p.metadata.creation_timestamp),
+                **extra,
             }
             result["pods"].append(pod_info)
-            # Flag anything that looks unhealthy
-            unhealthy_reasons = {"CrashLoopBackOff", "OOMKilled", "Error", "Evicted",
-                                 "ImagePullBackOff", "ErrImagePull", "Pending"}
-            if reason in unhealthy_reasons or restarts >= 5 or (
-                phase not in ("Running", "Succeeded") and p.metadata.namespace != "kube-system"
-            ):
+            if unhealthy:
                 result["unhealthy_pods"].append(pod_info)
     except Exception as e:
         result["errors"].append(f"pods: {e}")
+
+    # Used to discard warning events whose pod has since been deleted.
+    _collected_pod_keys = {f"{p['namespace']}/{p['name']}" for p in result["pods"]}
 
     # --- Recent warning events (last 20) ---
     try:
@@ -124,13 +221,28 @@ def _collect_cluster_data() -> dict:
             key=lambda e: (e.last_timestamp or e.event_time or datetime.min.replace(tzinfo=timezone.utc)),
             reverse=True,
         )[:20]
+        now_ev = datetime.now(timezone.utc)
         for e in events:
+            stamp = e.last_timestamp or e.event_time
+            age_min = _minutes_since(stamp, now_ev)
+            if age_min > EVENT_MAX_AGE_MINUTES:
+                continue  # stale
+
+            # An event about a pod that no longer exists cannot describe a current
+            # fault, however recent it is. This is what made a deleted ReplicaSet's
+            # InvalidImageName warning read as a live critical for the better part
+            # of an hour. The pod list is already collected above, so this is free.
+            if e.involved_object.kind == "Pod":
+                key = f"{e.metadata.namespace}/{e.involved_object.name}"
+                if key not in _collected_pod_keys:
+                    continue
             result["events"].append({
                 "namespace": e.metadata.namespace,
                 "reason": e.reason,
                 "message": (e.message or "")[:200],
                 "object": f"{e.involved_object.kind}/{e.involved_object.name}",
                 "count": e.count or 1,
+                "age_min": None if age_min == float("inf") else round(age_min),
             })
     except Exception as e:
         result["errors"].append(f"events: {e}")
@@ -215,7 +327,60 @@ def _collect_cluster_data() -> dict:
     except Exception as e:
         result["errors"].append(f"pod metrics: {e}")
 
+    # --- PVC utilisation (kubelet Summary API) ---
+    # metrics-server does not expose volume usage, and kubectl_get_pvc reports the
+    # *requested* size, not consumption. Without this a filling volume is invisible
+    # until pods start failing, which is exactly how the 2026-08 incident presented:
+    # the report showed unhealthy pods and gave no path to the full PVCs behind them.
+    try:
+        for node in result["nodes"]:
+            node_name = node["name"]
+            try:
+                # _preload_content=False because the client otherwise coerces the
+                # JSON body into a Python repr that json.loads cannot read.
+                resp = core_v1().connect_get_node_proxy_with_path(
+                    node_name, "stats/summary", _preload_content=False
+                )
+                summary = json.loads(resp.data)
+            except Exception as e:
+                result["errors"].append(f"pvc usage ({node_name}): {e}")
+                continue
+
+            for pod in summary.get("pods", []) or []:
+                for vol in pod.get("volume", []) or []:
+                    ref = vol.get("pvcRef") or {}
+                    name, ns = ref.get("name"), ref.get("namespace")
+                    if not name or not ns:
+                        continue  # ephemeral volume, not backed by a PVC
+                    used, capacity = vol.get("usedBytes"), vol.get("capacityBytes")
+                    if not capacity:
+                        continue
+                    result["pvc_usage"][f"{ns}/{name}"] = {
+                        "used_bytes": used or 0,
+                        "capacity_bytes": capacity,
+                        "percent": round((used or 0) / capacity * 100, 1),
+                        "inodes_used": vol.get("inodesUsed"),
+                        "inodes_free": vol.get("inodesFree"),
+                    }
+    except Exception as e:
+        result["errors"].append(f"pvc usage: {e}")
+
     return result
+
+
+# Only volumes at or above this fill level are listed in the snapshot, so a
+# cluster with many healthy PVCs does not crowd out the rest of the report.
+PVC_USAGE_ALERT_PERCENT = int(os.getenv("PVC_USAGE_ALERT_PERCENT", "70"))
+
+
+def _fmt_bytes(n) -> str:
+    """Render a byte count in the largest sensible binary unit."""
+    if n is None:
+        return "?"
+    for unit, size in (("Ti", 1024 ** 4), ("Gi", 1024 ** 3), ("Mi", 1024 ** 2)):
+        if n >= size:
+            return f"{n / size:.1f}{unit}"
+    return f"{n}B"
 
 
 def _cpu_millicores(value: str):
@@ -367,13 +532,37 @@ def _format_snapshot(data: dict) -> str:
     if data["unhealthy_pods"]:
         lines.append("\n=== UNHEALTHY PODS ===")
         for p in data["unhealthy_pods"]:
+            cause = ""
+            if p.get("last_termination") and p.get("last_termination_min_ago") is not None:
+                cause = (f"  last={p['last_termination']}"
+                         f"(exit {p.get('last_exit_code')}) {p['last_termination_min_ago']}m ago")
             lines.append(
                 f"  {p['namespace']}/{p['name']}  {p['status']}  restarts={p['restarts']}  age={p['age']}"
-                f"{_pod_usage(p['namespace'], p['name'])}"
+                f"{cause}{_pod_usage(p['namespace'], p['name'])}"
             )
     else:
         total = len(data["pods"])
         lines.append(f"\n=== PODS === all {total} pods healthy")
+
+    # Pods with a lot of lifetime restarts whose last exit was clean. Not a fault
+    # (a rolling restart looks exactly like this), but worth stating so a genuinely
+    # flappy workload is still visible.
+    churny = [
+        p for p in data["pods"]
+        if p.get("restarts", 0) >= POD_RESTART_NOTABLE
+        and p not in data["unhealthy_pods"]
+    ]
+    if churny:
+        lines.append(
+            f"\n=== HIGH RESTART COUNTS (clean exits, not currently failing) ==="
+        )
+        for p in sorted(churny, key=lambda x: -x["restarts"])[:10]:
+            last = p.get("last_termination") or "unknown"
+            ago = p.get("last_termination_min_ago")
+            when = f", last {ago}m ago" if ago is not None else ""
+            lines.append(
+                f"  {p['namespace']}/{p['name']}  restarts={p['restarts']}  ({last}{when})"
+            )
 
     # Busiest pods. Capped at 10 so a large cluster cannot inflate the prompt,
     # and so a hot-but-healthy pod is still visible to the analysis step.
@@ -404,6 +593,30 @@ def _format_snapshot(data: dict) -> str:
             )
             lines.append(f"  {m['name']}  cpu={cpu}  memory={mem}")
 
+    # PVC utilisation. Only the filling ones, plus a count of the rest, so the
+    # model sees the risk without the snapshot growing with every healthy volume.
+    pvc_usage = data.get("pvc_usage") or {}
+    if pvc_usage:
+        hot = sorted(
+            ((k, v) for k, v in pvc_usage.items() if v["percent"] >= PVC_USAGE_ALERT_PERCENT),
+            key=lambda kv: kv[1]["percent"], reverse=True,
+        )
+        if hot:
+            lines.append(
+                f"\n=== PVC UTILIZATION (>={PVC_USAGE_ALERT_PERCENT}%, "
+                f"{len(hot)} of {len(pvc_usage)} volumes) ==="
+            )
+            for key, v in hot:
+                lines.append(
+                    f"  {key}  {_fmt_bytes(v['used_bytes'])}/{_fmt_bytes(v['capacity_bytes'])}"
+                    f"  {v['percent']}%"
+                )
+        else:
+            lines.append(
+                f"\n=== PVC UTILIZATION === all {len(pvc_usage)} volumes below "
+                f"{PVC_USAGE_ALERT_PERCENT}%"
+            )
+
     # HPAs
     if data["hpas"]:
         lines.append("\n=== HPAs ===")
@@ -416,9 +629,14 @@ def _format_snapshot(data: dict) -> str:
 
     # Recent warning events
     if data["events"]:
-        lines.append("\n=== RECENT WARNING EVENTS ===")
+        lines.append(
+            f"\n=== WARNING EVENTS (last {EVENT_MAX_AGE_MINUTES}m) ==="
+        )
         for e in data["events"][:10]:
-            lines.append(f"  [{e['namespace']}] {e['object']} — {e['reason']}: {e['message'][:120]}")
+            when = f"{e['age_min']}m ago" if e.get("age_min") is not None else "age unknown"
+            lines.append(
+                f"  [{e['namespace']}] {e['object']} — {e['reason']} ({when}): {e['message'][:110]}"
+            )
 
     # Collection errors
     if data["errors"]:

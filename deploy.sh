@@ -11,6 +11,27 @@ CLUSTER="${CLUSTER:?set CLUSTER, e.g. export CLUSTER=my-eks-cluster}"
 ECR_REPO="${ECR_REPO:-sre-agent}"
 IMAGE="${AWS_ACCOUNT}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}"
 TAG="${1:-latest}"
+
+# The deployment spec must reference an IMMUTABLE tag. Pinning :latest meant the
+# rendered manifest matched the live spec byte-for-byte, so kubectl apply made no
+# change, no ReplicaSet was created, and the old pod kept running the old image
+# while this script reported success. It also made "what is deployed" unanswerable
+# from the cluster and made rollout undo meaningless, since every revision named
+# the same mutable tag.
+GIT_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo "")"
+if [ -n "${GIT_SHA}" ] && ! printf '%s' "${GIT_SHA}" | grep -qE '^[0-9a-f]{7,40}$'; then
+  echo "ERROR: git rev-parse returned an unexpected value. Aborting."
+  exit 1
+fi
+# An explicit tag argument wins; otherwise deploy the commit.
+if [ "$#" -ge 1 ]; then
+  DEPLOY_TAG="$1"
+elif [ -n "${GIT_SHA}" ]; then
+  DEPLOY_TAG="${GIT_SHA}"
+else
+  echo "ERROR: not a git checkout and no tag argument given. Pass a tag explicitly."
+  exit 1
+fi
 NAMESPACE="${NAMESPACE:-sre-agent}"
 
 echo "==> Checking AWS auth..."
@@ -44,32 +65,74 @@ aws eks update-kubeconfig --name "${CLUSTER}" --region "${AWS_REGION}"
 
 echo "==> Checking secrets are populated..."
 K8S_DIR="$(dirname "$0")/k8s"
-if grep -q "REPLACE_WITH_BASE64" "${K8S_DIR}/secret.yaml"; then
+if [ ! -f "${K8S_DIR}/secret.yaml" ]; then
+  echo ""
+  echo "ERROR: k8s/secret.yaml does not exist."
+  echo "  cp k8s/secret.yaml.example k8s/secret.yaml   # then fill in the values"
+  echo ""
+  exit 1
+fi
+# REPLACE_ME is the sentinel in secret.yaml.example; REPLACE_WITH_BASE64 is the
+# older one, still matched so an existing unfilled secret.yaml is caught too.
+if grep -qE "REPLACE_ME|REPLACE_WITH_BASE64" "${K8S_DIR}/secret.yaml"; then
   echo ""
   echo "ERROR: k8s/secret.yaml still contains placeholder values."
-  echo "Run the following to encode your keys, then paste into k8s/secret.yaml:"
+  echo "Fill them in. secret.yaml.example uses stringData, so paste plaintext;"
+  echo "if you switched it to data:, encode with printf (never echo without -n):"
   echo ""
-  echo "  echo -n 'sk-ant-...'  | base64   # ANTHROPIC_API_KEY (when LLM_PROVIDER=anthropic)"
-  echo "  echo -n 'sk-...'      | base64   # OPENAI_API_KEY (when LLM_PROVIDER=openai)"
-  echo "  echo -n 'lsv2_pt_...' | base64   # LANGSMITH_API_KEY"
-  echo "  echo -n 'xoxb-...'    | base64   # SLACK_BOT_TOKEN"
-  echo "  echo -n 'xapp-...'    | base64   # SLACK_APP_TOKEN"
+  echo "  printf '%s' 'sk-ant-...' | base64   # ANTHROPIC_API_KEY (when LLM_PROVIDER=anthropic)"
+  echo "  printf '%s' 'sk-...'     | base64   # OPENAI_API_KEY (when LLM_PROVIDER=openai)"
+  echo "  printf '%s' 'lsv2_pt_...' | base64   # LANGSMITH_API_KEY"
+  echo "  printf '%s' 'xoxb-...'    | base64   # SLACK_BOT_TOKEN"
+  echo "  printf '%s' 'xapp-...'    | base64   # SLACK_APP_TOKEN"
   echo ""
   exit 1
 fi
 
-echo "==> Applying Kubernetes manifests..."
-kubectl apply -k "${K8S_DIR}"
-
 # deployment.yaml ships a placeholder image so no account-specific registry is
-# committed. Point it at the real one here, before waiting on the rollout, so
-# the placeholder is never actually pulled.
-echo "==> Setting image to ${IMAGE}:${TAG}..."
-kubectl set image deployment/sre-agent \
-  "sre-agent=${IMAGE}:${TAG}" -n "${NAMESPACE}"
+# committed. Substitute it BEFORE applying: patching afterwards created a
+# ReplicaSet with an unparseable image, which failed InvalidImageName and stayed
+# in the rollout history as a broken `kubectl rollout undo` target.
+echo "==> Rendering manifests with image ${IMAGE}:${DEPLOY_TAG}..."
+PLACEHOLDER="REPLACE_WITH_YOUR_REGISTRY/sre-agent:latest"
+RENDERED="$(kubectl kustomize "${K8S_DIR}")"
+SUBBED="$(printf '%s' "${RENDERED}" | sed "s|${PLACEHOLDER}|${IMAGE}:${DEPLOY_TAG}|g")"
+
+# Fail closed on both halves: the placeholder must be gone, and the real image
+# must be present. Either check alone would let a renamed placeholder through and
+# silently deploy whatever image happened to be in the manifest.
+if printf '%s' "${SUBBED}" | grep -q "REPLACE_WITH_YOUR_REGISTRY"; then
+  echo "ERROR: image placeholder still present after substitution. Aborting."
+  exit 1
+fi
+if ! printf '%s' "${SUBBED}" | grep -qF "${IMAGE}:${DEPLOY_TAG}"; then
+  echo "ERROR: expected image ${IMAGE}:${DEPLOY_TAG} not found in rendered manifests."
+  echo "       Has the placeholder in k8s/deployment.yaml been renamed?"
+  exit 1
+fi
+
+echo "==> Applying Kubernetes manifests..."
+# Captured before the apply, so a genuine no-op is distinguishable from a rollout.
+GEN_BEFORE="$(kubectl get deploy sre-agent -n "${NAMESPACE}" \
+  -o jsonpath='{.metadata.generation}' 2>/dev/null || echo 0)"
+
+printf '%s' "${SUBBED}" | kubectl apply -f -
 
 echo "==> Waiting for rollout..."
 kubectl rollout status deployment/sre-agent -n "${NAMESPACE}" --timeout=120s
+
+# A deploy that changes nothing is legitimate (same commit redeployed), but it must
+# be stated, not implied by a success message.
+RUNNING_IMAGE="$(kubectl get deploy sre-agent -n "${NAMESPACE}" \
+  -o jsonpath='{.spec.template.spec.containers[0].image}')"
+echo "==> Deployment is running: ${RUNNING_IMAGE}"
+if [ "${RUNNING_IMAGE}" != "${IMAGE}:${DEPLOY_TAG}" ]; then
+  echo "ERROR: deployment image is ${RUNNING_IMAGE}, expected ${IMAGE}:${DEPLOY_TAG}."
+  exit 1
+fi
+if [ "${GEN_BEFORE}" = "$(kubectl get deploy sre-agent -n "${NAMESPACE}" -o jsonpath='{.metadata.generation}')" ]; then
+  echo "    NOTE: spec unchanged, so no new pod was created. This commit was already deployed."
+fi
 
 echo "==> Deployment status:"
 kubectl get pods -n "${NAMESPACE}"

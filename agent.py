@@ -1,14 +1,18 @@
 """Main SRE orchestrator agent."""
+import logging
+
 from deepagents import create_deep_agent
 from deepagents.backends import FilesystemBackend
 from langchain.agents.middleware import (
     ModelCallLimitMiddleware,
     ToolCallLimitMiddleware,
     wrap_model_call,
+    wrap_tool_call,
 )
 
 from config import (
     DATABASE_URL,
+    TOOL_OUTPUT_MAX_CHARS,
     DEFAULT_NAMESPACES,
     LLM_PROVIDER,
     PROMPT_CACHING,
@@ -20,6 +24,8 @@ from config import (
 from llm import get_main_model
 from tools import READ_TOOLS
 from subagents import ALL_SUBAGENTS
+
+log = logging.getLogger("sre-agent.agent")
 
 # Read-heavy filesystem tools that caused the original runaway-loop cost
 # incident (agent grep/read_file-ing files in a cycle). Capped tightly below.
@@ -40,9 +46,56 @@ def anthropic_prompt_caching(request, handler):
     return handler(request.override(model_settings=settings))
 
 
+@wrap_tool_call
+def truncate_tool_output(request, handler):
+    """Bound how much any single tool result can add to the message history.
+
+    Every other guard in this file counts calls. None of them bounded bytes, and
+    that combination is what produced a 632,740-token prompt against a 200,000
+    ceiling with every limit satisfied: TOOL_CALL_RUN_LIMIT of 80 multiplied by
+    roughly 8k tokens of output each is 640k.
+
+    Summarization does not cover this. deepagents triggers it at 170k tokens, so it
+    has 30k of headroom, while a single parallel fan-out step was observed adding
+    about 580k. Summarization runs *between* steps and cannot prevent one step from
+    overshooting. Capping each result is what actually bounds per-step growth.
+
+    The marker matters: the model is told explicitly that content was elided and
+    how much, so it can narrow its next query instead of assuming it saw
+    everything. Silently dropping the tail would be worse than the overflow.
+    """
+    result = handler(request)
+    content = getattr(result, "content", None)
+    if not isinstance(content, str) or len(content) <= TOOL_OUTPUT_MAX_CHARS:
+        return result
+
+    name = getattr(request, "tool_name", None) or getattr(
+        getattr(request, "tool", None), "name", "tool")
+    dropped = len(content) - TOOL_OUTPUT_MAX_CHARS
+    truncated = (
+        content[:TOOL_OUTPUT_MAX_CHARS]
+        + f"\n\n[TRUNCATED: {name} returned {len(content):,} characters; "
+          f"{dropped:,} were dropped to protect the context window. "
+          f"Narrow the request (fewer lines, one namespace, a single resource) "
+          f"if you need the rest.]"
+    )
+    log.warning(
+        "Truncated %s output: %d chars -> %d (dropped %d)",
+        name, len(content), TOOL_OUTPUT_MAX_CHARS, dropped,
+    )
+    try:
+        return result.model_copy(update={"content": truncated})
+    except AttributeError:
+        result.content = truncated
+        return result
+
+
 def _build_middleware() -> list:
     """Middleware stack: prompt caching + hard runaway-loop / cost limits."""
     middleware: list = []
+
+    # First in the list: bound per-tool-result size before anything else sees it.
+    middleware.append(truncate_tool_output)
 
     if PROMPT_CACHING and LLM_PROVIDER == "anthropic":
         middleware.append(anthropic_prompt_caching)

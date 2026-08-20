@@ -92,11 +92,17 @@ python api.py         # API + web UI at http://localhost:8080
 | `MONITOR_DIGEST_EVERY_N_CHECKS` | No | Post a report every N checks even when nothing changed; `0` disables (default: `12`) |
 | `MONITOR_NOTIFY_ON_RESOLVED` | No | Announce findings that cleared (default: `true`) |
 | `MONITOR_ACK_HOURS` | No | How long the Slack **Ack** button mutes a finding (default: `24`) |
+| `PVC_USAGE_ALERT_PERCENT` | No | PVCs at or above this fill level are listed individually in the health snapshot (default: `70`) |
+| `POD_FAILURE_RECENCY_MINUTES` | No | A failed container termination older than this is history, not a live fault (default: `60`) |
+| `POD_STARTUP_GRACE_MINUTES` | No | Grace before Pending or not-ready counts as a fault (default: `10`) |
+| `POD_RESTART_NOTABLE` | No | Lifetime restart counts at or above this are reported as context, never a fault (default: `10`) |
+| `EVENT_MAX_AGE_MINUTES` | No | Warning events older than this are dropped (default: `60`) |
 | `DATABASE_URL` | No | Postgres DSN for durable state. Unset = in-memory, and pending approvals do not survive a restart |
 | `SLACK_APPROVER_IDS` | No | Comma-separated Slack user IDs allowed to approve changes. **Empty means anyone who can see the message may approve** |
 | `DEFAULT_NAMESPACES` | No | Comma-separated namespaces to watch (default: auto-discover) |
 | `PROMETHEUS_URL` | No | Prometheus endpoint for richer metrics |
 | `API_PORT` | No | Port for API server (default: `8080`) |
+| `TOOL_OUTPUT_MAX_CHARS` | No | Max characters a single tool result may add to context (default: `12000`) |
 | `CORS_ALLOW_ORIGINS` | No | Comma-separated browser origins allowed to call `/api/*`. Empty (default) means none; the bundled UI is same-origin and needs no grant |
 
 ## Deploy to Kubernetes
@@ -169,10 +175,15 @@ docker buildx build --platform linux/amd64 \
   -t your-registry/sre-agent:latest --push .
 # Update image in k8s/deployment.yaml
 
-# 3. Create the secrets file (never commit this)
-#   Values under data: must be base64-encoded; stringData: accepts plain text
-echo -n "sk-ant-..." | base64   # ANTHROPIC_API_KEY (Anthropic)
-echo -n "sk-..."     | base64   # OPENAI_API_KEY (OpenAI)
+# 3. Create the secrets file from the template (never commit the result)
+cp k8s/secret.yaml.example k8s/secret.yaml
+#   The template uses stringData, so paste plaintext and skip base64 entirely.
+#   The selected provider key is required; the rest are marked optional: true in
+#   deployment.yaml, so a missing key leaves its env var unset rather than
+#   stopping the pod. If you switch to data:, encode with printf, never
+#   `echo` without -n (the trailing newline produces a token the API rejects).
+printf '%s' 'sk-ant-...' | base64 # ANTHROPIC_API_KEY (when LLM_PROVIDER=anthropic)
+printf '%s' 'sk-...'     | base64 # OPENAI_API_KEY (when LLM_PROVIDER=openai)
 echo -n "lsv2_..."  | base64   # LANGSMITH_API_KEY
 echo -n "xoxb-..."  | base64   # SLACK_BOT_TOKEN
 echo -n "xapp-..."  | base64   # SLACK_APP_TOKEN
@@ -255,6 +266,7 @@ subagents/
   config_auditor.py
   change_executor.py      Only subagent with write tools
 k8s/                  Kustomize manifests for cluster deployment
+  secret.yaml.example   Template for the secret; copy to secret.yaml and fill in
                       (postgres.yaml = StatefulSet + Service + NetworkPolicy)
 tests/
   test_monitor_state.py   Fingerprint stability and diff semantics
@@ -346,3 +358,7 @@ TEST_DATABASE_URL=postgresql://sre_agent:testpw@127.0.0.1:55433/sre_agent \
 - Postgres traffic is unencrypted cluster-internal traffic; a NetworkPolicy in
   `k8s/postgres.yaml` restricts port 5432 to the `sre-agent` pod
 - If you suspect keys were exposed, rotate them immediately via the respective provider dashboards
+
+## License
+
+MIT. See [LICENSE](LICENSE).

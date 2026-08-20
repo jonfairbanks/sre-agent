@@ -24,7 +24,8 @@ spec:
       containers:
         - name: sre-agent
           # Placeholder. deploy.sh overrides this with the real registry via
-          # `kubectl set image` so no account-specific value is ever committed.
+          # deploy.sh substitutes it before applying so no account-specific value
+          # is ever committed.
           # Deploying by hand? Run:
           #   kubectl set image deployment/sre-agent \
           #     sre-agent=<account>.dkr.ecr.<region>.amazonaws.com/sre-agent:latest \
@@ -55,6 +56,7 @@ spec:
                 secretKeyRef:
                   name: sre-agent-secrets
                   key: LC_GATEWAY_KEY
+                  optional: true
             - name: ANTHROPIC_BASE_URL
               valueFrom:
                 secretKeyRef:
@@ -72,11 +74,13 @@ spec:
                 secretKeyRef:
                   name: sre-agent-secrets
                   key: SLACK_BOT_TOKEN
+                  optional: true
             - name: SLACK_APP_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: sre-agent-secrets
                   key: SLACK_APP_TOKEN
+                  optional: true
             - name: LANGSMITH_TRACING
               value: "true"
             - name: LANGCHAIN_TRACING_V2
@@ -85,11 +89,21 @@ spec:
               value: "sre-agent"
             - name: LANGCHAIN_PROJECT
               value: "sre-agent"
-            - name: LANGSMITH_RUNS_ENDPOINTS
+            # Single destination. LANGSMITH_RUNS_ENDPOINTS was a multi-endpoint
+            # fan-out carrying a key per destination; it covers trace export only,
+            # so the dataset client (evals/run_eval.py, auto-recording findings)
+            # could not authenticate with it. LANGSMITH_API_KEY covers both.
+            - name: LANGSMITH_API_KEY
               valueFrom:
                 secretKeyRef:
                   name: sre-agent-secrets
-                  key: LANGSMITH_RUNS_ENDPOINTS
+                  key: LANGSMITH_API_KEY
+                  optional: true
+            # - name: LANGSMITH_RUNS_ENDPOINTS
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: sre-agent-secrets
+            #       key: LANGSMITH_RUNS_ENDPOINTS
             - name: SLACK_CHANNEL
               value: "#sre_alerts"
             - name: MONITOR_INTERVAL_MINUTES
