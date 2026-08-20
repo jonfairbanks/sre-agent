@@ -1085,6 +1085,11 @@ _UI_HTML = """<!DOCTYPE html>
   .msg.bot pre { overflow-x: auto; background: #111827; border-radius: 6px; padding: 10px; margin: 8px 0; white-space: pre-wrap; }
   .msg.bot pre code { background: none; padding: 0; }
   .msg.bot a { color: #90cdf4; }
+  .msg.bot .table-wrap { overflow-x: auto; margin: 10px 0; border: 1px solid #2d3748; border-radius: 6px; }
+  .msg.bot table { width: 100%; min-width: max-content; border-collapse: collapse; white-space: normal; }
+  .msg.bot th, .msg.bot td { padding: 8px 10px; text-align: left; vertical-align: top; border-bottom: 1px solid #2d3748; }
+  .msg.bot th { color: #f7fafc; background: #111827; font-weight: 600; }
+  .msg.bot tr:last-child td { border-bottom: 0; }
   .msg.typing { display: flex; align-items: center; gap: 8px; color: #a0aec0; font-style: italic; }
   .typing-dots { display: inline-flex; gap: 3px; }
   .typing-dots i { width: 5px; height: 5px; border-radius: 50%; background: #63b3ed; animation: pulse 1.2s infinite ease-in-out; }
@@ -1170,7 +1175,10 @@ function renderMarkdown(text) {
   let list = null;
   let inCode = false;
   const closeList = () => { if (list) { html.push(`</${list}>`); list = null; } };
-  for (const line of lines) {
+  const tableCells = (line) => line.trim().replace(/^\\|/, '').replace(/\\|$/, '').split('|').map(cell => cell.trim());
+  const isTableSeparator = (line) => /^\\s*\\|?\\s*:?-{3,}:?\\s*(\\|\\s*:?-{3,}:?\\s*)+\\|?\\s*$/.test(line);
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
     if (line.startsWith('```')) {
       closeList();
       html.push(inCode ? '</code></pre>' : '<pre><code>');
@@ -1181,7 +1189,24 @@ function renderMarkdown(text) {
     const heading = line.match(/^(#{1,3})\\s+(.+)$/);
     const bullet = line.match(/^\\s*[-*+•]\\s+(.+)$/);
     const ordered = line.match(/^\\s*\\d+\\.\\s+(.+)$/);
-    if (heading) { closeList(); const level = heading[1].length; html.push(`<h${level}>${renderInline(heading[2])}</h${level}>`); }
+    if (line.includes('|') && isTableSeparator(lines[index + 1] || '')) {
+      closeList();
+      const headers = tableCells(line);
+      html.push('<div class="table-wrap"><table><thead><tr>');
+      headers.forEach(cell => html.push(`<th>${renderInline(cell)}</th>`));
+      html.push('</tr></thead><tbody>');
+      index += 1;
+      while (index + 1 < lines.length && lines[index + 1].includes('|') && lines[index + 1].trim()) {
+        const cells = tableCells(lines[index + 1]);
+        if (cells.length !== headers.length) break;
+        html.push('<tr>');
+        cells.forEach(cell => html.push(`<td>${renderInline(cell)}</td>`));
+        html.push('</tr>');
+        index += 1;
+      }
+      html.push('</tbody></table></div>');
+    }
+    else if (heading) { closeList(); const level = heading[1].length; html.push(`<h${level}>${renderInline(heading[2])}</h${level}>`); }
     else if (bullet) { if (list !== 'ul') { closeList(); html.push('<ul>'); list = 'ul'; } html.push(`<li>${renderInline(bullet[1])}</li>`); }
     else if (ordered) { if (list !== 'ol') { closeList(); html.push('<ol>'); list = 'ol'; } html.push(`<li>${renderInline(ordered[1])}</li>`); }
     else if (!line.trim()) { closeList(); }
