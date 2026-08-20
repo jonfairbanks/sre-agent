@@ -73,6 +73,7 @@ from .kubernetes_write import (
     kubectl_delete_custom_resource,
     kubectl_scale_bulk,
     kubectl_delete_resources_bulk,
+    kubectl_resize_pvc,
 )
 
 HELM_READ_TOOLS = [
@@ -152,6 +153,7 @@ WRITE_TOOLS = [
     kubectl_delete_custom_resource,
     kubectl_scale_bulk,
     kubectl_delete_resources_bulk,
+    kubectl_resize_pvc,
     *HELM_WRITE_TOOLS,
 ]
 

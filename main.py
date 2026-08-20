@@ -7,6 +7,7 @@ from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.markdown import Markdown
 from langgraph.types import Command
+from response_text import response_text
 
 load_dotenv()
 
@@ -98,8 +99,7 @@ def print_response(result: dict):
     messages = result.get("messages", [])
     if not messages:
         return
-    last = messages[-1]
-    content = last.content if hasattr(last, "content") else str(last)
+    content = response_text(messages[-1])
     if content:
         console.print()
         console.print(Panel(Markdown(content), title="[green bold]SRE Bot[/green bold]", border_style="green"))

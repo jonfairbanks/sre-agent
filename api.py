@@ -28,6 +28,7 @@ from config import (
     SLACK_APPROVER_IDS,
     make_agent_config,
 )
+from response_text import response_text
 
 load_dotenv()
 
@@ -284,8 +285,7 @@ def _handle_result(result: dict, session: Session, loop):
         messages = result.get("messages", [])
         response = ""
         if messages:
-            last = messages[-1]
-            response = last.content if hasattr(last, "content") else str(last)
+            response = response_text(messages[-1])
         session.last_response = response
         session.status = SessionStatus.DONE
         session.pending_actions = []
@@ -434,8 +434,7 @@ def _post_agent_result_to_slack(result: dict, session: Session, client, channel:
         messages = result.get("messages", [])
         response = ""
         if messages:
-            last = messages[-1]
-            response = last.content if hasattr(last, "content") else str(last)
+            response = response_text(messages[-1])
         session.last_response = response
         session.status = SessionStatus.DONE
         session.pending_actions = []
