@@ -31,6 +31,24 @@ log = logging.getLogger("sre-agent.agent")
 # incident (agent grep/read_file-ing files in a cycle). Capped tightly below.
 _FS_READ_TOOLS = ("grep", "read_file", "ls", "glob")
 
+# Deep Agents auto-adds this worker unless a subagent with the same name is
+# supplied. Define it here so its guardrail stack is explicit and identical to
+# the specialised workers' stack.
+_GENERAL_PURPOSE_SUBAGENT = {
+    "name": "general-purpose",
+    "description": (
+        "General-purpose agent for researching complex questions, searching for files "
+        "and content, and executing multi-step tasks."
+    ),
+    "system_prompt": (
+        "In order to complete the objective that the user asks of you, you have access "
+        "to a number of standard tools.\n\n"
+        "The calling agent only sees your final assistant message, not your intermediate "
+        "work, tool results, or status tracking. Ensure your final response contains the "
+        "complete answer."
+    ),
+}
+
 
 @wrap_model_call
 def anthropic_prompt_caching(request, handler):
@@ -128,6 +146,31 @@ def _build_middleware() -> list:
 
     return middleware
 
+
+def _build_subagents(tools: list) -> list:
+    """Attach fresh guardrails to every Deep Agents worker.
+
+    Declarative subagents do not inherit the parent middleware stack. Supplying
+    the stack in each spec is therefore the shared enforcement boundary for
+    output truncation and model/tool-call limits. A named general-purpose spec
+    prevents Deep Agents from auto-adding an unguarded default worker.
+    """
+    specs = [
+        *ALL_SUBAGENTS,
+        {
+            **_GENERAL_PURPOSE_SUBAGENT,
+            "model": get_main_model(),
+            "tools": tools,
+        },
+    ]
+    return [
+        {
+            **spec,
+            "middleware": [*_build_middleware(), *spec.get("middleware", [])],
+        }
+        for spec in specs
+    ]
+
 SYSTEM_PROMPT = f"""You are an autonomous SRE (Site Reliability Engineering) bot specializing in Kubernetes.
 
 Your job is to proactively monitor, diagnose, and improve Kubernetes cluster health.
@@ -221,7 +264,7 @@ def create_sre_agent(
         model=get_main_model(),
         tools=tools,
         system_prompt=SYSTEM_PROMPT,
-        subagents=ALL_SUBAGENTS,
+        subagents=_build_subagents(tools),
         backend=FilesystemBackend(root_dir=".", virtual_mode=True),
         middleware=_build_middleware(),
         checkpointer=checkpointer,
