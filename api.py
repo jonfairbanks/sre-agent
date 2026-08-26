@@ -1152,7 +1152,7 @@ fetch('/health').then(r=>r.json()).then(d=>{
   trigger.disabled = !slackEnabled;
   trigger.title = slackEnabled
     ? 'Run a health check and deliver the summary to Slack.'
-    : 'Slack is disabled, so scheduled check summaries have nowhere to go.';
+    : 'Slack integration is required.';
 }).catch(() => {
   document.getElementById('slack-badge').textContent = 'Slack: unavailable';
 });
