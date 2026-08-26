@@ -150,10 +150,10 @@ def _build_middleware() -> list:
 def _build_subagents(tools: list) -> list:
     """Attach fresh guardrails to every Deep Agents worker.
 
-    Declarative subagents do not inherit the parent middleware stack. Supplying
-    the stack in each spec is therefore the shared enforcement boundary for
-    output truncation and model/tool-call limits. A named general-purpose spec
-    prevents Deep Agents from auto-adding an unguarded default worker.
+    Deep Agents does not pass the parent's safeguards down to subagents, so we
+    add them to each worker directly. That keeps tool output, model calls, and
+    tool calls within the same limits. Defining general-purpose here also keeps
+    Deep Agents from adding one without those safeguards.
     """
     specs = [
         *ALL_SUBAGENTS,
