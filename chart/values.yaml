@@ -70,11 +70,19 @@ resources:
     cpu: "1"
     memory: 1Gi
 
+startupProbe:
+  httpGet:
+    path: /health
+    port: http
+  # Allow up to 30 seconds for the API and its optional integrations to initialise.
+  # While this probe is running, Kubernetes suppresses liveness and readiness.
+  failureThreshold: 6
+  periodSeconds: 5
+
 livenessProbe:
   httpGet:
     path: /health
     port: http
-  initialDelaySeconds: 15
   periodSeconds: 30
   failureThreshold: 3
 
@@ -82,7 +90,6 @@ readinessProbe:
   httpGet:
     path: /health
     port: http
-  initialDelaySeconds: 10
   periodSeconds: 10
 
 strategy:
