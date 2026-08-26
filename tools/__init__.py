@@ -15,9 +15,12 @@ from .kubernetes_read import (
     kubectl_get_pvc,
     kubectl_get_resource_quotas,
     get_cluster_summary,
+    kubectl_get_configmaps,
+    kubectl_get_configmap,
     kubectl_get_statefulsets,
     kubectl_get_daemonsets,
     kubectl_get_crds,
+    kubectl_get_custom_resources,
     kubectl_rollout_history,
 )
 from .kubernetes_security import (
@@ -43,6 +46,12 @@ from .kubernetes_hygiene import (
     kubectl_audit_selector_mismatch,
 )
 from .helm import (
+    helm_list_releases,
+    helm_get_release_values,
+    helm_get_release_manifest,
+    helm_search_chart_versions,
+    helm_list_repos,
+    helm_check_for_updates,
     helm_upgrade_release,
     helm_rollback_release,
     helm_release_history,
@@ -67,6 +76,16 @@ from .kubernetes_write import (
     kubectl_resize_pvc,
 )
 
+HELM_READ_TOOLS = [
+    helm_list_releases,
+    helm_get_release_values,
+    helm_get_release_manifest,
+    helm_search_chart_versions,
+    helm_list_repos,
+    helm_check_for_updates,
+    helm_release_history,
+]
+
 HELM_WRITE_TOOLS = [
     helm_upgrade_release,
     helm_rollback_release,
@@ -74,10 +93,6 @@ HELM_WRITE_TOOLS = [
 ]
 
 READ_TOOLS = [
-    # Do not expose ConfigMap contents, arbitrary custom resources, or Helm
-    # release records to the model. They can contain credentials or other
-    # sensitive configuration, and the default reader RBAC deliberately cannot
-    # access the underlying Secret/ConfigMap objects.
     kubectl_get_namespaces,
     kubectl_get_nodes,
     kubectl_get_pods,
@@ -94,9 +109,12 @@ READ_TOOLS = [
     kubectl_get_pvc,
     kubectl_get_resource_quotas,
     get_cluster_summary,
+    kubectl_get_configmaps,
+    kubectl_get_configmap,
     kubectl_get_statefulsets,
     kubectl_get_daemonsets,
     kubectl_get_crds,
+    kubectl_get_custom_resources,
     kubectl_rollout_history,
     # Security
     kubectl_get_rbac_summary,
@@ -116,6 +134,7 @@ READ_TOOLS = [
     kubectl_get_pvs,
     kubectl_get_limit_ranges,
     kubectl_audit_selector_mismatch,
+    *HELM_READ_TOOLS,
 ]
 
 WRITE_TOOLS = [
