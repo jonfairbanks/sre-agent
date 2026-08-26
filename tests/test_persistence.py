@@ -219,6 +219,11 @@ def test_check_counter_increments_atomically(db):
     assert db.next_check_number() == 2
 
 
+def test_startup_notification_is_claimed_once(db):
+    assert db.claim_startup_notification()
+    assert not db.claim_startup_notification()
+
+
 # ---------------------------------------------------------------------------
 # Degradation
 # ---------------------------------------------------------------------------

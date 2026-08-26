@@ -818,11 +818,15 @@ async def lifespan(app: FastAPI):
     else:
         log.info("MONITORING_ENABLED is false — scheduled health checks not started")
 
-    if _notifier.enabled:
+    if (
+        MONITORING_ENABLED
+        and _notifier.enabled
+        and _db.claim_startup_notification()
+    ):
         _notifier.send_alert(
             "ok",
             "SRE Bot is up",
-            "I'm online and ready to check the cluster. Run a health check from the dashboard or mention me here.",
+            "I'm online and watching the cluster. I'll share health checks here.",
         )
 
     if not _db.available:
