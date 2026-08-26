@@ -17,9 +17,6 @@ rules:
       - persistentvolumeclaims
       - persistentvolumes
       - resourcequotas
-      - configmaps
-      - serviceaccounts
-      - replicationcontrollers
     verbs: ["get", "list", "watch"]
   - apiGroups: ["apps"]
     resources: ["deployments", "statefulsets", "daemonsets", "replicasets"]
@@ -42,7 +39,7 @@ rules:
   - apiGroups: ["apiextensions.k8s.io"]
     resources: ["customresourcedefinitions"]
     verbs: ["get", "list", "watch"]
-  - apiGroups: ["*"]
-    resources: ["*"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterroles", "clusterrolebindings", "roles", "rolebindings"]
     verbs: ["get", "list", "watch"]
 {{- end }}
