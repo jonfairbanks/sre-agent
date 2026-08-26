@@ -7,6 +7,7 @@ from tools import (
     kubectl_get_hpa,
     kubectl_top_pods,
     kubectl_describe_deployment,
+    kubectl_get_custom_resources,
     # Write tools — ALL require HITL approval
     kubectl_scale_deployment,
     kubectl_scale_bulk,
@@ -68,8 +69,8 @@ change_executor_subagent = {
         "the child Deployments/Pods is futile — delete the OWNING custom resource instead "
         "with kubectl_delete_custom_resource (or a resource_type:'custom' entry in "
         "kubectl_delete_resources_bulk), which stops reconciliation and cascade-deletes "
-        "children via ownerReferences. Ask the user for the CR's group, version, and plural; "
-        "do not inspect arbitrary custom-resource contents.\n\n"
+        "children via ownerReferences. Use kubectl_get_custom_resources / kubectl_get_crds "
+        "(from the main agent) to find the CR's group, version, and plural.\n\n"
         "## Single changes\n"
         "For individual changes:\n"
         "1. BEFORE: read current state (describe the resource to be modified)\n"
@@ -91,6 +92,7 @@ change_executor_subagent = {
         kubectl_get_hpa,
         kubectl_top_pods,
         kubectl_describe_deployment,
+        kubectl_get_custom_resources,
         # Write tools (all require HITL)
         kubectl_scale_deployment,
         kubectl_scale_bulk,
