@@ -472,7 +472,7 @@ def _run_structured_health_check_for_slack(text: str, session: Session, client, 
     thinking = client.chat_postMessage(
         channel=channel,
         thread_ts=thread_ts,
-        text=":mag: Checking the cluster now...",
+        text=":mag: Running a cluster health check...",
     )
     try:
         from scheduler import annotate_with_history, run_structured_health_check
@@ -503,7 +503,7 @@ def _run_structured_health_check_for_slack(text: str, session: Session, client, 
                 client.chat_delete(channel=channel, ts=thinking["ts"])
             except Exception:
                 client.chat_update(channel=channel, ts=thinking["ts"],
-                                   text=":white_check_mark: All set — the health report is above.")
+                                   text=":white_check_mark: Health check complete.")
         else:
             client.chat_update(channel=channel, ts=thinking["ts"],
                                text=report.summary or "(no findings)")
@@ -1341,7 +1341,7 @@ async function triggerCheck() {
   try {
     const res = await fetch('/api/trigger-check', {method:'POST'});
     if (!res.ok) throw new Error(await res.text());
-    appendMsg('All set — the health check is done. The full report is in Slack.', 'bot');
+    appendMsg('Health check completed! View the full report in Slack.', 'bot');
   } catch (error) {
     appendMsg('Error: ' + error.message, 'error');
   } finally {
