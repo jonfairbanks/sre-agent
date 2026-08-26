@@ -1125,7 +1125,7 @@ _UI_HTML = """<!DOCTYPE html>
   <span class="badge">Kubernetes</span>
   <span class="badge" id="slack-badge">Slack: checking...</span>
   <span class="badge" id="status-badge">Ready</span>
-  <button id="trigger-check" onclick="triggerCheck()" style="margin-left:auto;background:#2d3748;color:#a0aec0;border:1px solid #4a5568;border-radius:6px;padding:4px 12px;font-size:12px;cursor:pointer">▶ Run health check</button>
+  <button id="trigger-check" onclick="triggerCheck()" style="margin-left:auto;background:#2d3748;color:#a0aec0;border:1px solid #4a5568;border-radius:6px;padding:4px 12px;font-size:12px;cursor:pointer">▶ Run Health Check</button>
 </header>
 <div id="chat"></div>
 <div class="shortcuts">
