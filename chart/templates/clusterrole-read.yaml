@@ -18,6 +18,10 @@ rules:
       - persistentvolumes
       - resourcequotas
     verbs: ["get", "list", "watch"]
+  # Required for the kubelet Summary API used by the PVC-utilisation collector.
+  - apiGroups: [""]
+    resources: ["nodes/proxy"]
+    verbs: ["get"]
   - apiGroups: ["apps"]
     resources: ["deployments", "statefulsets", "daemonsets", "replicasets"]
     verbs: ["get", "list", "watch"]
