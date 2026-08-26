@@ -819,7 +819,11 @@ async def lifespan(app: FastAPI):
         log.info("MONITORING_ENABLED is false — scheduled health checks not started")
 
     if _notifier.enabled:
-        _notifier.send_alert("ok", "SRE Bot Started", "The autonomous SRE bot is online and monitoring the cluster.")
+        _notifier.send_alert(
+            "ok",
+            "SRE Bot is up",
+            "I'm online and ready to check the cluster. Run a health check from the dashboard or mention me here.",
+        )
 
     if not _db.available:
         log.warning(
@@ -1121,7 +1125,7 @@ _UI_HTML = """<!DOCTYPE html>
   <span class="badge">Kubernetes</span>
   <span class="badge" id="slack-badge">Slack: checking...</span>
   <span class="badge" id="status-badge">Ready</span>
-  <button id="trigger-check" onclick="triggerCheck()" style="margin-left:auto;background:#2d3748;color:#a0aec0;border:1px solid #4a5568;border-radius:6px;padding:4px 12px;font-size:12px;cursor:pointer">▶ Trigger Check Now</button>
+  <button id="trigger-check" onclick="triggerCheck()" style="margin-left:auto;background:#2d3748;color:#a0aec0;border:1px solid #4a5568;border-radius:6px;padding:4px 12px;font-size:12px;cursor:pointer">▶ Run health check</button>
 </header>
 <div id="chat"></div>
 <div class="shortcuts">
@@ -1151,7 +1155,7 @@ fetch('/health').then(r=>r.json()).then(d=>{
   const trigger = document.getElementById('trigger-check');
   trigger.disabled = !slackEnabled;
   trigger.title = slackEnabled
-    ? 'Run a health check and deliver the summary to Slack.'
+    ? 'Run a health check and post the full report to Slack.'
     : 'Slack integration is required.';
 }).catch(() => {
   document.getElementById('slack-badge').textContent = 'Slack: unavailable';
@@ -1337,7 +1341,7 @@ async function triggerCheck() {
   try {
     const res = await fetch('/api/trigger-check', {method:'POST'});
     if (!res.ok) throw new Error(await res.text());
-    appendMsg('Slack health check started. Its summary will be delivered to Slack.', 'bot');
+    appendMsg('Health check completed! View the full report in Slack.', 'bot');
   } catch (error) {
     appendMsg('Error: ' + error.message, 'error');
   } finally {
