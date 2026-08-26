@@ -23,6 +23,12 @@ rules:
       - replicationcontrollers
     verbs: ["get", "list", "watch"]
 
+  # Required for the kubelet Summary API used by the PVC-utilisation collector.
+  # The collector uses GET /api/v1/nodes/{node}/proxy/stats/summary.
+  - apiGroups: [""]
+    resources: ["nodes/proxy"]
+    verbs: ["get"]
+
   - apiGroups: ["apps"]
     resources:
       - deployments

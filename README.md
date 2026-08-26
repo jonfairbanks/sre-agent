@@ -209,7 +209,8 @@ curl -s localhost:8080/health | jq '{state_backend, durable_state}'
 
 The included manifests grant:
 
-- **Read** on all resources cluster-wide (`ClusterRole: sre-agent-reader`)
+- **Read** on all resources cluster-wide (`ClusterRole: sre-agent-reader`), plus
+  `get` on `nodes/proxy` for kubelet PVC-utilisation summaries
 - **Write** (patch/update/delete) on all namespaces cluster-wide (`ClusterRole: sre-agent-writer`)
 
 All write operations are still gated by HITL regardless of RBAC.
