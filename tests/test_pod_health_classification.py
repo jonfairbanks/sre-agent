@@ -18,6 +18,7 @@ from scheduler import (
     _classify_pod,
     _format_snapshot,
     _minutes_since,
+    _warning_event_matches_current_fault,
 )
 
 NOW = datetime(2026, 8, 11, 22, 0, tzinfo=timezone.utc)
@@ -222,3 +223,30 @@ def test_event_with_unknown_age_says_so():
 def test_minutes_since_handles_a_missing_timestamp():
     assert _minutes_since(None, NOW) == float("inf")
     assert _minutes_since(NOW - timedelta(minutes=30), NOW) == pytest.approx(30, abs=0.01)
+
+
+def warning_event(kind="Pod", namespace="prod", name="api-1"):
+    return NS(
+        metadata=NS(namespace=namespace),
+        involved_object=NS(kind=kind, name=name),
+    )
+
+
+def test_probe_event_for_a_ready_pod_is_recovery_history():
+    event = warning_event()
+    assert not _warning_event_matches_current_fault(
+        event, {"prod/api-1"}, set()
+    )
+
+
+def test_probe_event_for_an_unhealthy_pod_remains_reportable():
+    event = warning_event()
+    assert _warning_event_matches_current_fault(
+        event, {"prod/api-1"}, {"prod/api-1"}
+    )
+
+
+def test_non_pod_warning_event_remains_reportable():
+    assert _warning_event_matches_current_fault(
+        warning_event(kind="Node", name="node-1"), set(), set()
+    )

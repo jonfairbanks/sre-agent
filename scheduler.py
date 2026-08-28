@@ -77,6 +77,22 @@ def _minutes_since(ts, now) -> float:
     return float("inf") if ts is None else (now - ts).total_seconds() / 60.0
 
 
+def _warning_event_matches_current_fault(event, pod_keys, unhealthy_pod_keys) -> bool:
+    """Return whether a warning event still represents an active pod fault.
+
+    Kubernetes retains warning events after a transient probe failure.  A ready
+    pod may therefore have a recent ``Unhealthy`` event even though it has
+    recovered, which should not make the scheduled health report yellow.
+    Non-pod events have no equivalent live pod status to correlate and remain
+    eligible for reporting.
+    """
+    if event.involved_object.kind != "Pod":
+        return True
+
+    key = f"{event.metadata.namespace}/{event.involved_object.name}"
+    return key in pod_keys and key in unhealthy_pod_keys
+
+
 def _classify_pod(pod, now) -> tuple[bool, str, dict]:
     """Decide whether a pod is unhealthy *right now*.
 
@@ -208,8 +224,13 @@ def _collect_cluster_data() -> dict:
     except Exception as e:
         result["errors"].append(f"pods: {e}")
 
-    # Used to discard warning events whose pod has since been deleted.
+    # Used to correlate warning events with the pod state collected in this
+    # same snapshot. A recent probe event from a ready pod is recovery history,
+    # not a current health finding.
     _collected_pod_keys = {f"{p['namespace']}/{p['name']}" for p in result["pods"]}
+    _unhealthy_pod_keys = {
+        f"{p['namespace']}/{p['name']}" for p in result["unhealthy_pods"]
+    }
 
     # --- Recent warning events (last 20) ---
     try:
@@ -228,14 +249,10 @@ def _collect_cluster_data() -> dict:
             if age_min > EVENT_MAX_AGE_MINUTES:
                 continue  # stale
 
-            # An event about a pod that no longer exists cannot describe a current
-            # fault, however recent it is. This is what made a deleted ReplicaSet's
-            # InvalidImageName warning read as a live critical for the better part
-            # of an hour. The pod list is already collected above, so this is free.
-            if e.involved_object.kind == "Pod":
-                key = f"{e.metadata.namespace}/{e.involved_object.name}"
-                if key not in _collected_pod_keys:
-                    continue
+            if not _warning_event_matches_current_fault(
+                e, _collected_pod_keys, _unhealthy_pod_keys
+            ):
+                continue
             result["events"].append({
                 "namespace": e.metadata.namespace,
                 "reason": e.reason,
