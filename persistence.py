@@ -453,6 +453,9 @@ def init_persistence(database_url: str = "") -> tuple[Any, Any, Any]:
             min_size=1,
             max_size=10,
             open=True,
+            # Validate an idle connection at checkout so a database restart does
+            # not turn the next scheduled health check into a false failure.
+            check=ConnectionPool.check_connection,
             # PostgresSaver requires both of these on every connection.
             kwargs={"autocommit": True, "row_factory": dict_row},
         )
