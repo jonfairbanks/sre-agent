@@ -818,7 +818,11 @@ async def lifespan(app: FastAPI):
     else:
         log.info("MONITORING_ENABLED is false — scheduled health checks not started")
 
-    if _notifier.enabled:
+    if (
+        MONITORING_ENABLED
+        and _notifier.enabled
+        and _db.claim_startup_notification()
+    ):
         _notifier.send_alert(
             "ok",
             "SRE Bot is up",

@@ -148,6 +148,10 @@ class NullDatabase:
     def next_check_number(self) -> int:
         return 0
 
+    def claim_startup_notification(self) -> bool:
+        """Durable startup notices are unavailable without Postgres."""
+        return False
+
 
 class PostgresDatabase:
     """Postgres-backed state. All SQL is parameterized; no value interpolation."""
@@ -423,6 +427,24 @@ class PostgresDatabase:
             return int(row["value"])
         except (TypeError, ValueError, KeyError):
             return 0
+
+    def claim_startup_notification(self) -> bool:
+        """Claim the one-time Slack startup notice for this database.
+
+        A unique row makes this atomic across overlapping rollouts: only the
+        process that inserts it may post the notice. In-memory mode deliberately
+        returns false instead, because it cannot prevent restart spam.
+        """
+        with self._pool.connection() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO monitor_meta (key, value)
+                VALUES ('startup_notification_sent', 'true')
+                ON CONFLICT (key) DO NOTHING
+                RETURNING key
+                """
+            )
+            return cur.fetchone() is not None
 
 
 def init_persistence(database_url: str = "") -> tuple[Any, Any, Any]:
