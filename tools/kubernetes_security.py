@@ -5,6 +5,14 @@ from kubernetes.client.rest import ApiException
 from langchain.tools import tool
 from .k8s_client import core_v1, rbac_v1, networking_v1
 
+SYSTEM_NAMESPACE_NAMES = {"default"}
+SYSTEM_NAMESPACE_PREFIX = "kube-"
+
+
+def _is_workload_namespace(name: str) -> bool:
+    """Return whether a namespace is safe to include in workload posture checks."""
+    return name not in SYSTEM_NAMESPACE_NAMES and not name.startswith(SYSTEM_NAMESPACE_PREFIX)
+
 
 def _safe(fn):
     try:
@@ -135,7 +143,9 @@ def kubectl_audit_pod_security(namespace: str = "default") -> str:
 @tool
 def kubectl_get_network_policies(namespace: str = "default") -> str:
     """
-    List NetworkPolicies and identify namespaces with no policies (fully open traffic).
+    List NetworkPolicies and identify workload namespaces with no policies.
+    Kubernetes system namespaces and the default namespace are excluded because
+    they require a separate control-plane traffic model.
     Pass namespace='--all-namespaces' to scan cluster-wide.
     """
     def _run():
@@ -145,7 +155,10 @@ def kubectl_get_network_policies(namespace: str = "default") -> str:
             policies = networking_v1().list_network_policy_for_all_namespaces().items
             all_ns = [ns.metadata.name for ns in core_v1().list_namespace().items]
             ns_with_policies = set(p.metadata.namespace for p in policies)
-            unprotected = [ns for ns in all_ns if ns not in ns_with_policies]
+            unprotected = [
+                ns for ns in all_ns
+                if _is_workload_namespace(ns) and ns not in ns_with_policies
+            ]
 
             out.append("=== NETWORK POLICIES ===")
             out.append(f"{'NAMESPACE':<25} {'NAME':<35} POD SELECTOR")
@@ -154,7 +167,7 @@ def kubectl_get_network_policies(namespace: str = "default") -> str:
                 out.append(f"{p.metadata.namespace:<25} {p.metadata.name:<35} {sel}")
 
             if unprotected:
-                out.append(f"\n=== NAMESPACES WITH NO NETWORK POLICIES ({len(unprotected)}) ===")
+                out.append(f"\n=== WORKLOAD NAMESPACES WITH NO NETWORK POLICIES ({len(unprotected)}) ===")
                 for ns in sorted(unprotected):
                     out.append(f"  {ns}  *** NO NETWORK POLICIES — unrestricted ingress/egress ***")
             else:
