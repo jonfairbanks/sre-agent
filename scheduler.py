@@ -14,6 +14,7 @@ import uuid
 from datetime import datetime, timezone
 from langsmith import traceable
 from langsmith.wrappers import wrap_anthropic
+from psycopg import OperationalError
 
 from config import (
     LLM_PROVIDER,
@@ -947,7 +948,19 @@ class MonitoringScheduler:
 
             # Advance state first so a Slack failure below cannot cause the next
             # run to re-report everything as new.
-            check_no = self._db.next_check_number()
+            # A connection can still be closed by PostgreSQL after the pool
+            # validates it at checkout. This is the first persistence action
+            # after the model call, so retry it once rather than losing an
+            # otherwise-complete scheduled check to a transient disconnect.
+            try:
+                check_no = self._db.next_check_number()
+            except OperationalError:
+                log.warning(
+                    "Postgres connection closed while advancing scheduled check state; retrying once "
+                    "(session=%s)",
+                    session_id,
+                )
+                check_no = self._db.next_check_number()
             diff = diff_report(report, self._db.load_tracked_findings(), now)
             self._db.apply_diff(diff, now)
 
