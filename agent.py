@@ -14,8 +14,7 @@ from config import (
     DATABASE_URL,
     TOOL_OUTPUT_MAX_CHARS,
     DEFAULT_NAMESPACES,
-    LLM_PROVIDER,
-    PROMPT_CACHING,
+    ANTHROPIC_PROMPT_CACHING,
     MODEL_CALL_RUN_LIMIT,
     MODEL_CALL_THREAD_LIMIT,
     TOOL_CALL_RUN_LIMIT,
@@ -97,7 +96,7 @@ def _build_middleware() -> list:
     # First in the list: bound per-tool-result size before anything else sees it.
     middleware.append(truncate_tool_output)
 
-    if PROMPT_CACHING and LLM_PROVIDER == "anthropic":
+    if ANTHROPIC_PROMPT_CACHING:
         middleware.append(anthropic_prompt_caching)
 
     # Backstop against runaway model spend (per-run and per-thread).

@@ -7,6 +7,7 @@ import os
 import re
 import threading
 import uuid
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
@@ -15,7 +16,7 @@ from typing import Any, Optional
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from langgraph.types import Command
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
@@ -784,6 +785,9 @@ from contextlib import asynccontextmanager
 async def lifespan(app: FastAPI):
     global _notifier, _agent, _scheduler, _db
 
+    from llm import validate_provider_credentials
+    validate_provider_credentials()
+
     # 1. Durable state (Postgres, or in-memory fallback). Built first so the
     #    agent, session table, audit log, and scheduler all share one pool.
     from persistence import init_persistence
@@ -1053,6 +1057,14 @@ async def trigger_check():
 # Built-in web UI
 # ---------------------------------------------------------------------------
 
+@app.get("/assets/markdown-it.min.js", include_in_schema=False)
+async def markdown_asset():
+    return FileResponse(
+        Path(__file__).parent / "static/vendor/markdown-it/markdown-it.umd.min.js",
+        media_type="text/javascript",
+    )
+
+
 @app.get("/", response_class=HTMLResponse)
 def ui():
     return HTMLResponse(content=_UI_HTML)
@@ -1074,6 +1086,7 @@ _UI_HTML = """<!DOCTYPE html>
   .msg { max-width: 80%; padding: 12px 16px; border-radius: 12px; line-height: 1.6; white-space: pre-wrap; font-size: 14px; }
   .msg.user { align-self: flex-end; background: #2b6cb0; color: #fff; }
   .msg.bot { align-self: flex-start; background: #1a1d2e; border: 1px solid #2d3748; }
+  .msg.markdown { white-space: normal; }
   .msg.bot p { margin: 0 0 10px; }
   .msg.bot p:last-child { margin-bottom: 0; }
   .msg.bot h1, .msg.bot h2, .msg.bot h3 { color: #f7fafc; line-height: 1.3; margin: 14px 0 8px; }
@@ -1081,7 +1094,7 @@ _UI_HTML = """<!DOCTYPE html>
   .msg.bot h1:first-child, .msg.bot h2:first-child, .msg.bot h3:first-child { margin-top: 0; }
   .msg.bot ul, .msg.bot ol { margin: 6px 0 10px 20px; }
   .msg.bot li { margin: 4px 0; }
-  .msg.bot code { background: #2d3748; border-radius: 4px; padding: 1px 4px; color: #bee3f8; }
+  .msg.bot code { background: #2d3748; border-radius: 4px; padding: 1px 4px; color: #bee3f8; white-space: pre-wrap; }
   .msg.bot pre { overflow-x: auto; background: #111827; border-radius: 6px; padding: 10px; margin: 8px 0; white-space: pre-wrap; }
   .msg.bot pre code { background: none; padding: 0; }
   .msg.bot a { color: #90cdf4; }
@@ -1135,6 +1148,7 @@ _UI_HTML = """<!DOCTYPE html>
   <textarea id="msg-input" rows="2" placeholder="Ask the SRE bot..." onkeydown="onKey(event)"></textarea>
   <button id="send-btn" onclick="sendMessage()">Send</button>
 </div>
+<script src="/assets/markdown-it.min.js"></script>
 <script>
 let sessionId = null;
 let eventSource = null;
@@ -1160,66 +1174,27 @@ fetch('/health').then(r=>r.json()).then(d=>{
 function escapeHtml(text) {
   return String(text).replace(/[&<>"']/g, c => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'}[c]));
 }
-function renderInline(text) {
-  return text
-    .replace(/`([^`]+)`/g, '<code>$1</code>')
-    .replace(/[*][*]([^*]+)[*][*]/g, '<strong>$1</strong>')
-    .replace(/__([^_]+)__/g, '<strong>$1</strong>')
-    .replace(/[*]([^*]+)[*]/g, '<strong>$1</strong>')
-    .replace(/_([^_]+)_/g, '<em>$1</em>')
-    .replace(/\\[([^\\]]+)\\]\\((https?:\\/\\/[^\\s)]+)\\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
-}
-function renderMarkdown(text) {
-  const lines = escapeHtml(text).split('\\n');
-  const html = [];
-  let list = null;
-  let inCode = false;
-  const closeList = () => { if (list) { html.push(`</${list}>`); list = null; } };
-  const tableCells = (line) => line.trim().replace(/^\\|/, '').replace(/\\|$/, '').split('|').map(cell => cell.trim());
-  const isTableSeparator = (line) => /^\\s*\\|?\\s*:?-{3,}:?\\s*(\\|\\s*:?-{3,}:?\\s*)+\\|?\\s*$/.test(line);
-  for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index];
-    if (line.startsWith('```')) {
-      closeList();
-      html.push(inCode ? '</code></pre>' : '<pre><code>');
-      inCode = !inCode;
-      continue;
-    }
-    if (inCode) { html.push(line + '\\n'); continue; }
-    const heading = line.match(/^(#{1,3})\\s+(.+)$/);
-    const bullet = line.match(/^\\s*[-*+•]\\s+(.+)$/);
-    const ordered = line.match(/^\\s*\\d+\\.\\s+(.+)$/);
-    if (line.includes('|') && isTableSeparator(lines[index + 1] || '')) {
-      closeList();
-      const headers = tableCells(line);
-      html.push('<div class="table-wrap"><table><thead><tr>');
-      headers.forEach(cell => html.push(`<th>${renderInline(cell)}</th>`));
-      html.push('</tr></thead><tbody>');
-      index += 1;
-      while (index + 1 < lines.length && lines[index + 1].includes('|') && lines[index + 1].trim()) {
-        const cells = tableCells(lines[index + 1]);
-        if (cells.length !== headers.length) break;
-        html.push('<tr>');
-        cells.forEach(cell => html.push(`<td>${renderInline(cell)}</td>`));
-        html.push('</tr>');
-        index += 1;
-      }
-      html.push('</tbody></table></div>');
-    }
-    else if (heading) { closeList(); const level = heading[1].length; html.push(`<h${level}>${renderInline(heading[2])}</h${level}>`); }
-    else if (bullet) { if (list !== 'ul') { closeList(); html.push('<ul>'); list = 'ul'; } html.push(`<li>${renderInline(bullet[1])}</li>`); }
-    else if (ordered) { if (list !== 'ol') { closeList(); html.push('<ol>'); list = 'ol'; } html.push(`<li>${renderInline(ordered[1])}</li>`); }
-    else if (!line.trim()) { closeList(); }
-    else { closeList(); html.push(`<p>${renderInline(line)}</p>`); }
-  }
-  closeList();
-  if (inCode) html.push('</code></pre>');
-  return html.join('');
-}
+const markdown = window.markdownit({html: false}).disable('image');
+// Recognize adjacent tables without a blank line using the library's table rule.
+const tableRuler = window.markdownit().block.ruler;
+tableRuler.enableOnly('table');
+const tableRule = tableRuler.getRules('')[0];
+markdown.block.ruler.before('table', 'adjacent_table', (state, start, end, silent) =>
+  silent && state.parentType === 'table' && tableRule(state, start, end, true),
+  {alt: ['blockquote']});
+markdown.renderer.rules.table_open = () => '<div class="table-wrap"><table>';
+markdown.renderer.rules.table_close = () => '</table></div>';
+markdown.renderer.rules.link_open = (tokens, index, options, env, renderer) => {
+  tokens[index].attrSet('target', '_blank');
+  tokens[index].attrSet('rel', 'noopener noreferrer');
+  return renderer.renderToken(tokens, index, options);
+};
+function renderInline(text) { return markdown.renderInline(String(text)); }
+function renderMarkdown(text) { return markdown.render(String(text)); }
 function appendMsg(text, cls, markdown = false) {
   const chat = document.getElementById('chat');
   const div = document.createElement('div');
-  div.className = 'msg ' + cls;
+  div.className = 'msg ' + cls + (markdown ? ' markdown' : '');
   if (markdown) div.innerHTML = renderMarkdown(text);
   else div.textContent = text;
   chat.appendChild(div);

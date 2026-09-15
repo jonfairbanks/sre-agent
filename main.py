@@ -7,6 +7,7 @@ from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.markdown import Markdown
 from langgraph.types import Command
+from response_text import response_text
 
 load_dotenv()
 
@@ -14,18 +15,14 @@ console = Console()
 
 
 def check_env():
-    missing = []
-    provider = os.getenv("LLM_PROVIDER", "anthropic").strip().lower()
-    provider_keys = {
-        "anthropic": "ANTHROPIC_API_KEY",
-        "openai": "OPENAI_API_KEY",
-    }
-    api_key = provider_keys.get(provider)
-    if api_key is None:
-        console.print("[red]LLM_PROVIDER must be 'anthropic' or 'openai'.[/red]")
+    try:
+        from llm import validate_provider_credentials
+        validate_provider_credentials()
+    except (RuntimeError, ValueError) as error:
+        console.print(f"[red]{error}[/red]")
+        console.print("Copy .env.example to .env and fill in your keys.")
         sys.exit(1)
-    if not os.getenv(api_key):
-        missing.append(api_key)
+    missing = []
     if not os.getenv("LANGSMITH_API_KEY"):
         missing.append("LANGSMITH_API_KEY")
     if missing:
@@ -99,7 +96,7 @@ def print_response(result: dict):
     if not messages:
         return
     last = messages[-1]
-    content = last.content if hasattr(last, "content") else str(last)
+    content = response_text(last)
     if content:
         console.print()
         console.print(Panel(Markdown(content), title="[green bold]SRE Bot[/green bold]", border_style="green"))
