@@ -6,6 +6,18 @@ import types
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def restore_imported_modules():
+    """Provider reloads must not leave other tests bound to stale modules."""
+    originals = {name: sys.modules.get(name) for name in ("config", "llm")}
+    yield
+    for name, module in originals.items():
+        if module is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = module
+
+
 def _reload_config(monkeypatch, provider: str):
     monkeypatch.setenv("LLM_PROVIDER", provider)
     sys.modules.pop("config", None)
@@ -55,3 +67,24 @@ def test_openai_model_uses_responses_api(monkeypatch):
 
     assert isinstance(llm.get_main_model(), FakeChatOpenAI)
     assert calls == [{"model": config.MODEL_ID, "use_responses_api": True}]
+
+
+def test_openai_missing_api_key_fails_with_clear_error(monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    sys.modules.pop("llm", None)
+    llm = importlib.import_module("llm")
+    monkeypatch.setattr(llm, "LLM_PROVIDER", "openai")
+    monkeypatch.setattr(llm, "PROVIDER_API_KEY", "OPENAI_API_KEY")
+
+    with pytest.raises(RuntimeError, match="OPENAI_API_KEY is required"):
+        llm.validate_provider_credentials()
+
+
+def test_openai_configured_api_key_passes_startup_validation(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    sys.modules.pop("llm", None)
+    llm = importlib.import_module("llm")
+    monkeypatch.setattr(llm, "LLM_PROVIDER", "openai")
+    monkeypatch.setattr(llm, "PROVIDER_API_KEY", "OPENAI_API_KEY")
+
+    llm.validate_provider_credentials()

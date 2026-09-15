@@ -6,6 +6,7 @@ load_dotenv()
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "anthropic").strip().lower()
 if LLM_PROVIDER not in {"anthropic", "openai"}:
     raise ValueError("LLM_PROVIDER must be either 'anthropic' or 'openai'")
+PROVIDER_API_KEY = f"{LLM_PROVIDER.upper()}_API_KEY"
 
 # Keep the existing Anthropic defaults, while allowing every active model role
 # to be overridden independently. The OpenAI defaults preserve the same tiered
@@ -80,6 +81,7 @@ TOOL_OUTPUT_MAX_CHARS = int(os.getenv("TOOL_OUTPUT_MAX_CHARS", "12000"))
 # full input tokens on every model call. It is ignored for OpenAI, whose recent
 # models use automatic prompt caching.
 PROMPT_CACHING = os.getenv("PROMPT_CACHING", "true").lower() in ("1", "true", "yes")
+ANTHROPIC_PROMPT_CACHING = PROMPT_CACHING and LLM_PROVIDER == "anthropic"
 
 # ---------------------------------------------------------------------------
 # Durable state

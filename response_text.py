@@ -25,6 +25,10 @@ def _content_text(content: Any) -> str:
     if isinstance(content, list) or isinstance(content, tuple):
         return "\n".join(filter(None, (_content_text(block) for block in content)))
     if isinstance(content, dict):
+        if content.get("type") == "refusal":
+            refusal = content.get("refusal")
+            if isinstance(refusal, str):
+                return refusal
         text = content.get("text")
         if isinstance(text, str):
             return text
