@@ -74,8 +74,10 @@ startupProbe:
   httpGet:
     path: /health
     port: http
-  # Allow up to 30 seconds for the API and its optional integrations to initialise.
-  # While this probe is running, Kubernetes suppresses liveness and readiness.
+  # The API performs persistence and integration initialisation before binding
+  # its health endpoint. Defer the first probe through that normal cold-start
+  # window, then retain six checks to detect a genuinely stalled startup.
+  initialDelaySeconds: 30
   failureThreshold: 6
   periodSeconds: 5
 
