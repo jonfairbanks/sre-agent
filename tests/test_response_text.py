@@ -24,3 +24,9 @@ def test_response_text_extracts_openai_responses_content_blocks():
 
 def test_response_text_ignores_non_text_blocks():
     assert response_text([{"type": "tool_use", "name": "kubectl_get_pods"}]) == ""
+
+
+def test_response_text_preserves_openai_refusal():
+    assert response_text(Message([{"type": "refusal", "refusal": "I cannot help with that."}])) == (
+        "I cannot help with that."
+    )

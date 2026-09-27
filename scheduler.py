@@ -13,16 +13,15 @@ import os
 import uuid
 from datetime import datetime, timezone
 from langsmith import traceable
-from langsmith.wrappers import wrap_anthropic
 from psycopg import OperationalError
 
 from config import (
-    LLM_PROVIDER,
     MONITOR_DIGEST_EVERY_N_CHECKS,
     MONITOR_NOTIFY_ON_RESOLVED,
     SUBAGENT_MODEL_ID,
 )
 from monitor_state import diff_report
+from llm import HealthReportTokenLimitError, request_health_report
 
 log = logging.getLogger("sre-agent.scheduler")
 
@@ -660,8 +659,12 @@ def _repair_health_report(payload):
         return None
 
     data = dict(payload)
+    raw_findings = data.get("findings") or []
+    actions = data.get("recommended_actions") or []
+    if not isinstance(raw_findings, list) or not isinstance(actions, list):
+        return None
     findings = []
-    for raw in data.get("findings") or []:
+    for raw in raw_findings:
         if not isinstance(raw, dict):
             continue
         f = dict(raw)
@@ -670,6 +673,8 @@ def _repair_health_report(payload):
             findings.append(Finding.model_validate(f))
         except Exception:
             continue  # drop only this finding
+    if raw_findings and not findings:
+        return None
     data["findings"] = findings
 
     overall = _coerce_severity(
@@ -685,7 +690,6 @@ def _repair_health_report(payload):
     data["overall_severity"] = overall
     data["summary"] = str(data.get("summary") or "").strip() or "Health check completed."
 
-    actions = data.get("recommended_actions") or []
     data["recommended_actions"] = [str(a) for a in actions if isinstance(a, (str, int, float))]
 
     try:
@@ -726,115 +730,43 @@ def _degraded_health_report(summary: str):
     )
 
 
-def _analyse_with_openai(snapshot: str) -> "HealthReport":
-    """Use OpenAI native structured output through LangChain's Responses API."""
-    from llm import get_subagent_model
+@traceable(name="scheduled-health-check", run_type="llm")
+def _analyse_snapshot(snapshot: str) -> "HealthReport":
+    """Validate and repair either provider's bounded health analysis."""
     from schemas import HealthReport
 
     system, user = _health_prompt(snapshot)
-    model = get_subagent_model().with_structured_output(
-        HealthReport,
-        method="json_schema",
-    )
     try:
-        result = model.invoke([("system", system), ("user", user)])
-        return HealthReport.model_validate(result)
+        payload = request_health_report(HealthReport.model_json_schema(), system, user)
     except Exception as e:
         log.error(
-            "OpenAI health analysis failed to return a valid HealthReport (model=%s): %s",
-            SUBAGENT_MODEL_ID,
-            e,
+            "Health analysis request failed (model=%s, error=%s)",
+            SUBAGENT_MODEL_ID, type(e).__name__,
         )
+        hint = " (analysis hit the output token limit)" if isinstance(e, HealthReportTokenLimitError) else ""
+        return _degraded_health_report(
+            f"Health analysis did not return a structured result{hint}; review the cluster manually."
+        )
+
+    if not isinstance(payload, dict) or not {"overall_severity", "findings"}.intersection(payload):
         return _degraded_health_report(
             "Health analysis did not return a structured result; review the cluster manually."
         )
 
-
-def _analyse_with_anthropic(snapshot: str) -> "HealthReport":
-    """Use Anthropic forced tool calling to produce a HealthReport.
-
-    Uses forced tool-use so the model returns a validated HealthReport rather
-    than free text that has to be regex-parsed downstream.
-    """
-    import anthropic
-    from schemas import HealthReport
-
-    client = wrap_anthropic(anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY", "")))
-
-    system, user = _health_prompt(snapshot)
-    tool = {
-        "name": "report_health",
-        "description": "Report the structured cluster health assessment.",
-        "input_schema": HealthReport.model_json_schema(),
-    }
-
-    response = client.messages.create(
-        model=SUBAGENT_MODEL_ID,
-        max_tokens=4096,
-        system=system,
-        tools=[tool],
-        tool_choice={"type": "tool", "name": "report_health"},
-        messages=[
-            {
-                "role": "user",
-                "content": user,
-            }
-        ],
-    )
-
-    stop_reason = getattr(response, "stop_reason", None)
-    tool_input = next(
-        (block.input for block in response.content if getattr(block, "type", None) == "tool_use"),
-        None,
-    )
-
-    if tool_input is None:
-        # Forced tool_choice should guarantee a tool_use block, so its absence almost
-        # always means the model ran out of output tokens before finishing the call.
-        # Log the shape (block types + stop_reason — never the snapshot/secrets) so
-        # this is diagnosable, and surface a clearly-labelled degraded report.
-        block_types = [getattr(b, "type", "?") for b in response.content]
-        log.error(
-            "Anthropic returned no tool_use block (stop_reason=%s, blocks=%s)",
-            stop_reason, block_types,
-        )
-        hint = " (analysis hit the output token limit)" if stop_reason == "max_tokens" else ""
-        return HealthReport(
-            overall_severity="warning",
-            summary=f"Health analysis did not return a structured result{hint}; review the cluster manually.",
-            findings=[],
-            recommended_actions=[],
-        )
-
     try:
-        return HealthReport.model_validate(tool_input)
-    except Exception as e:
-        # Try to salvage before giving up, so a drifted enum does not cost the
-        # operator the entire report.
-        repaired = _repair_health_report(tool_input)
+        return HealthReport.model_validate(payload)
+    except ValueError:
+        repaired = _repair_health_report(payload)
         if repaired is not None:
             log.warning(
-                "Repaired malformed HealthReport from Anthropic (stop_reason=%s, severity=%s, "
-                "findings=%d): %s",
-                stop_reason, repaired.overall_severity, len(repaired.findings), e,
+                "Repaired malformed HealthReport (model=%s, severity=%s, findings=%d)",
+                SUBAGENT_MODEL_ID, repaired.overall_severity, len(repaired.findings),
             )
             return repaired
 
-        log.error("Failed to validate HealthReport from Anthropic (stop_reason=%s): %s", stop_reason, e)
-        return HealthReport(
-            overall_severity="warning",
-            summary="Health analysis returned a malformed result; review the cluster manually.",
-            findings=[],
-            recommended_actions=[],
+        return _degraded_health_report(
+            "Health analysis returned a malformed result; review the cluster manually."
         )
-
-
-@traceable(name="scheduled-health-check", run_type="llm")
-def _analyse_snapshot(snapshot: str) -> "HealthReport":
-    """Analyze a pre-collected snapshot with the configured LLM provider."""
-    if LLM_PROVIDER == "openai":
-        return _analyse_with_openai(snapshot)
-    return _analyse_with_anthropic(snapshot)
 
 
 def run_structured_health_check() -> tuple["HealthReport", dict]:
