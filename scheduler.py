@@ -719,7 +719,11 @@ def _health_prompt(snapshot: str) -> tuple[str, str]:
         "You are a concise SRE assistant. You receive a Kubernetes cluster snapshot "
         "and produce a structured health report. Focus on actionable issues and name "
         "specific resources. Skip healthy resources unless there is a pattern worth "
-        "noting. Set overall_severity to the highest severity among your findings, or "
+        "noting. Do not flag an HPA CPU reading above its target by itself: that is "
+        "normal while a healthy deployment is scaling. Report an HPA warning only "
+        "when it is scaling-limited at its maximum, its deployment remains unavailable "
+        "after its target has settled, or other evidence shows workload harm. Set "
+        "overall_severity to the highest severity among your findings, or "
         "'ok' if the cluster is healthy."
     )
     user = (
