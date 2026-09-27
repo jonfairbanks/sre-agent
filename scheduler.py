@@ -701,7 +701,11 @@ def _health_prompt(snapshot: str) -> tuple[str, str]:
         "and produce a structured health report. Focus on actionable issues and name "
         "specific resources. Skip healthy resources. Lifetime restart counts alone "
         "are not findings; do not report recovered historical restarts. "
-        "Set overall_severity to the highest severity among your findings, or "
+        "Do not flag an HPA CPU reading above its target by itself: that is "
+        "normal while a healthy deployment is scaling. Report an HPA warning only "
+        "when it is scaling-limited at its maximum, its deployment remains unavailable "
+        "after its target has settled, or other evidence shows workload harm. Set "
+        "overall_severity to the highest severity among your findings, or "
         "'ok' if the cluster is healthy."
     )
     user = (

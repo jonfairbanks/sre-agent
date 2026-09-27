@@ -153,6 +153,10 @@ rollout. Version tags are published by `.github/workflows/release.yml` when a
 matching Git tag such as `v0.1.0` is pushed; the tag must match both the chart
 `version` and `appVersion`.
 
+For an image-only release, run the release workflow manually on the desired
+branch. It tests and publishes `ghcr.io/jonfairbanks/sre-agent:sha-<full-commit-sha>`
+without changing the chart version. Pin the published image digest in GitOps.
+
 ### Raw manifests
 
 The included `deploy.sh` handles build, ECR push, and EKS apply in one step:
