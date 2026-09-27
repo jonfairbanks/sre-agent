@@ -1,6 +1,7 @@
 name: Release image
 
 on:
+  workflow_dispatch:
   push:
     tags:
       - "v*.*.*"
@@ -22,16 +23,20 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Validate release version
+      - name: Select Image Version
         id: version
         shell: bash
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
-          chart_version="$(awk '/^version:/ { print $2; exit }' chart/Chart.yaml)"
-          app_version="$(awk '/^appVersion:/ { gsub(/\"/, "", $2); print $2; exit }' chart/Chart.yaml)"
-          test "$version" = "$chart_version"
-          test "$version" = "$app_version"
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            version="sha-${GITHUB_SHA}"
+          else
+            version="${GITHUB_REF_NAME#v}"
+            chart_version="$(awk '/^version:/ { print $2; exit }' chart/Chart.yaml)"
+            app_version="$(awk '/^appVersion:/ { gsub(/\"/, "", $2); print $2; exit }' chart/Chart.yaml)"
+            test "$version" = "$chart_version"
+            test "$version" = "$app_version"
+          fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
