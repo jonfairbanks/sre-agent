@@ -153,9 +153,14 @@ rollout. Version tags are published by `.github/workflows/release.yml` when a
 matching Git tag such as `v0.1.0` is pushed; the tag must match both the chart
 `version` and `appVersion`.
 
-For an image-only release, run the release workflow manually on the desired
-branch. It tests and publishes `ghcr.io/jonfairbanks/sre-agent:sha-<full-commit-sha>`
-without changing the chart version. Pin the published image digest in GitOps.
+Every push or merge to `main` runs the release checks and publishes
+`ghcr.io/jonfairbanks/sre-agent:sha-<full-commit-sha>` and `:latest`.
+Argo CD Image Updater follows `latest`, commits its digest to the workload's
+GitOps values, and Argo deploys it automatically. App-only changes need no chart
+version bump or manual `cluster-state` edit.
+
+Manual releases from other branches publish only the SHA tag, so test builds
+cannot replace the production image. Version tags also leave `latest` unchanged.
 
 ### Raw manifests
 
