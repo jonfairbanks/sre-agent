@@ -93,7 +93,7 @@ python api.py         # API + web UI at http://localhost:8080
 | `MONITOR_NOTIFY_ON_RESOLVED` | No | Announce findings that cleared (default: `true`) |
 | `MONITOR_ACK_HOURS` | No | How long the Slack **Ack** button mutes a finding (default: `24`) |
 | `PVC_USAGE_ALERT_PERCENT` | No | PVCs at or above this fill level are listed individually in the health snapshot (default: `70`) |
-| `POD_FAILURE_RECENCY_MINUTES` | No | Recovered failures drop out after this many minutes (default: `60`). Lifetime restart counts alone are not reported; active faults still are. |
+| `POD_FAILURE_RECENCY_MINUTES` | No | Recovered failures drop out after this many minutes (default: `240`, or 4 hours). Set this variable to override the window. Lifetime restart counts alone are not reported; active faults still are. |
 | `POD_STARTUP_GRACE_MINUTES` | No | Grace before Pending or not-ready counts as a fault (default: `10`) |
 | `EVENT_MAX_AGE_MINUTES` | No | Warning events older than this are dropped (default: `60`) |
 | `DATABASE_URL` | No | Postgres DSN for durable state. Unset = in-memory, and pending approvals do not survive a restart |

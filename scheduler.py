@@ -58,7 +58,7 @@ FAILURE_TERMINATION_REASONS = {
 # How recently a *failed* termination must have happened to still count as a
 # current problem. Restart count alone cannot distinguish a crashloop from a
 # healthy redeploy, so recency plus failure reason is used instead.
-POD_FAILURE_RECENCY_MINUTES = int(os.getenv("POD_FAILURE_RECENCY_MINUTES", "60"))
+POD_FAILURE_RECENCY_MINUTES = int(os.getenv("POD_FAILURE_RECENCY_MINUTES", "240"))
 
 # Grace period before Pending or not-ready is treated as a fault, so pods that
 # are simply still starting during a rollout are not reported.

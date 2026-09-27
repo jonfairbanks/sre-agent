@@ -5,6 +5,9 @@ cases below are mostly about what must NOT be reported.
 """
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace as NS
 
@@ -20,6 +23,20 @@ from scheduler import (
 )
 
 NOW = datetime(2026, 8, 11, 22, 0, tzinfo=timezone.utc)
+
+
+@pytest.mark.parametrize("override,expected", [(None, 240), ("30", 30), ("480", 480)])
+def test_failure_recency_default_and_overrides(override, expected):
+    env = os.environ.copy()
+    env.pop("POD_FAILURE_RECENCY_MINUTES", None)
+    if override is not None:
+        env["POD_FAILURE_RECENCY_MINUTES"] = override
+    result = subprocess.run(
+        [sys.executable, "-c", "from scheduler import POD_FAILURE_RECENCY_MINUTES; "
+         "print(POD_FAILURE_RECENCY_MINUTES)"],
+        env=env, capture_output=True, text=True, check=True,
+    )
+    assert int(result.stdout.strip()) == expected
 
 
 def container(ready=True, restarts=0, waiting=None,
