@@ -13,7 +13,6 @@ import pytest
 from scheduler import (
     EVENT_MAX_AGE_MINUTES,
     POD_FAILURE_RECENCY_MINUTES,
-    POD_RESTART_NOTABLE,
     POD_STARTUP_GRACE_MINUTES,
     _classify_pod,
     _format_snapshot,
@@ -170,14 +169,64 @@ def pod_row(name="api-1", restarts=0, status="Running", last=None, ago=None):
             "last_termination_min_ago": ago}
 
 
-def test_high_restart_pods_render_as_context_not_as_unhealthy():
-    rows = [pod_row(f"api-{i}", restarts=POD_RESTART_NOTABLE + i,
-                    last="Completed", ago=150) for i in range(3)]
+@pytest.mark.parametrize("reason", ["Completed", "Error", "OOMKilled", "Unknown", None])
+@pytest.mark.parametrize("ago", [2 * 24 * 60, 9 * 30 * 24 * 60, None])
+def test_healthy_pods_restart_history_is_not_sent_to_the_model(reason, ago):
+    rows = [pod_row(f"api-{i}", restarts=37 + i,
+                    last=reason, ago=ago) for i in range(3)]
     out = _format_snapshot(base_data(pods=rows))
     assert "=== PODS === all 3 pods healthy" in out
-    assert "HIGH RESTART COUNTS (clean exits, not currently failing)" in out
-    assert "Completed" in out
+    assert "HIGH RESTART COUNTS" not in out
+    assert "restarts=" not in out
+    assert "api-" not in out
     assert "UNHEALTHY PODS" not in out
+
+
+@pytest.mark.parametrize("reason,exit_code", [("Error", 1), ("OOMKilled", 137)])
+def test_recovered_failure_ages_out_of_the_snapshot(reason, exit_code):
+    p = pod(containers=[container(restarts=37, last_terminated=(reason, exit_code, 0))])
+
+    def snapshot_after(minutes):
+        unhealthy, status, extra = _classify_pod(p, NOW + timedelta(minutes=minutes))
+        row = pod_row(restarts=37, status=status)
+        row.update(extra)
+        return _format_snapshot(base_data(pods=[row], unhealthy_pods=[row] if unhealthy else []))
+
+    # Keep reporting the failure through the configured window, then drop it
+    # even though Kubernetes still reports the same lifetime restart count.
+    for minutes in (5, POD_FAILURE_RECENCY_MINUTES):
+        out = snapshot_after(minutes)
+        assert f"Restarted/{reason}" in out
+        assert "restarts=37" in out
+    for minutes in (POD_FAILURE_RECENCY_MINUTES + 1, 2 * 24 * 60, 9 * 30 * 24 * 60):
+        out = snapshot_after(minutes)
+        assert "all 1 pods healthy" in out
+        assert "api-1" not in out
+        assert "restarts=" not in out
+
+
+@pytest.mark.parametrize("waiting", ["CrashLoopBackOff", "ImagePullBackOff"])
+def test_active_fault_with_old_restart_history_stays_in_the_snapshot(waiting):
+    p = pod(containers=[container(ready=False, restarts=37, waiting=waiting,
+                                 last_terminated=("Error", 1, 9 * 30 * 24 * 60))])
+    unhealthy, status, extra = _classify_pod(p, NOW)
+    assert unhealthy is True
+    row = pod_row(restarts=37, status=status)
+    row.update(extra)
+    out = _format_snapshot(base_data(pods=[row], unhealthy_pods=[row]))
+    assert waiting in out
+    assert "api-1" in out
+
+
+def test_recent_clean_restart_is_not_sent_to_the_model():
+    p = pod(containers=[container(restarts=37, last_terminated=("Completed", 0, 1))])
+    unhealthy, status, extra = _classify_pod(p, NOW)
+    assert unhealthy is False
+    row = pod_row(restarts=37, status=status)
+    row.update(extra)
+    out = _format_snapshot(base_data(pods=[row]))
+    assert "all 1 pods healthy" in out
+    assert "restarts=" not in out
 
 
 def test_unhealthy_pod_line_states_the_cause():
