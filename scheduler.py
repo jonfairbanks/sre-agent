@@ -58,14 +58,11 @@ FAILURE_TERMINATION_REASONS = {
 # How recently a *failed* termination must have happened to still count as a
 # current problem. Restart count alone cannot distinguish a crashloop from a
 # healthy redeploy, so recency plus failure reason is used instead.
-POD_FAILURE_RECENCY_MINUTES = int(os.getenv("POD_FAILURE_RECENCY_MINUTES", "60"))
+POD_FAILURE_RECENCY_MINUTES = int(os.getenv("POD_FAILURE_RECENCY_MINUTES", "240"))
 
 # Grace period before Pending or not-ready is treated as a fault, so pods that
 # are simply still starting during a rollout are not reported.
 POD_STARTUP_GRACE_MINUTES = int(os.getenv("POD_STARTUP_GRACE_MINUTES", "10"))
-
-# Restart counts at or above this are surfaced as context, never as a fault.
-POD_RESTART_NOTABLE = int(os.getenv("POD_RESTART_NOTABLE", "10"))
 
 # Warning events older than this are dropped. The section is titled "RECENT" but
 # had no age filter, so a warning about a pod that no longer exists was presented
@@ -144,7 +141,7 @@ def _classify_pod(pod, now) -> tuple[bool, str, dict]:
     if failed_termination and last_ago <= POD_FAILURE_RECENCY_MINUTES:
         return True, f"Restarted/{last_reason}", extra
 
-    # Healthy. High restart counts with clean exits land here on purpose.
+    # Healthy. Lifetime restart counts and recovered old failures are history.
     return False, phase, extra
 
 
@@ -545,25 +542,9 @@ def _format_snapshot(data: dict) -> str:
         total = len(data["pods"])
         lines.append(f"\n=== PODS === all {total} pods healthy")
 
-    # Pods with a lot of lifetime restarts whose last exit was clean. Not a fault
-    # (a rolling restart looks exactly like this), but worth stating so a genuinely
-    # flappy workload is still visible.
-    churny = [
-        p for p in data["pods"]
-        if p.get("restarts", 0) >= POD_RESTART_NOTABLE
-        and p not in data["unhealthy_pods"]
-    ]
-    if churny:
-        lines.append(
-            f"\n=== HIGH RESTART COUNTS (clean exits, not currently failing) ==="
-        )
-        for p in sorted(churny, key=lambda x: -x["restarts"])[:10]:
-            last = p.get("last_termination") or "unknown"
-            ago = p.get("last_termination_min_ago")
-            when = f", last {ago}m ago" if ago is not None else ""
-            lines.append(
-                f"  {p['namespace']}/{p['name']}  restarts={p['restarts']}  ({last}{when})"
-            )
+    # Do not send healthy pods' lifetime restart history to the model. It can
+    # turn even explicitly historical context into a fresh finding every check.
+    # Recent failed terminations and active faults are already included above.
 
     # Busiest pods. Capped at 10 so a large cluster cannot inflate the prompt,
     # and so a hot-but-healthy pod is still visible to the analysis step.
@@ -718,8 +699,9 @@ def _health_prompt(snapshot: str) -> tuple[str, str]:
     system = (
         "You are a concise SRE assistant. You receive a Kubernetes cluster snapshot "
         "and produce a structured health report. Focus on actionable issues and name "
-        "specific resources. Skip healthy resources unless there is a pattern worth "
-        "noting. Do not flag an HPA CPU reading above its target by itself: that is "
+        "specific resources. Skip healthy resources. Lifetime restart counts alone "
+        "are not findings; do not report recovered historical restarts. "
+        "Do not flag an HPA CPU reading above its target by itself: that is "
         "normal while a healthy deployment is scaling. Report an HPA warning only "
         "when it is scaling-limited at its maximum, its deployment remains unavailable "
         "after its target has settled, or other evidence shows workload harm. Set "
