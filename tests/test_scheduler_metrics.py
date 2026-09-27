@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from scheduler import _format_hpa_metrics, _format_snapshot, _metric_value
+from scheduler import _format_hpa_metrics, _format_snapshot, _health_prompt, _metric_value
 
 
 def base_data(**over):
@@ -63,6 +63,12 @@ def test_metrics_failure_surfaces_as_a_collection_error_not_a_crash():
 # ---------------------------------------------------------------------------
 # HPA metric rendering
 # ---------------------------------------------------------------------------
+
+def test_health_prompt_requires_evidence_beyond_high_hpa_cpu():
+    system, _ = _health_prompt("snapshot")
+    assert "Do not flag an HPA CPU reading above its target by itself" in system
+    assert "scaling-limited at its maximum" in system
+
 
 class Target:
     def __init__(self, average_utilization=None, average_value=None, value=None):
