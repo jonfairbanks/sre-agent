@@ -74,6 +74,52 @@ def _minutes_since(ts, now) -> float:
     return float("inf") if ts is None else (now - ts).total_seconds() / 60.0
 
 
+def _event_timestamp(event):
+    """Use the latest observation, including aggregated event series."""
+    stamps = [event.last_timestamp, event.event_time,
+              event.series.last_observed_time if event.series else None]
+    return max((stamp for stamp in stamps if stamp is not None), default=None)
+
+
+def _is_recovered_startup_event(event, pod, now) -> bool:
+    """Require proof of a healthy first startup; keep uncertain warnings active."""
+    ref = event.involved_object
+    statuses = pod.status.container_statuses or []
+    if (ref.kind != "Pod" or event.reason != "Unhealthy"
+            or not (event.message or "").startswith("Startup probe failed:")
+            or not ref.uid or ref.uid != pod.metadata.uid
+            or pod.status.phase != "Running" or not statuses
+            or any(not cs.ready or cs.restart_count != 0 for cs in statuses)
+            or _classify_pod(pod, now)[0]):
+        return False
+
+    # A missing container reference is unambiguous only for one container.
+    containers = pod.spec.containers or []
+    if ref.field_path:
+        containers = [c for c in containers if ref.field_path == f"spec.containers{{{c.name}}}"]
+    if len(containers) != 1:
+        return False
+    probe = containers[0].startup_probe
+    cs = next((cs for cs in statuses if cs.name == containers[0].name), None)
+    if not probe or not cs or cs.started is not True or not cs.state or not cs.state.running:
+        return False
+
+    started_at = cs.state.running.started_at
+    ready_at = next((c.last_transition_time for c in (pod.status.conditions or [])
+                     if c.type == "Ready" and c.status == "True"), None)
+    stamp = _event_timestamp(event)
+    if started_at is None or ready_at is None or stamp is None:
+        return False
+
+    # A nominal startup window, not an exact kubelet deadline.
+    delay = probe.initial_delay_seconds or 0
+    period = probe.period_seconds if probe.period_seconds is not None else 10
+    threshold = probe.failure_threshold if probe.failure_threshold is not None else 3
+    return (delay >= 0 and period > 0 and threshold > 0
+            and started_at <= stamp < ready_at <= now
+            and (ready_at - started_at).total_seconds() <= delay + period * threshold)
+
+
 def _classify_pod(pod, now) -> tuple[bool, str, dict]:
     """Decide whether a pod is unhealthy *right now*.
 
@@ -159,6 +205,7 @@ def _collect_cluster_data() -> dict:
         "pods": [],
         "unhealthy_pods": [],
         "events": [],
+        "recovered_startup_events": [],
         "hpas": [],
         "deployments": [],
         "node_metrics": [],
@@ -187,6 +234,7 @@ def _collect_cluster_data() -> dict:
         result["errors"].append(f"nodes: {e}")
 
     # --- Pods (all namespaces) ---
+    collected_pods = {}
     try:
         now = datetime.now(timezone.utc)
         for p in core_v1().list_pod_for_all_namespaces().items:
@@ -200,13 +248,11 @@ def _collect_cluster_data() -> dict:
                 **extra,
             }
             result["pods"].append(pod_info)
+            collected_pods[f"{p.metadata.namespace}/{p.metadata.name}"] = p
             if unhealthy:
                 result["unhealthy_pods"].append(pod_info)
     except Exception as e:
         result["errors"].append(f"pods: {e}")
-
-    # Used to discard warning events whose pod has since been deleted.
-    _collected_pod_keys = {f"{p['namespace']}/{p['name']}" for p in result["pods"]}
 
     # --- Recent warning events (last 20) ---
     try:
@@ -215,25 +261,27 @@ def _collect_cluster_data() -> dict:
         )
         events = sorted(
             ev_resp.items,
-            key=lambda e: (e.last_timestamp or e.event_time or datetime.min.replace(tzinfo=timezone.utc)),
+            key=lambda e: (_event_timestamp(e) or datetime.min.replace(tzinfo=timezone.utc)),
             reverse=True,
         )[:20]
         now_ev = datetime.now(timezone.utc)
         for e in events:
-            stamp = e.last_timestamp or e.event_time
+            stamp = _event_timestamp(e)
             age_min = _minutes_since(stamp, now_ev)
-            if age_min > EVENT_MAX_AGE_MINUTES:
+            if stamp is not None and age_min > EVENT_MAX_AGE_MINUTES:
                 continue  # stale
 
-            # An event about a pod that no longer exists cannot describe a current
-            # fault, however recent it is. This is what made a deleted ReplicaSet's
-            # InvalidImageName warning read as a live critical for the better part
-            # of an hour. The pod list is already collected above, so this is free.
-            if e.involved_object.kind == "Pod":
-                key = f"{e.metadata.namespace}/{e.involved_object.name}"
-                if key not in _collected_pod_keys:
-                    continue
-            result["events"].append({
+            # Deleted pods cannot have current faults. Reuse the collected objects.
+            is_pod = e.involved_object.kind == "Pod"
+            pod = (collected_pods.get(f"{e.metadata.namespace}/{e.involved_object.name}")
+                   if is_pod else None)
+            if is_pod and pod is None:
+                continue
+            # Keep recovered evidence outside the model's active warnings.
+            target = ("recovered_startup_events"
+                      if pod is not None and _is_recovered_startup_event(e, pod, now_ev)
+                      else "events")
+            result[target].append({
                 "namespace": e.metadata.namespace,
                 "reason": e.reason,
                 "message": (e.message or "")[:200],
@@ -883,9 +931,11 @@ class MonitoringScheduler:
             self._db.apply_diff(diff, now)
 
             log.info(
-                "Health check complete (session=%s, check=%d, severity=%s, %s, unhealthy_pods=%d)",
+                "Health check complete (session=%s, check=%d, severity=%s, %s, "
+                "unhealthy_pods=%d, recovered_startup_events=%d)",
                 session_id, check_no, report.overall_severity, diff.summary_line(),
                 len(data.get("unhealthy_pods", [])),
+                len(data.get("recovered_startup_events", [])),
             )
 
             # A digest fires every N checks so a quiet channel still proves the
