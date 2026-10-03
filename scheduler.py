@@ -144,6 +144,25 @@ def _classify_pod(pod, now) -> tuple[bool, str, dict]:
     return False, phase, extra
 
 
+def _hpa_snapshot(h) -> dict:
+    """Keep controller evidence needed to distinguish a cap from blocked growth."""
+    spec, status = h.spec, h.status
+    return {
+        "namespace": h.metadata.namespace,
+        "name": h.metadata.name,
+        "min": spec.min_replicas,
+        "max": spec.max_replicas,
+        "current": status.current_replicas if status else "?",
+        "desired": status.desired_replicas if status else "?",
+        "current_metrics": (getattr(status, "current_metrics", None) or []) if status else [],
+        "target_metrics": getattr(spec, "metrics", None) or [],
+        "conditions": [
+            {"type": c.type, "status": c.status, "reason": c.reason or "unknown"}
+            for c in (getattr(status, "conditions", None) or [])
+        ],
+    }
+
+
 def _collect_cluster_data() -> dict:
     """Collect raw cluster state using the kubernetes Python client directly.
 
@@ -247,20 +266,7 @@ def _collect_cluster_data() -> dict:
     # --- HPAs ---
     try:
         for h in autoscaling_v2().list_horizontal_pod_autoscaler_for_all_namespaces().items:
-            spec = h.spec
-            status = h.status
-            result["hpas"].append({
-                "namespace": h.metadata.namespace,
-                "name": h.metadata.name,
-                "min": spec.min_replicas,
-                "max": spec.max_replicas,
-                "current": status.current_replicas if status else "?",
-                "desired": status.desired_replicas if status else "?",
-                # Utilisation vs target. Without these an "AT MAX" HPA says nothing
-                # about *why* it is pinned, which is the question an operator asks next.
-                "current_metrics": (getattr(status, "current_metrics", None) or []) if status else [],
-                "target_metrics": getattr(spec, "metrics", None) or [],
-            })
+            result["hpas"].append(_hpa_snapshot(h))
     except Exception as e:
         result["errors"].append(f"hpas: {e}")
 
@@ -602,10 +608,16 @@ def _format_snapshot(data: dict) -> str:
     if data["hpas"]:
         lines.append("\n=== HPAs ===")
         for h in data["hpas"]:
-            at_max = " ⚠ AT MAX" if h["current"] == h["max"] else ""
+            at_max = " AT MAX" if h["current"] == h["max"] else ""
+            conditions = ", ".join(
+                f"{c['type']}={c['status']}({c['reason']})"
+                for c in h.get("conditions", [])
+            ) or "unknown"
             lines.append(
                 f"  {h['namespace']}/{h['name']}  {h['current']}/{h['max']}{at_max}"
                 f"{_format_hpa_metrics(h)}"
+                f" desired={h.get('desired', '?')} min={h.get('min', '?')}"
+                f" conditions: {conditions}"
             )
 
     # Recent warning events
@@ -706,9 +718,15 @@ def _health_prompt(snapshot: str) -> tuple[str, str]:
         "specific resources. Skip healthy resources. Lifetime restart counts alone "
         "are not findings; do not report recovered historical restarts. "
         "Do not flag an HPA CPU reading above its target by itself: that is "
-        "normal while a healthy deployment is scaling. Report an HPA warning only "
-        "when it is scaling-limited at its maximum, its deployment remains unavailable "
-        "after its target has settled, or other evidence shows workload harm. Set "
+        "normal while a healthy deployment is scaling. AT MAX alone is not a finding. "
+        "Use controller conditions and current versus target metrics: "
+        "ScalingLimited=True with TooFewReplicas means the configured minimum; "
+        "ScaleDownStabilized means scale-down is waiting. Neither proves blocked growth. "
+        "Report blocked growth at the maximum only with ScalingLimited=True, "
+        "TooManyReplicas, and current demand above target. Missing conditions are "
+        "unknown, not evidence of blocked growth. Still report metric/controller "
+        "failures, deployment unavailability after its target has settled, or other "
+        "evidence of workload harm. Set "
         "overall_severity to the highest severity among your findings, or "
         "'ok' if the cluster is healthy."
     )

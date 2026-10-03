@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from scheduler import _format_hpa_metrics, _format_snapshot, _health_prompt, _metric_value
+from scheduler import _format_hpa_metrics, _format_snapshot, _health_prompt, _hpa_snapshot, _metric_value
 
 
 def base_data(**over):
@@ -67,7 +67,9 @@ def test_metrics_failure_surfaces_as_a_collection_error_not_a_crash():
 def test_health_prompt_requires_evidence_beyond_high_hpa_cpu():
     system, _ = _health_prompt("snapshot")
     assert "Do not flag an HPA CPU reading above its target by itself" in system
-    assert "scaling-limited at its maximum" in system
+    assert "AT MAX alone is not a finding" in system
+    assert "TooManyReplicas, and current demand above target" in system
+    assert "Still report metric/controller failures" in system
 
 
 class Target:
@@ -153,7 +155,7 @@ def test_hpa_line_in_snapshot_includes_metrics_and_at_max_flag():
     assert "(cpu 12%/target 80%)" in out
 
 
-def test_hpa_without_metrics_renders_exactly_as_before():
+def test_hpa_without_metrics_keeps_replicas_and_unknown_conditions():
     data = base_data(hpas=[{
         "namespace": "prod", "name": "api", "min": 1, "max": 4,
         "current": 2, "desired": 2,
@@ -161,6 +163,54 @@ def test_hpa_without_metrics_renders_exactly_as_before():
     out = _format_snapshot(data)
     assert "prod/api  2/4" in out
     assert "(" not in out.split("=== HPAs ===")[1]
+    assert "conditions: unknown" in out
+
+
+@pytest.mark.parametrize("current,desired,condition,reason", [
+    (50, 30, "AbleToScale", "ScaleDownStabilized"),
+    (50, 50, "ScalingLimited", "TooManyReplicas"),
+    (2, 2, "ScalingLimited", "TooFewReplicas"),
+    (2, 2, "ScalingActive", "FailedGetResourceMetric"),
+])
+def test_hpa_controller_evidence_survives_collection_and_rendering(current, desired, condition, reason):
+    from kubernetes.client import (
+        V1ObjectMeta, V2HorizontalPodAutoscaler, V2HorizontalPodAutoscalerCondition,
+        V2HorizontalPodAutoscalerSpec, V2HorizontalPodAutoscalerStatus,
+        V2CrossVersionObjectReference,
+    )
+
+    condition_status = "False" if condition == "ScalingActive" else "True"
+    hpa = V2HorizontalPodAutoscaler(
+        metadata=V1ObjectMeta(namespace="prod", name="api"),
+        spec=V2HorizontalPodAutoscalerSpec(
+            min_replicas=2, max_replicas=50,
+            scale_target_ref=V2CrossVersionObjectReference(kind="Deployment", name="api"),
+        ),
+        status=V2HorizontalPodAutoscalerStatus(
+            current_replicas=current, desired_replicas=desired,
+            conditions=[V2HorizontalPodAutoscalerCondition(
+                type=condition, status=condition_status, reason=reason,
+            )],
+        ),
+    )
+    out = _format_snapshot(base_data(hpas=[_hpa_snapshot(hpa)]))
+    assert f"desired={desired} min=2" in out
+    assert f"{condition}={condition_status}({reason})" in out
+    assert "⚠ AT MAX" not in out
+
+
+def test_hpa_missing_status_stays_unknown():
+    from types import SimpleNamespace
+
+    hpa = SimpleNamespace(
+        metadata=SimpleNamespace(namespace="prod", name="api"),
+        spec=SimpleNamespace(min_replicas=2, max_replicas=50, metrics=None),
+        status=None,
+    )
+    out = _format_snapshot(base_data(hpas=[_hpa_snapshot(hpa)]))
+    assert "prod/api  ?/50" in out
+    assert "conditions: unknown" in out
+    assert "AT MAX" not in out
 
 
 # ---------------------------------------------------------------------------
