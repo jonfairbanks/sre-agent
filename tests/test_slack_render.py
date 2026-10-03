@@ -1,8 +1,8 @@
 """Block Kit rendering tests for send_structured_report.
 
 No Slack connection and no database: a fake client captures the payload so the
-diff-labelling branches (NEW / ESCALATED / ongoing / RESOLVED / acked) can be
-asserted directly. `ensure_ascii=False` matters — the rendered text contains
+diff-labelling branches (First Seen / ESCALATED / ongoing / RESOLVED / acked) can be
+asserted directly. `ensure_ascii=False` matters because the rendered text contains
 '×' and '→', which json.dumps would otherwise escape past a substring check.
 """
 from __future__ import annotations
@@ -70,7 +70,7 @@ def test_without_a_diff_it_renders_the_plain_report(notifier):
     assert payload is not None
     assert payload["blocks"][0]["type"] == "header"
     assert "CrashLoopBackOff on api" in body(notifier)
-    assert "*NEW*" not in body(notifier)
+    assert "*First Seen*" not in body(notifier)
     assert "sre_ack" not in body(notifier)
 
 
@@ -80,7 +80,9 @@ def test_new_finding_is_labelled_and_gets_an_ack_button(notifier):
         report(finding()), source="scheduled", diff=diff, report_id="abc123"
     )
     text = body(notifier)
-    assert "*NEW*" in text
+    assert "*First Seen*" in text
+    assert "*NEW*" not in text
+    assert "Critical Issues Found" in notifier._client.posted["text"]
     assert ":red_circle:" in notifier._client.posted["text"]
     assert "sre_ack" in text
     assert '"value": "abc123"' in text
@@ -96,7 +98,7 @@ def test_ongoing_finding_shows_age_and_occurrence_count(notifier):
     assert "ongoing" in text
     assert "6h" in text
     assert "12×" in text     # 11 stored + this run
-    assert "*NEW*" not in text
+    assert "*First Seen*" not in text
 
 
 def test_escalation_shows_the_severity_transition(notifier):
@@ -117,7 +119,7 @@ def test_returning_finding_is_marked_as_a_repeat(notifier):
     diff = diff_report(report(f), {fp: prev}, NOW)
     notifier.send_structured_report(report(f), source="scheduled", diff=diff)
     text = body(notifier)
-    assert "*NEW*" in text
+    assert "*First Seen*" in text
     assert "returned" in text
 
 
@@ -178,3 +180,61 @@ def test_disabled_notifier_posts_nothing(notifier):
     assert slack_notifier.SlackNotifier.send_structured_report(
         notifier, report(finding())
     ) is None
+
+
+def recovered_event(index=0):
+    return {"namespace": "longhorn-system", "object": f"Pod/engine-image-{index}",
+            "message": "Readiness probe failed: command timed out", "count": 1,
+            "age_min": 33}
+
+
+def test_recovered_probe_evidence_keeps_healthy_report_green(notifier):
+    healthy = report(severity="ok")
+    diff = diff_report(healthy, {}, NOW)
+    notifier.send_structured_report(
+        healthy, source="scheduled", diff=diff, report_id="r7",
+        recovered_probe_events=[recovered_event()],
+    )
+    payload = notifier._client.posted
+    text = body(notifier)
+    assert ":large_green_circle:" in payload["text"]
+    assert "All Clear" in payload["text"]
+    assert "Issues Found" not in payload["text"]
+    assert "Recovered Probe Events" in text
+    assert "Isolated warnings; pods are healthy with no restart since the event." in text
+    assert "Pod/engine-image-0" in text and "longhorn-system" in text
+    assert "1 occurrence" in text and "33m ago" in text
+    assert "Readiness probe failed" in text
+    assert "sre_ack" not in text
+    assert not diff.should_notify()
+    recovered = next(a for a in payload["attachments"]
+                     if "Recovered Probe Events" in json.dumps(a))
+    assert recovered["color"] == "#38a169"
+
+
+def test_recovered_probe_evidence_does_not_hide_active_warning(notifier):
+    active = report(finding(severity="warning"), severity="warning")
+    diff = diff_report(active, {}, NOW)
+    notifier.send_structured_report(
+        active, source="scheduled", diff=diff, report_id="r8",
+        recovered_probe_events=[recovered_event()],
+    )
+    assert ":large_yellow_circle:" in notifier._client.posted["text"]
+    assert "Issues Found" in notifier._client.posted["text"]
+    assert "*First Seen*" in body(notifier)
+    assert "Recovered Probe Events" in body(notifier)
+    assert "sre_ack" in body(notifier)
+    assert len(diff.active) == 1 and diff.should_notify()
+
+
+def test_recovered_probe_evidence_is_limited_to_ten_records(notifier):
+    notifier.send_structured_report(
+        report(severity="ok"), recovered_probe_events=[recovered_event(i) for i in range(12)],
+    )
+    text = body(notifier)
+    assert "Pod/engine-image-9" in text
+    assert "Pod/engine-image-10" not in text
+    assert "Pod/engine-image-11" not in text
+    for attachment in notifier._client.posted["attachments"]:
+        for block in attachment.get("blocks", []):
+            assert len(block.get("text", {}).get("text", "")) <= 3000

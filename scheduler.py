@@ -12,6 +12,7 @@ import logging
 import os
 import uuid
 from datetime import datetime, timezone
+from datetime import datetime as Timestamp
 from langsmith import traceable
 from psycopg import OperationalError
 
@@ -74,11 +75,86 @@ def _minutes_since(ts, now) -> float:
     return float("inf") if ts is None else (now - ts).total_seconds() / 60.0
 
 
+def _known_timestamp(stamp) -> bool:
+    return isinstance(stamp, Timestamp) and stamp.utcoffset() is not None
+
+
 def _event_timestamp(event):
     """Use the latest observation, including aggregated event series."""
     stamps = [event.last_timestamp, event.event_time,
               event.series.last_observed_time if event.series else None]
+    if any(stamp is not None and not _known_timestamp(stamp) for stamp in stamps):
+        return None
     return max((stamp for stamp in stamps if stamp is not None), default=None)
+
+
+def _event_occurrences(event) -> int | None:
+    """Keep unknown counts unknown; event series can supersede the legacy count."""
+    count = event.count
+    series_count = event.series.count if event.series else None
+    if event.series and (not isinstance(series_count, int)
+                         or isinstance(series_count, bool) or series_count < 1):
+        return None
+    counts = [value for value in (count, series_count)
+              if isinstance(value, int) and not isinstance(value, bool) and value > 0]
+    return max(counts, default=None)
+
+
+def _runtime_probe_target(event, pod):
+    """Resolve the probe and container without guessing in multi-container pods."""
+    if event.involved_object.kind != "Pod" or event.reason != "Unhealthy":
+        return None
+    message = event.message or ""
+    probe_type = next((kind for kind in ("readiness", "liveness")
+                       if message.startswith(f"{kind.capitalize()} probe failed:")), None)
+    if probe_type is None:
+        return None
+    containers = pod.spec.containers or []
+    field_path = event.involved_object.field_path
+    if field_path:
+        containers = [c for c in containers if field_path == f"spec.containers{{{c.name}}}"]
+    if len(containers) != 1:
+        return None
+    container = containers[0]
+    probe = getattr(container, f"{probe_type}_probe", None)
+    return (container, probe_type, probe) if probe else None
+
+
+def _is_recovered_runtime_probe_event(event, pod, now) -> bool:
+    """Recognize an isolated old warning only with a healthy unchanged container."""
+    target = _runtime_probe_target(event, pod)
+    ref = event.involved_object
+    statuses = pod.status.container_statuses or []
+    expected = {c.name for c in (pod.spec.containers or [])}
+    if (target is None or _event_occurrences(event) != 1
+            or not ref.uid or ref.uid != pod.metadata.uid
+            or pod.status.phase != "Running" or not statuses
+            or {cs.name for cs in statuses} != expected
+            or any(not cs.ready or cs.started is not True or not cs.state
+                   or not cs.state.running for cs in statuses)
+            or _classify_pod(pod, now)[0]):
+        return False
+
+    stamp = _event_timestamp(event)
+    ready_at = next((c.last_transition_time for c in (pod.status.conditions or [])
+                     if c.type == "Ready" and c.status == "True"), None)
+    starts = [cs.state.running.started_at for cs in statuses]
+    if (stamp is None or not _known_timestamp(ready_at)
+            or not all(_known_timestamp(start) for start in starts)
+            or ready_at > now or stamp > now
+            or any(start >= stamp for start in starts)):
+        return False
+
+    # Allow subsequent probe cycles to update readiness or record recurrence.
+    # A Ready sample immediately after a failed probe is not recovery evidence.
+    probe = target[2]
+    period = probe.period_seconds if probe.period_seconds is not None else 10
+    timeout = probe.timeout_seconds if probe.timeout_seconds is not None else 1
+    threshold = probe.failure_threshold if probe.failure_threshold is not None else 3
+    if period <= 0 or timeout <= 0 or threshold <= 0:
+        return False
+    quiet_seconds = max(60, max(period, timeout) * threshold + timeout)
+    return (now - stamp).total_seconds() >= quiet_seconds
 
 
 def _is_recovered_startup_event(event, pod, now) -> bool:
@@ -206,6 +282,7 @@ def _collect_cluster_data() -> dict:
         "unhealthy_pods": [],
         "events": [],
         "recovered_startup_events": [],
+        "recovered_runtime_probe_events": [],
         "hpas": [],
         "deployments": [],
         "node_metrics": [],
@@ -263,9 +340,25 @@ def _collect_cluster_data() -> dict:
             ev_resp.items,
             key=lambda e: (_event_timestamp(e) or datetime.min.replace(tzinfo=timezone.utc)),
             reverse=True,
-        )[:20]
+        )
         now_ev = datetime.now(timezone.utc)
-        for e in events:
+        recent_events = [e for e in events
+                         if _minutes_since(_event_timestamp(e), now_ev) <= EVENT_MAX_AGE_MINUTES
+                         or _event_timestamp(e) is None]
+        ready_nodes = {n["name"] for n in result["nodes"] if n["status"] == "Ready"}
+        # Different failure messages can produce separate Events with count=1.
+        # Count recurrence before capping evidence; never hide the second event.
+        probe_occurrences = {}
+        for e in recent_events:
+            ref = e.involved_object
+            pod = collected_pods.get(f"{e.metadata.namespace}/{ref.name}")
+            target = _runtime_probe_target(e, pod) if pod is not None else None
+            if target is not None:
+                key = (ref.uid, target[0].name, target[1])
+                count = _event_occurrences(e)
+                probe_occurrences[key] = probe_occurrences.get(key, 0) + (count or 2)
+
+        for e in recent_events[:20]:
             stamp = _event_timestamp(e)
             age_min = _minutes_since(stamp, now_ev)
             if stamp is not None and age_min > EVENT_MAX_AGE_MINUTES:
@@ -278,17 +371,30 @@ def _collect_cluster_data() -> dict:
             if is_pod and pod is None:
                 continue
             # Keep recovered evidence outside the model's active warnings.
-            target = ("recovered_startup_events"
-                      if pod is not None and _is_recovered_startup_event(e, pod, now_ev)
-                      else "events")
-            result[target].append({
+            target = "events"
+            if pod is not None:
+                runtime_probe = _runtime_probe_target(e, pod)
+                if _is_recovered_startup_event(e, pod, now_ev):
+                    target = "recovered_startup_events"
+                elif (runtime_probe is not None
+                      and pod.spec.node_name in ready_nodes
+                      and probe_occurrences[(e.involved_object.uid, runtime_probe[0].name,
+                                             runtime_probe[1])] == 1
+                      and _is_recovered_runtime_probe_event(e, pod, now_ev)):
+                    target = "recovered_runtime_probe_events"
+            evidence = {
                 "namespace": e.metadata.namespace,
                 "reason": e.reason,
                 "message": (e.message or "")[:200],
                 "object": f"{e.involved_object.kind}/{e.involved_object.name}",
-                "count": e.count or 1,
+                "count": _event_occurrences(e),
                 "age_min": None if age_min == float("inf") else round(age_min),
-            })
+            }
+            if pod is not None:
+                cs = pod.status.container_statuses or []
+                evidence["pod_status"] = _classify_pod(pod, now_ev)[1]
+                evidence["pod_ready"] = bool(cs) and all(c.ready for c in cs)
+            result[target].append(evidence)
     except Exception as e:
         result["errors"].append(f"events: {e}")
 
@@ -663,8 +769,13 @@ def _format_snapshot(data: dict) -> str:
         )
         for e in data["events"][:10]:
             when = f"{e['age_min']}m ago" if e.get("age_min") is not None else "age unknown"
+            count = e.get("count")
+            occurrences = f"count={count}" if count is not None else "count unknown"
+            pod_state = (f", pod={e['pod_status']} ready={e['pod_ready']}"
+                         if "pod_status" in e else "")
             lines.append(
-                f"  [{e['namespace']}] {e['object']} — {e['reason']} ({when}): {e['message'][:110]}"
+                f"  [{e['namespace']}] {e['object']}: {e['reason']} "
+                f"({when}, {occurrences}{pod_state}): {e['message'][:110]}"
             )
 
     # Collection errors
@@ -753,6 +864,10 @@ def _health_prompt(snapshot: str) -> tuple[str, str]:
         "and produce a structured health report. Focus on actionable issues and name "
         "specific resources. Skip healthy resources. Lifetime restart counts alone "
         "are not findings; do not report recovered historical restarts. "
+        "Warning events are historical observations, not proof of a current fault. "
+        "Use their counts, ages, and current pod state to distinguish recurrence "
+        "from isolated warnings. Do not infer resource exhaustion or a storage "
+        "outage from a probe timeout alone. "
         "Do not flag an HPA CPU reading above its target by itself: that is "
         "normal while a healthy deployment is scaling. Report an HPA warning only "
         "when it is scaling-limited at its maximum, its deployment remains unavailable "
@@ -932,10 +1047,12 @@ class MonitoringScheduler:
 
             log.info(
                 "Health check complete (session=%s, check=%d, severity=%s, %s, "
-                "unhealthy_pods=%d, recovered_startup_events=%d)",
+                "unhealthy_pods=%d, recovered_startup_events=%d, "
+                "recovered_runtime_probe_events=%d)",
                 session_id, check_no, report.overall_severity, diff.summary_line(),
                 len(data.get("unhealthy_pods", [])),
                 len(data.get("recovered_startup_events", [])),
+                len(data.get("recovered_runtime_probe_events", [])),
             )
 
             # A digest fires every N checks so a quiet channel still proves the
@@ -974,6 +1091,7 @@ class MonitoringScheduler:
                     # assert something untrue.
                     diff=diff if self._db.available else None,
                     report_id=report_id,
+                    recovered_probe_events=data.get("recovered_runtime_probe_events", []),
                 )
         except Exception as e:
             log.exception("Scheduled health check failed (session=%s)", session_id)

@@ -84,8 +84,9 @@ class SlackNotifier:
         thread_ts: Optional[str] = None,
         diff=None,
         report_id: Optional[str] = None,
+        recovered_probe_events: list[dict] | None = None,
     ) -> Optional[str]:
-        """Render a typed HealthReport into Slack Block Kit — no text parsing.
+        """Render a typed HealthReport directly into Slack Block Kit.
 
         `report` is a schemas.HealthReport. Findings are grouped by severity and
         rendered directly from typed fields, which removes the regex-on-markdown
@@ -96,10 +97,12 @@ class SlackNotifier:
         the originating thread.
 
         `diff` is an optional monitor_state.ReportDiff. When supplied, findings
-        are labelled NEW / ESCALATED / ongoing-with-age and a resolved section is
+        are labelled First Seen / ESCALATED / ongoing-with-age and a resolved section is
         appended, so a reader can tell at a glance what actually changed since
         the last check instead of re-reading an identical wall of text. Acked
         findings are omitted entirely. `report_id` enables the Ack button.
+        `recovered_probe_events` shows classified recovery evidence separately
+        without changing severity or notification eligibility.
         """
         if not self.enabled:
             log.info(
@@ -126,10 +129,10 @@ class SlackNotifier:
             else ":large_green_circle:"
         )
         title = "Cluster Health Report" + (
-            " — Critical Issues Found" if has_critical
-            else " — Issues Found" if has_issues
-            else " — Recovered" if recovered
-            else " — All Clear"
+            ": Critical Issues Found" if has_critical
+            else ": Issues Found" if has_issues
+            else ": Recovered" if recovered
+            else ": All Clear"
         )
 
         def _trunc(s: str, n: int) -> str:
@@ -152,11 +155,11 @@ class SlackNotifier:
                     f" · returned, {delta.times_seen}× total"
                     if delta.times_seen > 1 else ""
                 )
-                return f":new: *NEW*{repeat} — "
+                return f":new: *First Seen*{repeat}: "
             if delta.status == "escalated":
                 prev = (delta.previous_severity or "?").lower()
-                return f":arrow_upper_right: *ESCALATED* {prev}→{delta.finding.severity} — "
-            return f"_ongoing {humanize_age(delta.age)} · seen {delta.times_seen}×_ — "
+                return f":arrow_upper_right: *ESCALATED* {prev}→{delta.finding.severity}: "
+            return f"_ongoing {humanize_age(delta.age)} · seen {delta.times_seen}×_: "
 
         # With a diff we render the deltas (so each line carries its history);
         # without one we fall back to the plain findings list.
@@ -180,7 +183,7 @@ class SlackNotifier:
                 f = item.finding if diff is not None else item
                 ns = f" · `{f.namespace}`" if f.namespace else ""
                 prefix = _status_prefix(item) if diff is not None else ""
-                lines.append(f"• {prefix}*{f.title}*{ns} — {f.detail}")
+                lines.append(f"• {prefix}*{f.title}*{ns}: {f.detail}")
             attachments.append({
                 "color": color,
                 "blocks": [{
@@ -205,6 +208,38 @@ class SlackNotifier:
                         "type": "mrkdwn",
                         "text": _trunc(
                             ":white_check_mark: *RESOLVED SINCE LAST CHECK*\n" + "\n".join(lines),
+                            2700,
+                        ),
+                    },
+                }],
+            })
+
+        if recovered_probe_events:
+            lines = []
+            for event in recovered_probe_events[:10]:
+                namespace = event.get("namespace") or ""
+                ns = f" · `{namespace}`" if namespace else ""
+                age = event.get("age_min")
+                when = f"{age}m ago" if age is not None else "age unknown"
+                count = event.get("count")
+                occurrences = (
+                    f"{count} occurrence" + ("s" if count != 1 else "")
+                    if count is not None else "count unknown"
+                )
+                lines.append(
+                    f"• *{event.get('object') or 'Pod'}*{ns} · {occurrences} · {when}: "
+                    f"{_trunc(event.get('message') or '', 110)}"
+                )
+            attachments.append({
+                "color": "#38a169",
+                "blocks": [{
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": _trunc(
+                            ":white_check_mark: *Recovered Probe Events*\n"
+                            "Isolated warnings; pods are healthy with no restart since the event.\n"
+                            + "\n".join(lines),
                             2700,
                         ),
                     },

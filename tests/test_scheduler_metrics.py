@@ -70,6 +70,30 @@ def test_health_prompt_requires_evidence_beyond_high_hpa_cpu():
     assert "scaling-limited at its maximum" in system
 
 
+def test_warning_snapshot_preserves_recurrence_and_current_pod_evidence():
+    out = _format_snapshot(base_data(events=[{
+        "namespace": "prod", "object": "Pod/api-1", "reason": "Unhealthy",
+        "message": "Readiness probe failed: command timed out", "age_min": 12,
+        "count": 4, "pod_status": "Running", "pod_ready": True,
+    }]))
+    assert "12m ago, count=4, pod=Running ready=True" in out
+
+
+def test_unknown_event_count_is_not_presented_as_one_occurrence():
+    out = _format_snapshot(base_data(events=[{
+        "namespace": "prod", "object": "Pod/api-1", "reason": "Unhealthy",
+        "message": "Liveness probe failed: command timed out", "age_min": None,
+        "count": None,
+    }]))
+    assert "age unknown, count unknown" in out
+
+
+def test_health_prompt_does_not_treat_warning_history_as_active_failure():
+    system, _ = _health_prompt("snapshot")
+    assert "historical observations, not proof of a current fault" in system
+    assert "Do not infer resource exhaustion or a storage outage" in system
+
+
 class Target:
     def __init__(self, average_utilization=None, average_value=None, value=None):
         self.average_utilization = average_utilization
