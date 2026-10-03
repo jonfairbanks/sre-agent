@@ -74,6 +74,70 @@ def _minutes_since(ts, now) -> float:
     return float("inf") if ts is None else (now - ts).total_seconds() / 60.0
 
 
+def _event_timestamp(event):
+    """Use the latest observation, including aggregated event series."""
+    stamps = [event.last_timestamp, event.event_time,
+              getattr(getattr(event, "series", None), "last_observed_time", None)]
+    return max((stamp for stamp in stamps if stamp is not None), default=None)
+
+
+def _is_recovered_startup_event(event, pod, now) -> bool:
+    """Recognize a successful first startup, keeping uncertain warnings active.
+
+    Ready alone is insufficient: correlate the pod UID, container, latest event,
+    current start time, and configured startup window. Any restart or missing
+    evidence keeps the warning available to the health analysis.
+    """
+    ref = event.involved_object
+    if (ref.kind != "Pod" or event.reason != "Unhealthy"
+            or not (event.message or "").startswith("Startup probe failed:")):
+        return False
+    if not ref.uid or ref.uid != pod.metadata.uid:
+        return False
+    statuses = pod.status.container_statuses or []
+    if (pod.status.phase != "Running" or not statuses
+            or any(not cs.ready or cs.restart_count != 0 for cs in statuses)
+            or _classify_pod(pod, now)[0]):
+        return False
+
+    ready = next((c for c in (pod.status.conditions or [])
+                  if c.type == "Ready" and c.status == "True"), None)
+    ready_at = getattr(ready, "last_transition_time", None)
+    stamp = _event_timestamp(event)
+    if ready_at is None or stamp is None or not stamp < ready_at <= now:
+        return False
+
+    # Kubelet events identify the container as spec.containers{name}. Without
+    # that field, only a single-container pod is unambiguous. Init-container
+    # events and unsupported field paths remain reportable.
+    containers = pod.spec.containers or []
+    field_path = ref.field_path
+    if field_path:
+        matching = [c for c in containers if field_path == f"spec.containers{{{c.name}}}"]
+    else:
+        matching = containers if len(containers) == 1 else []
+    if len(matching) != 1:
+        return False
+    spec = matching[0]
+    probe = spec.startup_probe
+    cs = next((cs for cs in statuses if cs.name == spec.name), None)
+    running = getattr(getattr(cs, "state", None), "running", None)
+    started_at = getattr(running, "started_at", None)
+    if probe is None or cs is None or cs.started is not True or started_at is None:
+        return False
+
+    # This is a conservative nominal window, not an exact kubelet deadline.
+    # Delayed readiness outside it remains visible even if startup succeeded.
+    delay = probe.initial_delay_seconds or 0
+    period = probe.period_seconds if probe.period_seconds is not None else 10
+    threshold = probe.failure_threshold if probe.failure_threshold is not None else 3
+    if delay < 0 or period <= 0 or threshold <= 0:
+        return False
+    window = delay + period * threshold
+    return (started_at <= stamp < ready_at
+            and (ready_at - started_at).total_seconds() <= window)
+
+
 def _classify_pod(pod, now) -> tuple[bool, str, dict]:
     """Decide whether a pod is unhealthy *right now*.
 
@@ -159,6 +223,7 @@ def _collect_cluster_data() -> dict:
         "pods": [],
         "unhealthy_pods": [],
         "events": [],
+        "recovered_startup_events": [],
         "hpas": [],
         "deployments": [],
         "node_metrics": [],
@@ -187,6 +252,7 @@ def _collect_cluster_data() -> dict:
         result["errors"].append(f"nodes: {e}")
 
     # --- Pods (all namespaces) ---
+    collected_pods = {}
     try:
         now = datetime.now(timezone.utc)
         for p in core_v1().list_pod_for_all_namespaces().items:
@@ -200,6 +266,7 @@ def _collect_cluster_data() -> dict:
                 **extra,
             }
             result["pods"].append(pod_info)
+            collected_pods[f"{p.metadata.namespace}/{p.metadata.name}"] = p
             if unhealthy:
                 result["unhealthy_pods"].append(pod_info)
     except Exception as e:
@@ -215,14 +282,14 @@ def _collect_cluster_data() -> dict:
         )
         events = sorted(
             ev_resp.items,
-            key=lambda e: (e.last_timestamp or e.event_time or datetime.min.replace(tzinfo=timezone.utc)),
+            key=lambda e: (_event_timestamp(e) or datetime.min.replace(tzinfo=timezone.utc)),
             reverse=True,
         )[:20]
         now_ev = datetime.now(timezone.utc)
         for e in events:
-            stamp = e.last_timestamp or e.event_time
+            stamp = _event_timestamp(e)
             age_min = _minutes_since(stamp, now_ev)
-            if age_min > EVENT_MAX_AGE_MINUTES:
+            if stamp is not None and age_min > EVENT_MAX_AGE_MINUTES:
                 continue  # stale
 
             # An event about a pod that no longer exists cannot describe a current
@@ -233,14 +300,21 @@ def _collect_cluster_data() -> dict:
                 key = f"{e.metadata.namespace}/{e.involved_object.name}"
                 if key not in _collected_pod_keys:
                     continue
-            result["events"].append({
+            event_info = {
                 "namespace": e.metadata.namespace,
                 "reason": e.reason,
                 "message": (e.message or "")[:200],
                 "object": f"{e.involved_object.kind}/{e.involved_object.name}",
                 "count": e.count or 1,
                 "age_min": None if age_min == float("inf") else round(age_min),
-            })
+            }
+            if (e.involved_object.kind == "Pod"
+                    and _is_recovered_startup_event(e, collected_pods[key], now_ev)):
+                # Preserve evidence in raw data without presenting recovered
+                # startup history as an active warning to the model.
+                result["recovered_startup_events"].append(event_info)
+            else:
+                result["events"].append(event_info)
     except Exception as e:
         result["errors"].append(f"events: {e}")
 
@@ -883,9 +957,11 @@ class MonitoringScheduler:
             self._db.apply_diff(diff, now)
 
             log.info(
-                "Health check complete (session=%s, check=%d, severity=%s, %s, unhealthy_pods=%d)",
+                "Health check complete (session=%s, check=%d, severity=%s, %s, "
+                "unhealthy_pods=%d, recovered_startup_events=%d)",
                 session_id, check_no, report.overall_severity, diff.summary_line(),
                 len(data.get("unhealthy_pods", [])),
+                len(data.get("recovered_startup_events", [])),
             )
 
             # A digest fires every N checks so a quiet channel still proves the
