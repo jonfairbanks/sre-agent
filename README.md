@@ -323,13 +323,25 @@ Two known gaps are worth calling out.
   who can see `#sre-alerts` can approve a cluster mutation. Set it to your
   on-call rotation.
 
-## Monitoring behaviour
+## Monitoring Behavior
 
 Scheduled checks are stateful. Each run is diffed against the previous one and
 Slack is only notified when something is **new**, **escalated**, or **newly
 resolved**. Otherwise the run is logged and stays quiet. A digest posts every
 `MONITOR_DIGEST_EVERY_N_CHECKS` runs regardless, so a silent channel still
 proves the bot is alive.
+
+Recent warnings are historical evidence, not proof of a current fault. The model
+receives occurrence counts and the affected pod's current state. An isolated
+readiness or liveness warning is classified as recovered only when its pod and
+container identities match, every container is healthy, none restarted after the
+warning, the node is Ready, and at least one minute and the nominal probe retry
+window have passed without recurrence. Repeated warnings, recent failed
+terminations, and missing or uncertain evidence remain eligible for analysis.
+Recovered probe events stay in the collected evidence and appear separately in
+scheduled reports or digests; they do not trigger a notification on their own.
+Slack's **First Seen** label means the checker first identified a finding, not
+that the underlying fault just began.
 
 Findings are identified by `namespace/kind/name:reason`, not by the model's
 free-text title (which it rewords between runs) and not by raw pod name (which
