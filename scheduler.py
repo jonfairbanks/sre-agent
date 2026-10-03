@@ -77,65 +77,47 @@ def _minutes_since(ts, now) -> float:
 def _event_timestamp(event):
     """Use the latest observation, including aggregated event series."""
     stamps = [event.last_timestamp, event.event_time,
-              getattr(getattr(event, "series", None), "last_observed_time", None)]
+              event.series.last_observed_time if event.series else None]
     return max((stamp for stamp in stamps if stamp is not None), default=None)
 
 
 def _is_recovered_startup_event(event, pod, now) -> bool:
-    """Recognize a successful first startup, keeping uncertain warnings active.
-
-    Ready alone is insufficient: correlate the pod UID, container, latest event,
-    current start time, and configured startup window. Any restart or missing
-    evidence keeps the warning available to the health analysis.
-    """
+    """Require proof of a healthy first startup; keep uncertain warnings active."""
     ref = event.involved_object
-    if (ref.kind != "Pod" or event.reason != "Unhealthy"
-            or not (event.message or "").startswith("Startup probe failed:")):
-        return False
-    if not ref.uid or ref.uid != pod.metadata.uid:
-        return False
     statuses = pod.status.container_statuses or []
-    if (pod.status.phase != "Running" or not statuses
+    if (ref.kind != "Pod" or event.reason != "Unhealthy"
+            or not (event.message or "").startswith("Startup probe failed:")
+            or not ref.uid or ref.uid != pod.metadata.uid
+            or pod.status.phase != "Running" or not statuses
             or any(not cs.ready or cs.restart_count != 0 for cs in statuses)
             or _classify_pod(pod, now)[0]):
         return False
 
-    ready = next((c for c in (pod.status.conditions or [])
-                  if c.type == "Ready" and c.status == "True"), None)
-    ready_at = getattr(ready, "last_transition_time", None)
-    stamp = _event_timestamp(event)
-    if ready_at is None or stamp is None or not stamp < ready_at <= now:
-        return False
-
-    # Kubelet events identify the container as spec.containers{name}. Without
-    # that field, only a single-container pod is unambiguous. Init-container
-    # events and unsupported field paths remain reportable.
+    # A missing container reference is unambiguous only for one container.
     containers = pod.spec.containers or []
-    field_path = ref.field_path
-    if field_path:
-        matching = [c for c in containers if field_path == f"spec.containers{{{c.name}}}"]
-    else:
-        matching = containers if len(containers) == 1 else []
-    if len(matching) != 1:
+    if ref.field_path:
+        containers = [c for c in containers if ref.field_path == f"spec.containers{{{c.name}}}"]
+    if len(containers) != 1:
         return False
-    spec = matching[0]
-    probe = spec.startup_probe
-    cs = next((cs for cs in statuses if cs.name == spec.name), None)
-    running = getattr(getattr(cs, "state", None), "running", None)
-    started_at = getattr(running, "started_at", None)
-    if probe is None or cs is None or cs.started is not True or started_at is None:
+    probe = containers[0].startup_probe
+    cs = next((cs for cs in statuses if cs.name == containers[0].name), None)
+    if not probe or not cs or cs.started is not True or not cs.state or not cs.state.running:
         return False
 
-    # This is a conservative nominal window, not an exact kubelet deadline.
-    # Delayed readiness outside it remains visible even if startup succeeded.
+    started_at = cs.state.running.started_at
+    ready_at = next((c.last_transition_time for c in (pod.status.conditions or [])
+                     if c.type == "Ready" and c.status == "True"), None)
+    stamp = _event_timestamp(event)
+    if started_at is None or ready_at is None or stamp is None:
+        return False
+
+    # A nominal startup window, not an exact kubelet deadline.
     delay = probe.initial_delay_seconds or 0
     period = probe.period_seconds if probe.period_seconds is not None else 10
     threshold = probe.failure_threshold if probe.failure_threshold is not None else 3
-    if delay < 0 or period <= 0 or threshold <= 0:
-        return False
-    window = delay + period * threshold
-    return (started_at <= stamp < ready_at
-            and (ready_at - started_at).total_seconds() <= window)
+    return (delay >= 0 and period > 0 and threshold > 0
+            and started_at <= stamp < ready_at <= now
+            and (ready_at - started_at).total_seconds() <= delay + period * threshold)
 
 
 def _classify_pod(pod, now) -> tuple[bool, str, dict]:
@@ -272,9 +254,6 @@ def _collect_cluster_data() -> dict:
     except Exception as e:
         result["errors"].append(f"pods: {e}")
 
-    # Used to discard warning events whose pod has since been deleted.
-    _collected_pod_keys = {f"{p['namespace']}/{p['name']}" for p in result["pods"]}
-
     # --- Recent warning events (last 20) ---
     try:
         ev_resp = core_v1().list_event_for_all_namespaces(
@@ -292,29 +271,24 @@ def _collect_cluster_data() -> dict:
             if stamp is not None and age_min > EVENT_MAX_AGE_MINUTES:
                 continue  # stale
 
-            # An event about a pod that no longer exists cannot describe a current
-            # fault, however recent it is. This is what made a deleted ReplicaSet's
-            # InvalidImageName warning read as a live critical for the better part
-            # of an hour. The pod list is already collected above, so this is free.
-            if e.involved_object.kind == "Pod":
-                key = f"{e.metadata.namespace}/{e.involved_object.name}"
-                if key not in _collected_pod_keys:
-                    continue
-            event_info = {
+            # Deleted pods cannot have current faults. Reuse the collected objects.
+            is_pod = e.involved_object.kind == "Pod"
+            pod = (collected_pods.get(f"{e.metadata.namespace}/{e.involved_object.name}")
+                   if is_pod else None)
+            if is_pod and pod is None:
+                continue
+            # Keep recovered evidence outside the model's active warnings.
+            target = ("recovered_startup_events"
+                      if pod is not None and _is_recovered_startup_event(e, pod, now_ev)
+                      else "events")
+            result[target].append({
                 "namespace": e.metadata.namespace,
                 "reason": e.reason,
                 "message": (e.message or "")[:200],
                 "object": f"{e.involved_object.kind}/{e.involved_object.name}",
                 "count": e.count or 1,
                 "age_min": None if age_min == float("inf") else round(age_min),
-            }
-            if (e.involved_object.kind == "Pod"
-                    and _is_recovered_startup_event(e, collected_pods[key], now_ev)):
-                # Preserve evidence in raw data without presenting recovered
-                # startup history as an active warning to the model.
-                result["recovered_startup_events"].append(event_info)
-            else:
-                result["events"].append(event_info)
+            })
     except Exception as e:
         result["errors"].append(f"events: {e}")
 
