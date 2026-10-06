@@ -211,7 +211,8 @@ def mock_cluster(monkeypatch, pods, events, node_ready=True):
     monkeypatch.setattr(scheduler, "datetime", FixedDatetime)
     node = k.V1Node(metadata=k.V1ObjectMeta(name="worker-1"), status=k.V1NodeStatus(
         conditions=[k.V1NodeCondition(type="Ready", status="True" if node_ready else "False")]))
-    core = NS(list_node=lambda: NS(items=[node]),
+    core = NS(list_persistent_volume=lambda: NS(items=[]),
+              list_node=lambda: NS(items=[node]),
               list_pod_for_all_namespaces=lambda: NS(items=pods),
               list_event_for_all_namespaces=lambda **kw: NS(items=events),
               connect_get_node_proxy_with_path=lambda *args, **kw: NS(data='{"pods": []}'))

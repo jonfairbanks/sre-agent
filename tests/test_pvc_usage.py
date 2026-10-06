@@ -132,3 +132,84 @@ def test_pvc_section_does_not_disturb_the_other_sections():
         assert section in out
     # PVC sits between node utilization and HPAs.
     assert out.index("NODE UTILIZATION") < out.index("PVC UTILIZATION") < out.index("=== HPAs ===")
+
+
+def storage_result():
+    return base_data(node_disk_usage={}, local_filesystem_usage={})
+
+
+def storage_summary(*volumes, root_capacity=55 * 1024 ** 3):
+    root = {"capacityBytes": root_capacity, "usedBytes": 39 * 1024 ** 3,
+            "inodes": 3700000, "inodesUsed": 660000,
+            "availableBytes": root_capacity - 39 * 1024 ** 3}
+    return {"node": {"fs": root}, "pods": [{"volume": list(volumes)}]}
+
+
+def volume_stats(name="vault-0", capacity=55 * 1024 ** 3, used=39 * 1024 ** 3):
+    return {"pvcRef": {"namespace": "prod", "name": name},
+            "capacityBytes": capacity, "usedBytes": used,
+            "inodes": 3700000, "inodesUsed": 660000,
+            "availableBytes": capacity - used}
+
+
+def test_local_claims_report_one_node_disk_instead_of_pvc_consumption():
+    from scheduler import _collect_storage_usage, _health_prompt
+    data = storage_result()
+    summary = storage_summary(volume_stats(), volume_stats("vault-1"), volume_stats())
+    _collect_storage_usage(data, summary, "n1", {"prod/vault-0": True, "prod/vault-1": True})
+    assert data["pvc_usage"] == {}
+    assert data["local_filesystem_usage"] == {}
+    assert data["node_disk_usage"]["n1"]["local_claims"] == ["prod/vault-0", "prod/vault-1"]
+    out = _format_snapshot(data)
+    assert "PVC UTILIZATION" not in out
+    assert out.count("39.0Gi/55.0Gi") == 1
+    assert "Shared node disk usage is not PVC data size" in out
+    assert "do not recommend PVC expansion" in _health_prompt(out)[0]
+
+
+def test_local_claim_on_a_separate_disk_keeps_its_filesystem_warning():
+    from scheduler import _collect_storage_usage
+    data = storage_result()
+    vol = volume_stats(capacity=100 * 1024 ** 3, used=90 * 1024 ** 3)
+    _collect_storage_usage(data, storage_summary(vol), "n1", {"prod/vault-0": True})
+    assert data["pvc_usage"] == {}
+    assert data["node_disk_usage"]["n1"]["local_claims"] == []
+    out = _format_snapshot(data)
+    assert "90.0Gi/100.0Gi" in out
+    assert "shared filesystem, not PVC data size" in out
+
+
+def test_dedicated_volume_keeps_pvc_usage_even_on_same_capacity_disk():
+    from scheduler import _collect_storage_usage
+    data = storage_result()
+    _collect_storage_usage(data, storage_summary(volume_stats()), "n1", {"prod/vault-0": False})
+    assert data["pvc_usage"]["prod/vault-0"]["percent"] == 70.9
+    assert "PVC UTILIZATION" in _format_snapshot(data)
+
+
+def test_unknown_pv_metadata_keeps_node_disk_and_reports_collection_error():
+    from scheduler import _collect_storage_usage
+    data = storage_result()
+    _collect_storage_usage(data, storage_summary(volume_stats()), "n1", {})
+    assert data["pvc_usage"] == {}
+    assert "n1" in data["node_disk_usage"]
+    assert data["errors"] == ["pvc usage (prod/vault-0): backing PV unavailable"]
+
+
+def test_missing_used_bytes_is_not_reported_as_zero_usage():
+    from scheduler import _collect_storage_usage
+    data = storage_result()
+    vol = volume_stats()
+    del vol["usedBytes"]
+    _collect_storage_usage(data, storage_summary(vol), "n1", {"prod/vault-0": False})
+    assert data["pvc_usage"] == {}
+
+
+def test_same_size_local_disk_with_different_usage_keeps_full_disk_warning():
+    from scheduler import _collect_storage_usage
+    data = storage_result()
+    vol = volume_stats(used=54 * 1024 ** 3)
+    _collect_storage_usage(data, storage_summary(vol), "n1", {"prod/vault-0": True})
+    assert data["node_disk_usage"]["n1"]["local_claims"] == []
+    assert data["local_filesystem_usage"]["prod/vault-0"]["percent"] == 98.2
+    assert "54.0Gi/55.0Gi" in _format_snapshot(data)

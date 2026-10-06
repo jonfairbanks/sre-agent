@@ -140,7 +140,8 @@ def test_named_container_with_healthy_sidecar_can_recover():
 
 
 def mock_cluster(monkeypatch, pods, events):
-    core = NS(list_node=lambda: NS(items=[]),
+    core = NS(list_persistent_volume=lambda: NS(items=[]),
+              list_node=lambda: NS(items=[]),
               list_pod_for_all_namespaces=lambda: NS(items=pods),
               list_event_for_all_namespaces=lambda **kw: NS(items=events))
     monkeypatch.setattr(k8s_client, "core_v1", lambda: core)
