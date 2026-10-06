@@ -266,6 +266,61 @@ def _classify_pod(pod, now) -> tuple[bool, str, dict]:
     return False, phase, extra
 
 
+def _filesystem_usage(stats):
+    capacity = stats.get("capacityBytes")
+    if not capacity or stats.get("usedBytes") is None:
+        return None
+    used = stats["usedBytes"]
+    return {
+        "used_bytes": used,
+        "capacity_bytes": capacity,
+        "percent": round(used / capacity * 100, 1),
+        "inodes_used": stats.get("inodesUsed"),
+        "inodes_free": stats.get("inodesFree"),
+    }
+
+
+def _collect_storage_usage(result, summary, node_name, volume_sources):
+    """Keep shared local filesystems separate from dedicated PVC consumption."""
+    root = summary.get("node", {}).get("fs", {})
+    root_usage = _filesystem_usage(root)
+    if root_usage:
+        result["node_disk_usage"][node_name] = {**root_usage, "local_claims": []}
+    for pod in summary.get("pods", []) or []:
+        for vol in pod.get("volume", []) or []:
+            ref = vol.get("pvcRef") or {}
+            name, ns = ref.get("name"), ref.get("namespace")
+            if not name or not ns:
+                continue
+            key = f"{ns}/{name}"
+            stats = _filesystem_usage(vol)
+            if not stats:
+                continue
+            shared = volume_sources.get(key)
+            if shared is None:
+                result["errors"].append(f"pvc usage ({key}): backing PV unavailable")
+                continue
+            if shared:
+                # Local directories expose statfs of their backing device, not
+                # bytes in the directory. Require matching usage as well as
+                # geometry; separate same-size disks can have different pressure.
+                # Allow 1 MiB of writes between kubelet sampling times.
+                if (root_usage and vol.get("inodes") is not None
+                        and vol.get("capacityBytes") == root.get("capacityBytes")
+                        and vol.get("inodes") == root.get("inodes")
+                        and abs(vol["usedBytes"] - root["usedBytes"]) <= 1024 ** 2
+                        and vol.get("availableBytes") is not None
+                        and root.get("availableBytes") is not None
+                        and abs(vol["availableBytes"] - root["availableBytes"]) <= 1024 ** 2):
+                    claims = result["node_disk_usage"][node_name]["local_claims"]
+                    if key not in claims:
+                        claims.append(key)
+                else:
+                    result["local_filesystem_usage"][key] = {**stats, "node": node_name}
+            else:
+                result["pvc_usage"][key] = stats
+
+
 def _collect_cluster_data() -> dict:
     """Collect raw cluster state using the kubernetes Python client directly.
 
@@ -288,6 +343,8 @@ def _collect_cluster_data() -> dict:
         "node_metrics": [],
         "pod_metrics": {},
         "pvc_usage": {},
+        "node_disk_usage": {},
+        "local_filesystem_usage": {},
         "errors": [],
     }
 
@@ -478,43 +535,29 @@ def _collect_cluster_data() -> dict:
     except Exception as e:
         result["errors"].append(f"pod metrics: {e}")
 
-    # --- PVC utilisation (kubelet Summary API) ---
-    # metrics-server does not expose volume usage, and kubectl_get_pvc reports the
-    # *requested* size, not consumption. Without this a filling volume is invisible
-    # until pods start failing, which is exactly how the 2026-08 incident presented:
-    # the report showed unhealthy pods and gave no path to the full PVCs behind them.
+    # PV sources determine whether kubelet stats describe a shared local disk.
+    volume_sources = {}
     try:
-        for node in result["nodes"]:
-            node_name = node["name"]
-            try:
-                # _preload_content=False because the client otherwise coerces the
-                # JSON body into a Python repr that json.loads cannot read.
-                resp = core_v1().connect_get_node_proxy_with_path(
-                    node_name, "stats/summary", _preload_content=False
+        for pv in core_v1().list_persistent_volume().items:
+            ref = pv.spec.claim_ref
+            if ref and ref.namespace and ref.name:
+                volume_sources[f"{ref.namespace}/{ref.name}"] = bool(
+                    pv.spec.local or pv.spec.host_path
                 )
-                summary = json.loads(resp.data)
-            except Exception as e:
-                result["errors"].append(f"pvc usage ({node_name}): {e}")
-                continue
-
-            for pod in summary.get("pods", []) or []:
-                for vol in pod.get("volume", []) or []:
-                    ref = vol.get("pvcRef") or {}
-                    name, ns = ref.get("name"), ref.get("namespace")
-                    if not name or not ns:
-                        continue  # ephemeral volume, not backed by a PVC
-                    used, capacity = vol.get("usedBytes"), vol.get("capacityBytes")
-                    if not capacity:
-                        continue
-                    result["pvc_usage"][f"{ns}/{name}"] = {
-                        "used_bytes": used or 0,
-                        "capacity_bytes": capacity,
-                        "percent": round((used or 0) / capacity * 100, 1),
-                        "inodes_used": vol.get("inodesUsed"),
-                        "inodes_free": vol.get("inodesFree"),
-                    }
     except Exception as e:
-        result["errors"].append(f"pvc usage: {e}")
+        result["errors"].append(f"volume sources: {e}")
+
+    # Collect node disks even when PV metadata is unavailable. Unknown claims
+    # must not become misleading PVC consumption warnings.
+    for node in result["nodes"]:
+        node_name = node["name"]
+        try:
+            resp = core_v1().connect_get_node_proxy_with_path(
+                node_name, "stats/summary", _preload_content=False
+            )
+            _collect_storage_usage(result, json.loads(resp.data), node_name, volume_sources)
+        except Exception as e:
+            result["errors"].append(f"pvc usage ({node_name}): {e}")
 
     return result
 
@@ -728,6 +771,27 @@ def _format_snapshot(data: dict) -> str:
             )
             lines.append(f"  {m['name']}  cpu={cpu}  memory={mem}")
 
+    disks = data.get("node_disk_usage") or {}
+    if disks:
+        lines.append("\n=== Node Filesystem Usage ===")
+        for node, v in sorted(disks.items(), key=lambda item: item[1]["percent"], reverse=True):
+            claims = ", ".join(v["local_claims"]) or "none observed"
+            lines.append(
+                f"  {node}  {_fmt_bytes(v['used_bytes'])}/{_fmt_bytes(v['capacity_bytes'])}"
+                f"  {v['percent']}%  local claims={claims}"
+            )
+        lines.append("  Shared node disk usage is not PVC data size. "
+                     "PVC expansion does not enlarge this filesystem.")
+    local_disks = data.get("local_filesystem_usage") or {}
+    if local_disks:
+        lines.append("\n=== Local Volume Backing Filesystems ===")
+        for key, v in local_disks.items():
+            lines.append(
+                f"  node={v['node']} claim={key}"
+                f"  {_fmt_bytes(v['used_bytes'])}/{_fmt_bytes(v['capacity_bytes'])}"
+                f"  {v['percent']}% (shared filesystem, not PVC data size)"
+            )
+
     # PVC utilisation. Only the filling ones, plus a count of the rest, so the
     # model sees the risk without the snapshot growing with every healthy volume.
     pvc_usage = data.get("pvc_usage") or {}
@@ -868,6 +932,9 @@ def _health_prompt(snapshot: str) -> tuple[str, str]:
         "Use their counts, ages, and current pod state to distinguish recurrence "
         "from isolated warnings. Do not infer resource exhaustion or a storage "
         "outage from a probe timeout alone. "
+        "Node and local volume filesystem statistics describe shared disk usage, "
+        "not the data size of a named PVC or application. Report disk pressure "
+        "against the node; do not recommend PVC expansion for local directory volumes. "
         "Do not flag an HPA CPU reading above its target by itself: that is "
         "normal while a healthy deployment is scaling. Report an HPA warning only "
         "when it is scaling-limited at its maximum, its deployment remains unavailable "
