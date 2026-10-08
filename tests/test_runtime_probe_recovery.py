@@ -49,7 +49,9 @@ def set_path(target, path, value):
     parts = path.split(".")
     for part in parts[:-1]:
         target = target[int(part)] if part.isdigit() else getattr(target, part)
-    setattr(target, parts[-1], value)
+    # These cases intentionally corrupt API data. New client models validate
+    # assignments, so bypass validation to keep exercising collector guards.
+    object.__setattr__(target, parts[-1], value)
 
 
 @pytest.mark.parametrize("kind", ["Readiness", "Liveness"])
@@ -164,7 +166,7 @@ def test_series_and_legacy_counts_use_latest_known_occurrence_count(count, serie
 def test_unknown_series_count_does_not_invent_a_single_occurrence():
     pod, event = runtime_probe()
     event.count = None
-    event.series = NS(count=None, last_observed_time=WARNING)
+    object.__setattr__(event, "series", NS(count=None, last_observed_time=WARNING))
     assert not scheduler._is_recovered_runtime_probe_event(event, pod, NOW)
 
 
