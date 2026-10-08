@@ -321,6 +321,68 @@ def _collect_storage_usage(result, summary, node_name, volume_sources):
                 result["pvc_usage"][key] = stats
 
 
+def _keda_hpa_context(hpa, scaled_object: dict, deployment) -> dict:
+    """Correlate activation ownership before interpreting an idle HPA condition."""
+    scaled_object = scaled_object or {}
+    meta = scaled_object.get("metadata") or {}
+    spec = scaled_object.get("spec") or {}
+    status = scaled_object.get("status") or {}
+    conditions = {c.get("type"): c for c in status.get("conditions") or []}
+    annotations = meta.get("annotations") or {}
+    paused = {k: v for k, v in annotations.items() if k.startswith("autoscaling.keda.sh/paused")}
+    health = status.get("health") or {}
+    context = {"idle": False, "min": spec.get("minReplicaCount", 0),
+               "conditions": list(conditions.values()), "paused": paused, "health": health}
+    if hpa is None:
+        return context
+    owners = getattr(hpa.metadata, "owner_references", None) or []
+    owned = any(o.controller and o.kind == "ScaledObject"
+                and o.api_version == "keda.sh/v1alpha1"
+                and o.name == meta.get("name") and o.uid == meta.get("uid") and o.uid
+                for o in owners)
+    target = hpa.spec.scale_target_ref
+    so_target = spec.get("scaleTargetRef") or {}
+    if (not owned or meta.get("namespace") != hpa.metadata.namespace
+            or status.get("hpaName") != hpa.metadata.name
+            or target.api_version != "apps/v1" or target.kind != "Deployment"
+            or so_target.get("name") != target.name
+            or so_target.get("kind", "Deployment") != target.kind
+            or so_target.get("apiVersion", "apps/v1") != target.api_version
+            or deployment is None):
+        return context
+    hstatus = hpa.status
+    dstatus = deployment.status
+    hconditions = {c.type: c for c in (hstatus.conditions or [])} if hstatus else {}
+    active = hconditions.get("ScalingActive")
+    able = hconditions.get("AbleToScale")
+    # HPA generation fields are absent on some supported API versions.
+    generation = getattr(hpa.metadata, "generation", None)
+    observed = getattr(hstatus, "observed_generation", None)
+    current = generation is None or (observed is not None and observed >= generation)
+    failing_scaler = any(v.get("status") == "Failing" or v.get("numberOfFailures", 0) > 0
+                         for v in health.values())
+    context["idle"] = bool(
+        deployment.metadata.namespace == hpa.metadata.namespace
+        and deployment.metadata.name == target.name
+        and deployment.spec.replicas == 0 and dstatus is not None
+        and dstatus.observed_generation is not None
+        and dstatus.observed_generation >= deployment.metadata.generation
+        and not any((dstatus.replicas, dstatus.ready_replicas, dstatus.available_replicas))
+        and current and hstatus is not None and hstatus.desired_replicas == 0
+        and hstatus.current_replicas in (None, 0)
+        and active and active.status == "False" and active.reason == "ScalingDisabled"
+        and able and able.status == "True"
+        and context["min"] == 0 and spec.get("idleReplicaCount", 0) == 0
+        and conditions.get("Ready", {}).get("status") == "True"
+        and conditions.get("Active", {}).get("status") == "False"
+        and conditions.get("Active", {}).get("reason") == "ScalerNotActive"
+        and conditions.get("Fallback", {}).get("status") == "False"
+        and conditions.get("Paused", {}).get("status") == "False"
+        and not paused and not failing_scaler
+    )
+    return context
+
+
 def _collect_cluster_data() -> dict:
     """Collect raw cluster state using the kubernetes Python client directly.
 
@@ -456,8 +518,10 @@ def _collect_cluster_data() -> dict:
         result["errors"].append(f"events: {e}")
 
     # --- HPAs ---
+    collected_hpas = {}
     try:
         for h in autoscaling_v2().list_horizontal_pod_autoscaler_for_all_namespaces().items:
+            collected_hpas[(h.metadata.namespace, h.metadata.name)] = h
             spec = h.spec
             status = h.status
             result["hpas"].append({
@@ -480,8 +544,10 @@ def _collect_cluster_data() -> dict:
         result["errors"].append(f"hpas: {e}")
 
     # --- Deployments (non-system namespaces) ---
+    collected_deployments = {}
     try:
         for d in apps_v1().list_deployment_for_all_namespaces().items:
+            collected_deployments[(d.metadata.namespace, d.metadata.name)] = d
             if d.metadata.namespace in ("kube-system", "kube-public", "kube-node-lease"):
                 continue
             spec_replicas = d.spec.replicas or 0
@@ -495,6 +561,25 @@ def _collect_cluster_data() -> dict:
             })
     except Exception as e:
         result["errors"].append(f"deployments: {e}")
+
+    # KEDA owns activation from zero; an HPA alone cannot establish its health.
+    for info in result["hpas"]:
+        hpa = collected_hpas[(info["namespace"], info["name"])]
+        owner = next((o for o in (getattr(hpa.metadata, "owner_references", None) or [])
+                      if o.controller and o.kind == "ScaledObject"
+                      and o.api_version == "keda.sh/v1alpha1"), None)
+        if owner is None:
+            continue
+        try:
+            scaled_object = custom_objects().get_namespaced_custom_object(
+                "keda.sh", "v1alpha1", info["namespace"], "scaledobjects", owner.name
+            )
+            target = hpa.spec.scale_target_ref
+            info["keda"] = _keda_hpa_context(
+                hpa, scaled_object, collected_deployments.get((info["namespace"], target.name))
+            )
+        except Exception as e:
+            result["errors"].append(f"KEDA {info['namespace']}/{owner.name}: {e}")
 
     # --- Node utilisation (metrics-server) ---
     # Wrapped like every other block so a metrics-server outage degrades into a
@@ -832,11 +917,22 @@ def _format_snapshot(data: dict) -> str:
                 f"{c['type']}={c['status']}/{c.get('reason') or '?'}"
                 for c in h.get("conditions") or []
             )
+            keda = h.get("keda")
+            activation = ""
+            if keda:
+                state = "KEDA Idle at Zero" if keda["idle"] else "KEDA Activation Context"
+                keda_conditions = ",".join(
+                    f"{c.get('type')}={c.get('status')}/{c.get('reason')}"
+                    for c in keda["conditions"]
+                )
+                activation = (f" {state} minReplicaCount={keda['min']}"
+                              f" conditions={keda_conditions} paused={keda['paused']}"
+                              f" health={keda['health']}")
             lines.append(
                 f"  {h['namespace']}/{h['name']}  {h['current']}/{h['max']}{at_max}"
                 f" min={h.get('min', '?')} max={h['max']} desired={h['desired']}"
                 f"{_format_hpa_metrics(h)}"
-                f"{(' ' + conditions) if conditions else ''}"
+                f"{(' ' + conditions) if conditions else ''}{activation}"
             )
 
     # Recent warning events
@@ -957,7 +1053,15 @@ def _health_prompt(snapshot: str) -> tuple[str, str]:
         "ScalingLimited=True/TooFewReplicas means the minimum prevents scaling down, "
         "not that demand exceeds the maximum. TooManyReplicas indicates the maximum "
         "limits scaling up. Fixed replicas still require findings for sustained demand "
-        "above target, unavailable workloads, ScalingActive=False, or AbleToScale=False. Set "
+        "above target, unavailable workloads, scaling or metric failures, or AbleToScale=False. "
+        "KEDA Idle at Zero means ownership, zero-replica target state and a ready, inactive "
+        "activation controller were verified. For that state, ScalingActive=False/ScalingDisabled "
+        "and absent HPA metrics are expected while KEDA waits for demand, even if HPA min=1. "
+        "Do not warn or recommend removing autoscaling or waking the workload for these alone. "
+        "Without verified idle context, investigate rather than assume healthy activation. "
+        "Check whether paused activation is intentional before treating it as a fault. "
+        "Keep failed metrics, unready or failing scalers, fallback, demand without "
+        "activation and unrelated workload faults actionable. Set "
         "overall_severity to the highest severity among your findings, or "
         "'ok' if the cluster is healthy."
     )

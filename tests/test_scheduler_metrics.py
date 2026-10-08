@@ -480,3 +480,27 @@ def test_repair_returns_none_for_unusable_payloads():
 def test_repair_supplies_a_summary_when_absent():
     report = _repair_health_report({"overall_severity": "ok", "findings": []})
     assert report.summary == "Health check completed."
+
+
+@pytest.mark.parametrize("idle", [True, False])
+def test_snapshot_keeps_keda_activation_evidence_and_independent_faults(idle):
+    out = _format_snapshot(base_data(hpas=[{
+        "namespace": "example", "name": "worker", "min": 1, "max": 1,
+        "current": None, "desired": 0,
+        "conditions": [{"type": "ScalingActive", "status": "False", "reason": "ScalingDisabled"}],
+        "keda": {"idle": idle, "min": 0, "paused": {}, "health": {}, "conditions": [
+            {"type": "Ready", "status": "True", "reason": "ScaledObjectReady"},
+        ]},
+    }], events=[{
+        "namespace": "example", "object": "Pod/other", "reason": "FailedScheduling",
+        "message": "Insufficient memory", "count": 3, "age_min": 1,
+    }]))
+    label = "KEDA Idle at Zero" if idle else "KEDA Activation Context"
+    assert label in out
+    assert "ScalingActive=False/ScalingDisabled" in out
+    assert "Ready=True/ScaledObjectReady" in out
+    assert "FailedScheduling" in out
+    system, _ = _health_prompt(out)
+    assert "even if HPA min=1" in system
+    assert "Do not warn or recommend removing autoscaling or waking the workload" in system
+    assert "unrelated workload faults actionable" in system
