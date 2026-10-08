@@ -6,9 +6,11 @@ and exotic HPA metric shapes.
 """
 from __future__ import annotations
 
+from types import SimpleNamespace as NS
+
 import pytest
 
-from scheduler import _format_hpa_metrics, _format_snapshot, _health_prompt, _metric_value
+from scheduler import _collect_cluster_data, _format_hpa_metrics, _format_snapshot, _health_prompt, _metric_value
 
 
 def base_data(**over):
@@ -63,6 +65,37 @@ def test_metrics_failure_surfaces_as_a_collection_error_not_a_crash():
 # ---------------------------------------------------------------------------
 # HPA metric rendering
 # ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("status_kind", ["conditions", "missing_conditions", "missing_status"])
+def test_hpa_collector_keeps_conditions_and_defaults_omitted_minimum(monkeypatch, status_kind):
+    from tools import k8s_client
+
+    condition = NS(type="ScalingLimited", status="True", reason="TooFewReplicas")
+    status = None if status_kind == "missing_status" else NS(
+        current_replicas=2, desired_replicas=2, current_metrics=None,
+        conditions=[condition] if status_kind == "conditions" else None,
+    )
+    hpa = NS(metadata=NS(namespace="keda", name="interceptor"),
+             spec=NS(min_replicas=None, max_replicas=2, metrics=None), status=status)
+    empty = lambda **kw: NS(items=[])
+    monkeypatch.setattr(k8s_client, "core_v1", lambda: NS(
+        list_node=empty, list_pod_for_all_namespaces=empty,
+        list_event_for_all_namespaces=empty, list_persistent_volume=empty,
+    ))
+    monkeypatch.setattr(k8s_client, "apps_v1", lambda: NS(list_deployment_for_all_namespaces=empty))
+    monkeypatch.setattr(k8s_client, "custom_objects", lambda: NS(
+        list_cluster_custom_object=lambda *args: {"items": []},
+    ))
+    monkeypatch.setattr(k8s_client, "autoscaling_v2", lambda: NS(
+        list_horizontal_pod_autoscaler_for_all_namespaces=lambda: NS(items=[hpa]),
+    ))
+    data = _collect_cluster_data()
+    assert not data["errors"]
+    assert data["hpas"][0]["min"] == 1
+    expected = [{"type": "ScalingLimited", "status": "True", "reason": "TooFewReplicas"}]
+    assert data["hpas"][0]["conditions"] == (expected if status_kind == "conditions" else [])
+    assert "keda/interceptor" in _format_snapshot(data)
+
 
 def test_health_prompt_requires_evidence_beyond_high_hpa_cpu():
     system, _ = _health_prompt("snapshot")
@@ -167,14 +200,72 @@ def test_malformed_entry_does_not_raise():
 
 def test_hpa_line_in_snapshot_includes_metrics_and_at_max_flag():
     data = base_data(hpas=[{
-        "namespace": "prod", "name": "api", "min": 1, "max": 1,
-        "current": 1, "desired": 1,
+        "namespace": "prod", "name": "api", "min": 2, "max": 50,
+        "current": 50, "desired": 50,
+        "conditions": [{"type": "ScalingLimited", "status": "True", "reason": "TooManyReplicas"}],
         "current_metrics": [Entry("Resource", ResourceBlock("cpu", current=Target(average_utilization=12)))],
         "target_metrics": [Entry("Resource", ResourceBlock("cpu", target=Target(average_utilization=80)))],
     }])
     out = _format_snapshot(data)
     assert "AT MAX" in out
+    assert "min=2 max=50 desired=50" in out
+    assert "ScalingLimited=True/TooManyReplicas" in out
     assert "(cpu 12%/target 80%)" in out
+
+
+def test_fixed_hpa_preserves_zero_demand_and_minimum_clamping():
+    out = _format_snapshot(base_data(hpas=[{
+        "namespace": "keda", "name": "interceptor", "min": 2, "max": 2,
+        "current": 2, "desired": 2,
+        "conditions": [{"type": "ScalingLimited", "status": "True", "reason": "TooFewReplicas"}],
+        "current_metrics": [Entry("External", ExternalBlock("concurrency", current=Target(average_value="0")))],
+        "target_metrics": [Entry("External", ExternalBlock("concurrency", target=Target(average_value="200")))],
+    }]))
+    assert "Fixed Replicas" in out
+    assert "AT MAX" not in out
+    assert "min=2 max=2 desired=2" in out
+    assert "concurrency 0/target 200" in out
+    assert "ScalingLimited=True/TooFewReplicas" in out
+
+
+def test_fixed_hpa_preserves_pressure_and_unavailable_deployment():
+    out = _format_snapshot(base_data(
+        hpas=[{
+            "namespace": "prod", "name": "api", "min": 2, "max": 2,
+            "current": 2, "desired": 2,
+            "conditions": [{"type": "ScalingLimited", "status": "True", "reason": "TooManyReplicas"}],
+            "current_metrics": [Entry("Resource", ResourceBlock("cpu", current=Target(average_utilization=95)))],
+            "target_metrics": [Entry("Resource", ResourceBlock("cpu", target=Target(average_utilization=80)))],
+        }],
+        deployments=[{"namespace": "prod", "name": "api", "desired": 2, "ready": 1, "available": 1}],
+    ))
+    assert "Fixed Replicas" in out
+    assert "cpu 95%/target 80%" in out
+    assert "ScalingLimited=True/TooManyReplicas" in out
+    assert "prod/api  desired=2 ready=1 ⚠" in out
+
+
+@pytest.mark.parametrize("condition,reason", [
+    ("ScalingActive", "FailedGetResourceMetric"),
+    ("AbleToScale", "FailedGetScale"),
+])
+def test_fixed_hpa_without_metrics_preserves_scaling_errors(condition, reason):
+    out = _format_snapshot(base_data(hpas=[{
+        "namespace": "prod", "name": "api", "min": 2, "max": 2,
+        "current": 2, "desired": 2,
+        "conditions": [{"type": condition, "status": "False", "reason": reason}],
+    }]))
+    assert "Fixed Replicas" in out
+    assert f"{condition}=False/{reason}" in out
+
+
+def test_health_prompt_distinguishes_fixed_capacity_and_keeps_failure_findings():
+    system, _ = _health_prompt("snapshot")
+    assert "Equal min/max bounds mean fixed replicas" in system
+    assert "TooFewReplicas means the minimum prevents scaling down" in system
+    assert "Fixed replicas still require findings for sustained demand" in system
+    assert "ScalingActive=False" in system
+    assert "AbleToScale=False" in system
 
 
 def test_hpa_without_metrics_renders_exactly_as_before():

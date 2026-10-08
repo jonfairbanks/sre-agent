@@ -463,10 +463,14 @@ def _collect_cluster_data() -> dict:
             result["hpas"].append({
                 "namespace": h.metadata.namespace,
                 "name": h.metadata.name,
-                "min": spec.min_replicas,
+                "min": spec.min_replicas if spec.min_replicas is not None else 1,
                 "max": spec.max_replicas,
                 "current": status.current_replicas if status else "?",
                 "desired": status.desired_replicas if status else "?",
+                "conditions": [
+                    {"type": c.type, "status": c.status, "reason": c.reason}
+                    for c in (status.conditions or [])
+                ] if status else [],
                 # Utilisation vs target. Without these an "AT MAX" HPA says nothing
                 # about *why* it is pinned, which is the question an operator asks next.
                 "current_metrics": (getattr(status, "current_metrics", None) or []) if status else [],
@@ -820,10 +824,19 @@ def _format_snapshot(data: dict) -> str:
     if data["hpas"]:
         lines.append("\n=== HPAs ===")
         for h in data["hpas"]:
-            at_max = " ⚠ AT MAX" if h["current"] == h["max"] else ""
+            fixed = h.get("min") is not None and h["min"] == h["max"]
+            at_max = " Fixed Replicas" if fixed else (
+                " ⚠ AT MAX" if h["current"] == h["max"] else ""
+            )
+            conditions = ", ".join(
+                f"{c['type']}={c['status']}/{c.get('reason') or '?'}"
+                for c in h.get("conditions") or []
+            )
             lines.append(
                 f"  {h['namespace']}/{h['name']}  {h['current']}/{h['max']}{at_max}"
+                f" min={h.get('min', '?')} max={h['max']} desired={h['desired']}"
                 f"{_format_hpa_metrics(h)}"
+                f"{(' ' + conditions) if conditions else ''}"
             )
 
     # Recent warning events
@@ -937,8 +950,14 @@ def _health_prompt(snapshot: str) -> tuple[str, str]:
         "against the node; do not recommend PVC expansion for local directory volumes. "
         "Do not flag an HPA CPU reading above its target by itself: that is "
         "normal while a healthy deployment is scaling. Report an HPA warning only "
-        "when it is scaling-limited at its maximum, its deployment remains unavailable "
-        "after its target has settled, or other evidence shows workload harm. Set "
+        "when it is scaling-limited at its maximum by excess demand, its deployment "
+        "remains unavailable after its target has settled, scaling or metric collection "
+        "fails, or other evidence shows workload harm. Equal min/max bounds mean fixed "
+        "replicas; do not warn about that configuration or replica equality alone. "
+        "ScalingLimited=True/TooFewReplicas means the minimum prevents scaling down, "
+        "not that demand exceeds the maximum. TooManyReplicas indicates the maximum "
+        "limits scaling up. Fixed replicas still require findings for sustained demand "
+        "above target, unavailable workloads, ScalingActive=False, or AbleToScale=False. Set "
         "overall_severity to the highest severity among your findings, or "
         "'ok' if the cluster is healthy."
     )

@@ -218,12 +218,17 @@ Unless told otherwise, check these namespaces: {', '.join(DEFAULT_NAMESPACES) or
 ### Slack notification guidelines:
 - severity='critical' → CrashLoopBackOff, OOMKilled, deployment not ready, node NotReady,
                         service with 0 ready endpoints, privileged container, cluster-admin misconfiguration
-- severity='warning'  → HPA at max replicas, resource limits too low, high restart counts,
+- severity='warning'  → HPA at max replicas with excess demand, resource limits too low, high restart counts,
                         missing PDB on multi-replica workload, missing probes, :latest image tags,
                         failed/stuck jobs, selector mismatch, namespace with no NetworkPolicy
 - severity='info'     → audit summary, right-sizing recommendations, suspended CronJobs,
                         orphaned PVs, missing resource requests
 - severity='ok'       → all clear, successful change applied
+
+Equal HPA min/max bounds mean fixed replicas, not saturation. Replica equality
+alone is not a finding. ScalingLimited/TooFewReplicas reflects the minimum;
+TooManyReplicas reflects the maximum. Still report sustained demand above target,
+unavailable workloads, scaling failures, or metric collection failures.
 
 ## Safety Rules
 - NEVER apply changes without explicit user confirmation
