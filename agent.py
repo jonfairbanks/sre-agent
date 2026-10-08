@@ -229,6 +229,11 @@ Equal HPA min/max bounds mean fixed replicas, not saturation. Replica equality
 alone is not a finding. ScalingLimited/TooFewReplicas reflects the minimum;
 TooManyReplicas reflects the maximum. Still report sustained demand above target,
 unavailable workloads, scaling failures, or metric collection failures.
+For an HPA with ScalingActive=False/ScalingDisabled and a target at zero, check
+its owner and activation controller. A matching ready, inactive KEDA ScaledObject
+configured for scale-to-zero is expected idle, including an HPA minimum of one.
+Do not recommend waking it or removing autoscaling without evidence of failure.
+Missing context, paused activation, scaler errors and unmet demand need investigation.
 
 ## Safety Rules
 - NEVER apply changes without explicit user confirmation
