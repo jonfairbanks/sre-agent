@@ -1,3 +1,6 @@
+{{- if not (and (lt (float64 .Values.config.diskUsageClearPercent) (float64 .Values.config.pvcUsageAlertPercent)) (le (float64 .Values.config.pvcUsageAlertPercent) (float64 .Values.config.diskUsageCriticalClearPercent)) (lt (float64 .Values.config.diskUsageCriticalClearPercent) (float64 .Values.config.diskUsageCriticalPercent))) }}
+{{- fail "disk thresholds must satisfy clear < warning <= criticalClear < critical" }}
+{{- end }}
 {{- if and .Values.existingSecret .Values.secrets.create }}
 {{- fail "set either existingSecret or secrets.create=true, not both" }}
 {{- end }}

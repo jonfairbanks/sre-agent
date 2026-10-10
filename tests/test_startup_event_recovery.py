@@ -167,7 +167,7 @@ def test_collector_keeps_evidence_but_model_sees_only_actionable_warning(monkeyp
         event.last_timestamp += shift
     mock_cluster(monkeypatch, [recovered, failing], [old, active])
     captured = []
-    monkeypatch.setattr(scheduler, "_analyse_snapshot", lambda text: captured.append(text))
+    monkeypatch.setattr(scheduler, "_analyse_snapshot", lambda text: (captured.append(text) or __import__("schemas").HealthReport(overall_severity="ok", summary="Healthy.")))
     _, data = scheduler.run_structured_health_check()
     assert data["errors"] == []
     assert len(data["recovered_startup_events"]) == 1

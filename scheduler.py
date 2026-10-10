@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import uuid
+import threading
 from datetime import datetime, timezone
 from datetime import datetime as Timestamp
 from langsmith import traceable
@@ -21,7 +22,7 @@ from config import (
     MONITOR_NOTIFY_ON_RESOLVED,
     SUBAGENT_MODEL_ID,
 )
-from monitor_state import diff_report
+from monitor_state import diff_report, serialize_diff
 from llm import HealthReportTokenLimitError, request_health_report
 
 log = logging.getLogger("sre-agent.scheduler")
@@ -383,6 +384,18 @@ def _keda_hpa_context(hpa, scaled_object: dict, deployment) -> dict:
     return context
 
 
+
+def _collection_failure(error: Exception) -> str:
+    """Keep safe error identity without response bodies, headers, or tokens."""
+    from http import HTTPStatus
+    status = getattr(error, "status", None)
+    try:
+        code = int(status)
+        return f"{type(error).__name__} (HTTP {code} {HTTPStatus(code).phrase})"
+    except (TypeError, ValueError):
+        return type(error).__name__
+
+
 def _collect_cluster_data() -> dict:
     """Collect raw cluster state using the kubernetes Python client directly.
 
@@ -414,11 +427,13 @@ def _collect_cluster_data() -> dict:
     try:
         for n in core_v1().list_node().items:
             conditions = {c.type: c.status for c in (n.status.conditions or [])}
-            status = "Ready" if conditions.get("Ready") == "True" else "NotReady"
+            status = ("Ready" if conditions.get("Ready") == "True"
+                      else "NotReady" if conditions.get("Ready") == "False" else "Unknown")
             allocatable = (n.status.allocatable or {}) if n.status else {}
             result["nodes"].append({
                 "name": n.metadata.name,
                 "status": status,
+                "conditions": conditions,
                 "version": (n.status.node_info.kubelet_version if n.status.node_info else "?"),
                 # Denominator for utilisation. Usage without capacity is a bare
                 # number the model cannot turn into a percentage, which is what
@@ -427,7 +442,7 @@ def _collect_cluster_data() -> dict:
                 "memory_allocatable": allocatable.get("memory", ""),
             })
     except Exception as e:
-        result["errors"].append(f"nodes: {e}")
+        result["errors"].append(f"nodes: {_collection_failure(e)}")
 
     # --- Pods (all namespaces) ---
     collected_pods = {}
@@ -435,9 +450,12 @@ def _collect_cluster_data() -> dict:
         now = datetime.now(timezone.utc)
         for p in core_v1().list_pod_for_all_namespaces().items:
             unhealthy, status, extra = _classify_pod(p, now)
+            owner = next((o for o in (p.metadata.owner_references or []) if o.controller), None)
             pod_info = {
                 "namespace": p.metadata.namespace,
                 "name": p.metadata.name,
+                "owner_kind": owner.kind if owner and owner.kind != "ReplicaSet" else "",
+                "owner_name": owner.name if owner and owner.kind != "ReplicaSet" else "",
                 "status": status,
                 "restarts": sum((cs.restart_count or 0) for cs in (p.status.container_statuses or [])),
                 "age": _age(p.metadata.creation_timestamp),
@@ -448,7 +466,7 @@ def _collect_cluster_data() -> dict:
             if unhealthy:
                 result["unhealthy_pods"].append(pod_info)
     except Exception as e:
-        result["errors"].append(f"pods: {e}")
+        result["errors"].append(f"pods: {_collection_failure(e)}")
 
     # --- Recent warning events (last 20) ---
     try:
@@ -515,7 +533,7 @@ def _collect_cluster_data() -> dict:
                 evidence["pod_ready"] = bool(cs) and all(c.ready for c in cs)
             result[target].append(evidence)
     except Exception as e:
-        result["errors"].append(f"events: {e}")
+        result["errors"].append(f"events: {_collection_failure(e)}")
 
     # --- HPAs ---
     collected_hpas = {}
@@ -541,7 +559,7 @@ def _collect_cluster_data() -> dict:
                 "target_metrics": getattr(spec, "metrics", None) or [],
             })
     except Exception as e:
-        result["errors"].append(f"hpas: {e}")
+        result["errors"].append(f"hpas: {_collection_failure(e)}")
 
     # --- Deployments (non-system namespaces) ---
     collected_deployments = {}
@@ -552,15 +570,23 @@ def _collect_cluster_data() -> dict:
                 continue
             spec_replicas = d.spec.replicas or 0
             ready = (d.status.ready_replicas or 0)
+            unavailable = next((c for c in (d.status.conditions or [])
+                                if c.type == "Available" and c.status == "False"), None)
             result["deployments"].append({
                 "namespace": d.metadata.namespace,
                 "name": d.metadata.name,
                 "desired": spec_replicas,
                 "ready": ready,
                 "available": (d.status.available_replicas or 0),
+                "settled": (d.status.observed_generation is not None
+                            and d.status.observed_generation >= (d.metadata.generation or 0)
+                            and unavailable is not None
+                            and unavailable.last_transition_time is not None
+                            and _minutes_since(unavailable.last_transition_time, datetime.now(timezone.utc))
+                            > POD_STARTUP_GRACE_MINUTES),
             })
     except Exception as e:
-        result["errors"].append(f"deployments: {e}")
+        result["errors"].append(f"deployments: {_collection_failure(e)}")
 
     # KEDA owns activation from zero; an HPA alone cannot establish its health.
     for info in result["hpas"]:
@@ -579,7 +605,7 @@ def _collect_cluster_data() -> dict:
                 hpa, scaled_object, collected_deployments.get((info["namespace"], target.name))
             )
         except Exception as e:
-            result["errors"].append(f"KEDA {info['namespace']}/{owner.name}: {e}")
+            result["errors"].append(f"KEDA {info['namespace']}/{owner.name}: {_collection_failure(e)}")
 
     # --- Node utilisation (metrics-server) ---
     # Wrapped like every other block so a metrics-server outage degrades into a
@@ -596,7 +622,7 @@ def _collect_cluster_data() -> dict:
                 "memory": usage.get("memory", "?"),
             })
     except Exception as e:
-        result["errors"].append(f"node metrics: {e}")
+        result["errors"].append(f"node metrics: {_collection_failure(e)}")
 
     # --- Pod utilisation (metrics-server) ---
     try:
@@ -622,7 +648,7 @@ def _collect_cluster_data() -> dict:
                 "memory_ki": total_mem_ki,
             }
     except Exception as e:
-        result["errors"].append(f"pod metrics: {e}")
+        result["errors"].append(f"pod metrics: {_collection_failure(e)}")
 
     # PV sources determine whether kubelet stats describe a shared local disk.
     volume_sources = {}
@@ -634,7 +660,7 @@ def _collect_cluster_data() -> dict:
                     pv.spec.local or pv.spec.host_path
                 )
     except Exception as e:
-        result["errors"].append(f"volume sources: {e}")
+        result["errors"].append(f"volume sources: {_collection_failure(e)}")
 
     # Collect node disks even when PV metadata is unavailable. Unknown claims
     # must not become misleading PVC consumption warnings.
@@ -646,8 +672,13 @@ def _collect_cluster_data() -> dict:
             )
             _collect_storage_usage(result, json.loads(resp.data), node_name, volume_sources)
         except Exception as e:
-            result["errors"].append(f"pvc usage ({node_name}): {e}")
+            result["errors"].append(f"pvc usage ({node_name}): {_collection_failure(e)}")
 
+    for node in result["nodes"]:
+        if node["name"] not in result["node_disk_usage"]:
+            result["errors"].append(f"pvc usage ({node['name']}): node filesystem statistics unavailable")
+    from health_evidence import collection_coverage
+    result["coverage"] = [item.model_dump() for item in collection_coverage(result)]
     return result
 
 
@@ -1046,14 +1077,15 @@ def _health_prompt(snapshot: str) -> tuple[str, str]:
         "against the node; do not recommend PVC expansion for local directory volumes. "
         "Do not flag an HPA CPU reading above its target by itself: that is "
         "normal while a healthy deployment is scaling. Report an HPA warning only "
-        "when it is scaling-limited at its maximum by excess demand, its deployment "
-        "remains unavailable after its target has settled, scaling or metric collection "
+        "when its deployment remains unavailable after its target has settled, scaling or metric collection "
         "fails, or other evidence shows workload harm. Equal min/max bounds mean fixed "
         "replicas; do not warn about that configuration or replica equality alone. "
         "ScalingLimited=True/TooFewReplicas means the minimum prevents scaling down, "
         "not that demand exceeds the maximum. TooManyReplicas indicates the maximum "
-        "limits scaling up. Fixed replicas still require findings for sustained demand "
-        "above target, unavailable workloads, scaling or metric failures, or AbleToScale=False. "
+        "limits scaling up. Being scaling-limited at its maximum may be intentional, including "
+        "during scheduled load tests. Do not flag replica equality or TooManyReplicas alone "
+        "without independent evidence of workload harm. Fixed replicas still require findings for sustained demand "
+        "above target with workload harm, unavailable workloads, scaling or metric failures, or AbleToScale=False. "
         "KEDA Idle at Zero means ownership, zero-replica target state and a ready, inactive "
         "activation controller were verified. For that state, ScalingActive=False/ScalingDisabled "
         "and absent HPA metrics are expected while KEDA waits for demand, even if HPA min=1. "
@@ -1076,7 +1108,8 @@ def _degraded_health_report(summary: str):
     from schemas import HealthReport
 
     return HealthReport(
-        overall_severity="warning",
+        overall_severity="unknown",
+        analysis_valid=False,
         summary=summary,
         findings=[],
         recommended_actions=[],
@@ -1135,7 +1168,8 @@ def run_structured_health_check() -> tuple["HealthReport", dict]:
     data = _collect_cluster_data()
     snapshot = _format_snapshot(data)
     report = _analyse_snapshot(snapshot)
-    return report, data
+    from health_evidence import reconcile_report
+    return reconcile_report(report, data), data
 
 
 def annotate_with_history(report, db):
@@ -1151,12 +1185,44 @@ def annotate_with_history(report, db):
     return diff_report(report, db.load_tracked_findings())
 
 
+def _monitor_status_signature(report) -> tuple:
+    """Compare validity and missing coverage, excluding changing error text."""
+    if isinstance(report, dict):
+        valid = report.get("analysis_valid", True)
+        coverage = report.get("coverage", [])
+    else:
+        valid = report.analysis_valid
+        coverage = report.coverage
+    incomplete = []
+    for item in coverage:
+        area = item.get("area") if isinstance(item, dict) else item.area
+        status = item.get("status") if isinstance(item, dict) else item.status
+        if status != "complete":
+            incomplete.append((area, status))
+    return bool(valid), tuple(sorted(incomplete))
+
+
+def _monitor_status_changed(report, db) -> bool:
+    reader = getattr(db, "recent_monitor_checks", None)
+    if reader is None:
+        return False
+    previous = reader(limit=1)
+    current = _monitor_status_signature(report)
+    if not previous:
+        return current != (True, ())
+    row = previous[0]
+    baseline = row.get("report") or {
+        "analysis_valid": row.get("analysis_valid", True), "coverage": row.get("coverage", []),
+    }
+    return current != _monitor_status_signature(baseline)
+
+
 # ---------------------------------------------------------------------------
 # Scheduler
 # ---------------------------------------------------------------------------
 
 class MonitoringScheduler:
-    def __init__(self, agent, notifier, interval_minutes: int = 30, db=None):
+    def __init__(self, agent, notifier, interval_minutes: int = 30, db=None, delivery=None):
         # agent is kept for API compatibility but is NOT used for scheduled checks
         self._agent = agent
         self._notifier = notifier
@@ -1168,6 +1234,8 @@ class MonitoringScheduler:
 
             db = NullDatabase()
         self._db = db
+        self._delivery = delivery
+        self._check_lock = threading.Lock()
 
     async def start(self):
         if self._task and not self._task.done():
@@ -1212,13 +1280,17 @@ class MonitoringScheduler:
         return session_id
 
     def _do_check(self, session_id: str):
-        """Synchronous: collect data + one model call, then diff. Runs in thread pool."""
+        """Serialize manual and scheduled checks before observing incident state."""
+        with self._check_lock:
+            self._do_check_locked(session_id)
+
+    def _do_check_locked(self, session_id: str):
         try:
             report, data = run_structured_health_check()
             now = datetime.now(timezone.utc)
 
-            # Advance state first so a Slack failure below cannot cause the next
-            # run to re-report everything as new.
+            # Reserve a check number before atomically saving observations and
+            # any pending notification.
             # A connection can still be closed by PostgreSQL after the pool
             # validates it at checkout. This is the first persistence action
             # after the model call, so retry it once rather than losing an
@@ -1232,8 +1304,10 @@ class MonitoringScheduler:
                     session_id,
                 )
                 check_no = self._db.next_check_number()
-            diff = diff_report(report, self._db.load_tracked_findings(), now)
-            self._db.apply_diff(diff, now)
+            stored = self._db.load_tracked_findings()
+            from health_evidence import reconcile_report
+            report = reconcile_report(report, data, stored)
+            diff = diff_report(report, stored, now)
 
             log.info(
                 "Health check complete (session=%s, check=%d, severity=%s, %s, "
@@ -1254,40 +1328,41 @@ class MonitoringScheduler:
             )
             # Without a database there is no history to diff against, so fall
             # back to the old always-post behaviour rather than going silent.
+            status_changed = _monitor_status_changed(report, self._db)
             notify = (
-                not self._db.available
+                status_changed
+                or not self._db.available
                 or diff.should_notify(MONITOR_NOTIFY_ON_RESOLVED)
                 or digest_due
             )
 
-            if not notify:
-                log.info(
-                    "Nothing new (%s) — suppressing Slack post (next digest at check %d)",
-                    diff.summary_line(),
-                    (check_no // MONITOR_DIGEST_EVERY_N_CHECKS + 1) * MONITOR_DIGEST_EVERY_N_CHECKS
-                    if MONITOR_DIGEST_EVERY_N_CHECKS > 0 else -1,
-                )
-                return
-
-            if self._notifier.enabled:
-                report_id = self._db.save_report([d.fingerprint for d in diff.active])
-                self._notifier.send_structured_report(
-                    report,
-                    source="scheduled digest" if digest_due and not diff.should_notify(
+            notification = None
+            if notify and self._notifier.enabled:
+                notification = {
+                    "report": report.model_dump(mode="json"),
+                    "diff": serialize_diff(diff) if self._db.available else None,
+                    "source": "scheduled status" if status_changed else "scheduled digest" if digest_due and not diff.should_notify(
                         MONITOR_NOTIFY_ON_RESOLVED
                     ) else "scheduled",
-                    # Without a database there is no history, so every finding
-                    # would read as NEW every hour. Omit the labels rather than
-                    # assert something untrue.
-                    diff=diff if self._db.available else None,
-                    report_id=report_id,
-                    recovered_probe_events=data.get("recovered_runtime_probe_events", []),
-                )
+                    "recovered_probe_events": data.get("recovered_runtime_probe_events", []),
+                }
+            self._db.record_monitor_check(session_id, check_no, report, data, diff, now, notification)
+            if self._delivery is not None:
+                self._delivery.drain_once()
+            elif notification is not None:
+                # NullDatabase has no durable outbox, so deliver best effort.
+                if not self._db.available:
+                    self._notifier.send_structured_report(
+                        report, source=notification["source"], diff=None,
+                        recovered_probe_events=notification["recovered_probe_events"],
+                    )
+                else:
+                    log.warning("Queued monitor notification awaits the delivery worker")
         except Exception as e:
             log.exception("Scheduled health check failed (session=%s)", session_id)
             if self._notifier.enabled:
                 self._notifier.send_alert(
                     "critical",
-                    "SRE Bot — Scheduled Check Failed",
-                    f"The autonomous health check encountered an error:\n```{e}```",
+                    "SRE Bot: Scheduled Check Failed",
+                    f"The autonomous health check failed ({type(e).__name__}). Check the service logs.",
                 )

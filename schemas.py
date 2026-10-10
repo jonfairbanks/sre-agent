@@ -16,7 +16,7 @@ Severity = Literal["critical", "warning", "info"]
 # highest severity among your findings", so every value a Finding can take has
 # to be representable here. Omitting "info" made an all-info report unanswerable
 # and the whole HealthReport failed validation.
-OverallSeverity = Literal["critical", "warning", "info", "ok"]
+OverallSeverity = Literal["critical", "warning", "info", "ok", "unknown"]
 
 
 class Finding(BaseModel):
@@ -29,6 +29,10 @@ class Finding(BaseModel):
     make the same ongoing problem look new every interval. See
     ``monitor_state.fingerprint``.
     """
+
+    evidence_source: Literal["model", "snapshot"] = "model"
+    owner_kind: str = ""
+    owner_name: str = ""
 
     severity: Severity = Field(
         description="critical = must fix now (down/crashloop/OOM); "
@@ -59,8 +63,19 @@ class Finding(BaseModel):
     )
 
 
+class CollectionCoverage(BaseModel):
+    """Whether a collection area can support health conclusions."""
+
+    area: str
+    status: Literal["complete", "partial", "unavailable"]
+    detail: str = ""
+
+
 class HealthReport(BaseModel):
     """A structured cluster health report."""
+
+    analysis_valid: bool = True
+    coverage: list[CollectionCoverage] = Field(default_factory=list)
 
     overall_severity: OverallSeverity = Field(
         description="Highest severity across all findings; 'ok' if the cluster is healthy."

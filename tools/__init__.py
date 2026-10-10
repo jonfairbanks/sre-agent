@@ -1,3 +1,4 @@
+from .gitops import get_argocd_application, get_gitops_source, propose_gitops_change
 from .kubernetes_read import (
     kubectl_get_namespaces,
     kubectl_get_nodes,
@@ -93,6 +94,9 @@ HELM_WRITE_TOOLS = [
 ]
 
 READ_TOOLS = [
+    get_argocd_application,
+    get_gitops_source,
+    propose_gitops_change,
     kubectl_get_namespaces,
     kubectl_get_nodes,
     kubectl_get_pods,

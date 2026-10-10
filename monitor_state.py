@@ -84,7 +84,12 @@ def fingerprint(finding) -> str:
     """
     ns = (getattr(finding, "namespace", "") or "-").strip().lower()
     kind = (getattr(finding, "kind", "") or "").strip()
-    name = normalize_resource_name(kind, (getattr(finding, "resource_name", "") or "").strip())
+    owner_name = getattr(finding, "owner_name", "")
+    if owner_name:
+        kind = getattr(finding, "owner_kind", "") or kind
+        name = owner_name
+    else:
+        name = normalize_resource_name(kind, (getattr(finding, "resource_name", "") or "").strip())
     reason = (getattr(finding, "reason", "") or "").strip()
 
     if not kind and not name and not reason:
@@ -105,11 +110,22 @@ class StoredFinding:
     severity: str
     title: str = ""
     namespace: str = ""
+    kind: str = ""
+    resource_name: str = ""
+    reason: str = ""
+    detail: str = ""
     first_seen: Optional[datetime] = None
     last_seen: Optional[datetime] = None
     times_seen: int = 0
     resolved_at: Optional[datetime] = None
     ack_until: Optional[datetime] = None
+
+    ignored_until: Optional[datetime] = None
+    ignored_forever: bool = False
+    mute_expired: bool = False
+
+    def is_ignored(self, now: datetime) -> bool:
+        return self.ignored_forever or (self.ignored_until is not None and self.ignored_until > now)
 
     def is_acked(self, now: datetime) -> bool:
         return self.ack_until is not None and self.ack_until > now
@@ -143,10 +159,12 @@ class ResolvedFinding:
     severity: str
     first_seen: Optional[datetime]
     last_seen: Optional[datetime]
+    suppressed: bool = False
 
 
 @dataclass
 class ReportDiff:
+    retained: list[StoredFinding] = field(default_factory=list)
     new: list[FindingDelta] = field(default_factory=list)
     escalated: list[FindingDelta] = field(default_factory=list)
     ongoing: list[FindingDelta] = field(default_factory=list)
@@ -163,14 +181,14 @@ class ReportDiff:
         """True when this run contains something a human has not already seen."""
         if self.new or self.escalated:
             return True
-        return bool(self.resolved) and notify_on_resolved
+        return any(not item.suppressed for item in self.resolved) and notify_on_resolved
 
     def summary_line(self) -> str:
         parts = []
         for label, items in (
             ("new", self.new), ("escalated", self.escalated),
-            ("ongoing", self.ongoing), ("resolved", self.resolved),
-            ("acked", self.suppressed),
+            ("ongoing", self.ongoing), ("resolved", [r for r in self.resolved if not r.suppressed]),
+            ("muted", self.suppressed),
         ):
             if items:
                 parts.append(f"{len(items)} {label}")
@@ -231,7 +249,7 @@ def diff_report(
             delta = FindingDelta(
                 finding=finding,
                 fingerprint=fp,
-                status="escalated" if escalated else "ongoing",
+                status="new" if prev.mute_expired else "escalated" if escalated else "ongoing",
                 first_seen=prev.first_seen or now,
                 times_seen=prev.times_seen + 1,
                 previous_severity=prev.severity,
@@ -240,7 +258,7 @@ def diff_report(
 
         # An active ack mutes a finding from notifications but does not stop us
         # tracking it — the history has to stay correct for when the ack lapses.
-        if prev is not None and prev.is_acked(now):
+        if prev is not None and (prev.is_ignored(now) or prev.is_acked(now)):
             diff.suppressed.append(delta)
         elif delta.status == "new":
             diff.new.append(delta)
@@ -252,7 +270,10 @@ def diff_report(
     for fp, prev in stored.items():
         if fp in current or prev.resolved_at is not None:
             continue
-        if prev.is_acked(now):
+        if not _can_resolve(report, fp):
+            diff.retained.append(prev)
+            continue
+        if not prev.is_ignored(now) and prev.is_acked(now):
             # Silently close acked findings: the human already said "not now",
             # so telling them it fixed itself is not worth an interrupt.
             continue
@@ -264,6 +285,7 @@ def diff_report(
                 severity=prev.severity,
                 first_seen=prev.first_seen,
                 last_seen=prev.last_seen,
+                suppressed=prev.is_ignored(now),
             )
         )
 
@@ -286,3 +308,75 @@ def humanize_age(delta: Optional[timedelta]) -> str:
     if s < 86400:
         return f"{s // 3600}h"
     return f"{s // 86400}d"
+
+
+def _can_resolve(report, fp: str) -> bool:
+    """Resolve only after successful analysis and the relevant collection."""
+    if not getattr(report, "analysis_valid", True):
+        return False
+    coverage = getattr(report, "coverage", [])
+    if not coverage:
+        return True
+    states = {item.area: item.status for item in coverage}
+    reason = fp.rsplit(":", 1)[-1]
+    kind = fp.split("/")[1] if "/" in fp else ""
+    disk_reasons = {"nodefilesystemusage", "pvcusage", "localfilesystemusage"}
+    pod_reasons = {"crashloopbackoff", "imagepullbackoff", "errimagepull", "invalidimagename",
+                   "createcontainerconfigerror", "createcontainererror", "errimageneverpull",
+                   "failed", "pending", "notready", "oomkilled", "error", "containercannotrun",
+                   "deadlineexceeded", "evicted"}
+    if reason in disk_reasons:
+        required = [f"disk:{fp}"]
+    elif kind == "node" and reason in {"notready", "diskpressure", "memorypressure", "pidpressure"}:
+        required = ["nodes"]
+        if "node_readiness" in states:
+            required.append("node_readiness")
+    elif reason in pod_reasons:
+        required = ["pods"]
+    elif kind == "deployment" and reason == "unavailable":
+        required = ["deployments"]
+    elif kind == "hpa" and reason == "kedaactivationfailure":
+        required = ["hpas", "keda"]
+    elif kind == "hpa" and (reason.startswith("failed") or reason in
+                            {"scalingfailure", "scalingdisabled", "toomanyreplicas"}):
+        required = ["hpas", "keda"]
+    else:
+        # Model observations can depend on several sources. Missing evidence
+        # must not be treated as a successful negative observation.
+        return all(item.status == "complete" for item in coverage)
+    return all(states.get(area) == "complete" for area in required)
+
+
+def serialize_diff(diff: ReportDiff) -> dict:
+    from dataclasses import asdict
+    payload = {}
+    for bucket in ("new", "escalated", "ongoing", "suppressed", "resolved", "retained"):
+        rows = []
+        for item in getattr(diff, bucket):
+            row = asdict(item)
+            if hasattr(item, "finding"):
+                row["finding"] = item.finding.model_dump(mode="json")
+            for key, value in row.items():
+                if isinstance(value, datetime):
+                    row[key] = value.isoformat()
+            rows.append(row)
+        payload[bucket] = rows
+    return payload
+
+
+def deserialize_diff(payload: dict) -> ReportDiff:
+    from schemas import Finding
+    diff = ReportDiff()
+    for bucket in ("new", "escalated", "ongoing", "suppressed", "resolved", "retained"):
+        for raw in payload.get(bucket, []):
+            row = dict(raw)
+            for key in ("first_seen", "last_seen", "resolved_at", "ack_until", "ignored_until"):
+                if row.get(key):
+                    row[key] = datetime.fromisoformat(row[key])
+            if bucket in ("resolved", "retained"):
+                item = (ResolvedFinding if bucket == "resolved" else StoredFinding)(**row)
+            else:
+                row["finding"] = Finding.model_validate(row["finding"])
+                item = FindingDelta(**row)
+            getattr(diff, bucket).append(item)
+    return diff

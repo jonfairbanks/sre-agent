@@ -217,7 +217,7 @@ def mock_cluster(monkeypatch, pods, events, node_ready=True):
               list_node=lambda: NS(items=[node]),
               list_pod_for_all_namespaces=lambda: NS(items=pods),
               list_event_for_all_namespaces=lambda **kw: NS(items=events),
-              connect_get_node_proxy_with_path=lambda *args, **kw: NS(data='{"pods": []}'))
+              connect_get_node_proxy_with_path=lambda *args, **kw: NS(data='{"node": {"fs": {"capacityBytes": 1000000, "usedBytes": 100000}}, "pods": []}'))
     monkeypatch.setattr(k8s_client, "core_v1", lambda: core)
     monkeypatch.setattr(k8s_client, "apps_v1", lambda: NS(
         list_deployment_for_all_namespaces=lambda: NS(items=[])))

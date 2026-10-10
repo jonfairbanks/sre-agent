@@ -1,20 +1,20 @@
 # SRE Bot
 
-An autonomous Kubernetes SRE agent. It monitors cluster health, diagnoses issues, and applies fixes — with human approval required before any write operation.
+An autonomous Kubernetes SRE agent. It monitors cluster health, diagnoses issues, and applies fixes with human approval for cluster writes.
 
 ## Features
 
-- **Autonomous health audits** — pods, scaling, resources, logs, security, reliability, config hygiene, and batch jobs analyzed in parallel by specialized subagents
-- **Human-in-the-loop (HITL)** — every write operation (restart, scale, patch, delete) pauses for explicit approval. Approving or rejecting in Slack confirms the decision inline (who decided, and the outcome) and removes the buttons, so an action can't be double-triggered
-- **Slack integration** — alerts, health reports, and HITL approve/reject buttons via Socket Mode (no public ingress needed). Mention the bot in a channel and it replies in-thread
-- **Fast interactive health checks** — a "run a health check" mention is served by the same bounded path as the scheduler (direct cluster reads + a single structured-output call), so it returns in seconds and can never hit the agent's recursion limit — unlike routing it through the full orchestrator
-- **Custom resource support** — the change-executor can create, update, and delete CRD instances, so it can remove an operator's top-level custom resource (e.g. an `lgps.apps.langchain.ai`) instead of fighting the operator's reconciliation loop
-- **Anthropic and OpenAI support** — select the provider with `LLM_PROVIDER`; each provider supports independent main and lower-cost worker model overrides
-- **Model gateway support** — route provider calls through a compatible gateway with `ANTHROPIC_BASE_URL` or `OPENAI_BASE_URL`; unset, calls go directly to the selected provider
-- **Scheduled monitoring** — periodic cluster health checks on a configurable interval. The scheduler collects cluster state directly via the Kubernetes client (no LLM tokens), then makes a single structured-output call to summarize findings
-- **Structured findings** — health analysis returns a typed `HealthReport` (see `schemas.py`) rather than free text, so Slack rendering reads typed fields instead of parsing markdown
-- **Two interfaces** — CLI for interactive use, FastAPI + web UI for in-cluster deployment
-- **LangSmith tracing** — full observability of every agent run, with an eval dataset and online evaluators
+- **Autonomous Health Audits**: pods, scaling, resources, logs, security, reliability, config hygiene, and batch jobs analyzed in parallel by specialized subagents
+- **Human-in-the-Loop (HITL)**: every write operation (restart, scale, patch, delete) pauses for explicit approval. Approving or rejecting in Slack confirms the decision inline (who decided, and the outcome) and removes the buttons, so an action can't be double-triggered
+- **Slack Integration**: alerts, health reports, and HITL approve/reject buttons via Socket Mode (no public ingress needed). Mention the bot in a channel and it replies in-thread
+- **Fast Interactive Health Checks**: a health-check mention uses direct cluster reads and one structured model call. It shares the scheduler's bounded path and avoids the orchestrator's recursion limit
+- **Custom Resource Support**: the change-executor can create, update, and delete CRD instances, so it can remove an operator's top-level custom resource (e.g. an `lgps.apps.langchain.ai`) instead of fighting the operator's reconciliation loop
+- **Anthropic and OpenAI Support**: select the provider with `LLM_PROVIDER`; each provider supports independent main and lower-cost worker model overrides
+- **Model Gateway Support**: route provider calls through a compatible gateway with `ANTHROPIC_BASE_URL` or `OPENAI_BASE_URL`; unset, calls go directly to the selected provider
+- **Scheduled Monitoring**: periodic cluster health checks on a configurable interval. The scheduler collects cluster state directly via the Kubernetes client (no LLM tokens), then makes a single structured-output call to summarize findings
+- **Structured Findings**: health analysis returns a typed `HealthReport` (see `schemas.py`) rather than free text, so Slack rendering reads typed fields instead of parsing markdown
+- **Two Interfaces**: CLI for interactive use, FastAPI + web UI for in-cluster deployment
+- **LangSmith Tracing**: full observability of every agent run, with an eval dataset and online evaluators
 
 ## Example Output
 
@@ -24,7 +24,7 @@ Slack health report showing a cluster audit with critical and warning findings:
 
 ![Slack health report 2](docs/slack_health_2.png)
 
-HITL approval in Slack — after you approve or reject, the decision is confirmed inline (with who decided) and the buttons are removed so the action can't be re-triggered:
+HITL approval in Slack: after you approve or reject, the decision is confirmed inline (with who decided) and the buttons are removed so the action can't be re-triggered:
 
 ![Slack HITL approval confirmation](docs/confirmation.png)
 
@@ -33,15 +33,15 @@ HITL approval in Slack — after you approve or reject, the decision is confirme
 ```text
 main.py / api.py
     └── SRE orchestrator (agent.py)
-            ├── pod-inspector        (read-only) — pod health, crashes, logs
-            ├── scaling-analyzer     (read-only) — HPA, replicas, node capacity
-            ├── performance-analyzer (read-only) — CPU/memory right-sizing
-            ├── log-analyzer         (read-only) — error detection in logs
-            ├── security-auditor     (read-only) — RBAC, privileged pods, NetworkPolicies, image tags
-            ├── reliability-auditor  (read-only) — PDBs, probes, endpoints, single-replica SPOFs
-            ├── job-inspector        (read-only) — Jobs, CronJobs, failures, missed schedules
-            ├── config-auditor       (read-only) — resource limits, PV hygiene, selector mismatches
-            └── change-executor      (write ops — all require HITL approval)
+            ├── pod-inspector        (read-only): pod health, crashes, logs
+            ├── scaling-analyzer     (read-only): HPA, replicas, node capacity
+            ├── performance-analyzer (read-only): CPU/memory right-sizing
+            ├── log-analyzer         (read-only): error detection in logs
+            ├── security-auditor     (read-only): RBAC, privileged pods, NetworkPolicies, image tags
+            ├── reliability-auditor  (read-only): PDBs, probes, endpoints, single-replica SPOFs
+            ├── job-inspector        (read-only): Jobs, CronJobs, failures, missed schedules
+            ├── config-auditor       (read-only): resource limits, PV hygiene, selector mismatches
+            └── change-executor      (write ops: all require HITL approval)
 ```
 
 The main agent only has read tools. All writes are delegated to `change-executor`, which is configured to interrupt before every write tool call.
@@ -56,7 +56,7 @@ The main agent only has read tools. All writes are delegated to `change-executor
 - LangSmith API key (for tracing)
 - Slack app with Bot and App-level tokens (optional, for Slack notifications)
 
-### Local dev
+### Local Development
 
 ```bash
 pip install -r requirements.txt
@@ -67,7 +67,7 @@ python main.py        # CLI mode
 python api.py         # API + web UI at http://localhost:8080
 ```
 
-### Environment variables
+### Environment Variables
 
 | Variable | Required | Description |
 | -------- | -------- | ----------- |
@@ -92,11 +92,16 @@ python api.py         # API + web UI at http://localhost:8080
 | `MONITOR_DIGEST_EVERY_N_CHECKS` | No | Post a report every N checks even when nothing changed; `0` disables (default: `12`) |
 | `MONITOR_NOTIFY_ON_RESOLVED` | No | Announce findings that cleared (default: `true`) |
 | `MONITOR_ACK_HOURS` | No | How long the Slack **Ack** button mutes a finding (default: `24`) |
-| `PVC_USAGE_ALERT_PERCENT` | No | PVCs at or above this fill level are listed individually in the health snapshot (default: `70`) |
+| `PVC_USAGE_ALERT_PERCENT` | No | Disk warning entry threshold and individual PVC snapshot threshold (default: `70`) |
+| `DISK_USAGE_CLEAR_PERCENT` | No | Disk findings clear below this percentage (default: `65`) |
+| `DISK_USAGE_CRITICAL_PERCENT` | No | Disk critical entry threshold (default: `90`) |
+| `DISK_USAGE_CRITICAL_CLEAR_PERCENT` | No | Critical disk findings step down below this percentage (default: `85`) |
+| `GITOPS_ALLOWED_REPOSITORIES` | No | Comma-separated verified public GitHub `owner/repo` names; empty disables source reads and proposals |
+| `GITOPS_REPOSITORY_OWNERSHIP` | No | Optional JSON object mapping repository names to responsible teams; metadata only |
 | `POD_FAILURE_RECENCY_MINUTES` | No | Recovered failures drop out after this many minutes (default: `240`, or 4 hours). Set this variable to override the window. Lifetime restart counts alone are not reported; active faults still are. |
 | `POD_STARTUP_GRACE_MINUTES` | No | Grace before Pending or not-ready counts as a fault (default: `10`) |
 | `EVENT_MAX_AGE_MINUTES` | No | Warning events older than this are dropped (default: `60`) |
-| `DATABASE_URL` | No | Postgres DSN for durable state. Unset = in-memory, and pending approvals do not survive a restart |
+| `DATABASE_URL` | No | Postgres DSN for sessions, findings, ignores, 30-day check history and Slack delivery retries. Unset = in-memory; persistent features are unavailable |
 | `SLACK_APPROVER_IDS` | No | Comma-separated Slack user IDs allowed to approve changes. **Empty means anyone who can see the message may approve** |
 | `DEFAULT_NAMESPACES` | No | Comma-separated namespaces to watch (default: auto-discover) |
 | `PROMETHEUS_URL` | No | Prometheus endpoint for richer metrics |
@@ -106,7 +111,7 @@ python api.py         # API + web UI at http://localhost:8080
 
 ## Deploy to Kubernetes
 
-### Helm (recommended)
+### Helm (Recommended)
 
 The chart defaults to Anthropic, one replica, cluster-wide read access, tracing
 disabled, and writer RBAC disabled. Provide credentials through an externally
@@ -162,7 +167,7 @@ version bump or manual `cluster-state` edit.
 Manual releases from other branches publish only the SHA tag, so test builds
 cannot replace the production image. Version tags also leave `latest` unchanged.
 
-### Raw manifests
+### Raw Manifests
 
 The included `deploy.sh` handles build, ECR push, and EKS apply in one step:
 
@@ -223,7 +228,7 @@ The included manifests grant:
 
 All write operations are still gated by HITL regardless of RBAC.
 
-## Stopping the bot
+## Stopping the Bot
 
 | Mode | How to stop |
 | ---- | ----------- |
@@ -232,7 +237,7 @@ All write operations are still gated by HITL regardless of RBAC.
 | In-cluster | `kubectl scale deployment sre-agent -n sre-agent --replicas=0` |
 | Delete everything | `kubectl delete -k k8s/` |
 
-## Project structure
+## Project Structure
 
 ```text
 agent.py              Main SRE orchestrator
@@ -240,7 +245,7 @@ api.py                FastAPI server (SSE streaming, HITL endpoints, web UI)
 main.py               CLI entry point
 config.py             Env-based configuration
 chart/                Helm chart (safe read-only defaults; Anthropic/OpenAI configuration)
-schemas.py            Pydantic models (Finding, HealthReport) — structured-output contract
+schemas.py            Pydantic models (Finding, HealthReport): structured-output contract
 scheduler.py          Periodic health check scheduler (structured HealthReport via tool-use),
                       diffed against stored state so only changes are posted
 persistence.py        Postgres checkpointer/store, sessions, HITL audit, finding state,
@@ -288,9 +293,10 @@ evals/
   upload_online_evals.py    Script to register online evaluators
 ```
 
-## Durable state
+## Durable State
 
-Checkpoints, sessions, the HITL audit log, and monitoring finding-state live in
+Checkpoints, sessions, the HITL audit log, monitoring finding-state, finding
+ignores, check/history records, and the Slack delivery outbox live in
 Postgres (`k8s/postgres.yaml` deploys a StatefulSet into the `sre-agent`
 namespace). Without it, a pod restart stranded every pending approval. The Slack
 Approve button stayed live but the session behind it was gone, so the click
@@ -303,13 +309,14 @@ interpolated into.
 
 If Postgres is unreachable the process logs loudly and **degrades to in-memory
 state rather than refusing to boot**, so a cluster problem cannot also remove
-your ability to ask the bot about it. `/health` exposes `durable_state`. Alert
-on it, because that degradation is otherwise invisible.
+your ability to ask the bot about it. `/health` exposes `durable_state`. Persistent
+history, finding ignores, and delivery retries are unavailable in this mode.
+Check snapshots and finding transitions are retained for 30 days.
 
 Note the trade-off. The bot's durability now depends on a database inside the
 cluster it monitors. A cluster-wide outage takes the audit trail with it.
 
-### Audit trail
+### Audit Trail
 
 `GET /api/audit?limit=50` returns recent HITL decisions, showing who approved
 or rejected which tool call, with the actual arguments. One row per tool call, so a
@@ -325,9 +332,17 @@ Two known gaps are worth calling out.
 
 ## Monitoring Behavior
 
+Observed snapshot facts determine finding identity and severity. Model prose
+adds context. Each collection area reports coverage; an unavailable source
+cannot resolve its existing findings. If incomplete evidence leaves no current
+fault established, the check reports Unknown instead of healthy.
+Disk warnings enter at 70% and clear below 65%; critical findings enter at 90%
+and step down below 85%. Separate entry and clear thresholds prevent alerts
+from flapping near a limit.
+
 Scheduled checks are stateful. Each run is diffed against the previous one and
 Slack is only notified when something is **new**, **escalated**, or **newly
-resolved**. Otherwise the run is logged and stays quiet. A digest posts every
+resolved**, or when analysis validity or collection coverage changes. Otherwise the run is logged and stays quiet. A digest posts every
 `MONITOR_DIGEST_EVERY_N_CHECKS` runs regardless, so a silent channel still
 proves the bot is alive.
 
@@ -350,13 +365,61 @@ one ongoing incident report as "ongoing 6h · seen 12×" instead of as a fresh
 alert every interval.
 
 The **Ack** button on a report mutes its findings for `MONITOR_ACK_HOURS`. Acked
-findings stay tracked, so history remains correct when the ack lapses, and they
-resolve silently. Acking is not gated by `SLACK_APPROVER_IDS`, because it
+findings stay tracked during the window. Acking is not gated by `SLACK_APPROVER_IDS`, because it
 changes no cluster state.
 
-Interactive health checks (`@sre-bot health check`) read this history to annotate
-age and counts but do not advance it; only scheduled runs do, so ad-hoc requests
-cannot inflate the counters.
+Each finding also has **Ignore** durations of **1h**, **8h**, **1d**, **1wk**,
+and **Forever**, plus **Unignore**. Ignored findings still update their history
+and resolve normally. When an ignore expires, a current fault can notify once
+again. `GET /api/findings/ignored` lists active ignores. Ignore controls use the `SLACK_APPROVER_IDS` policy and require
+Postgres; missing persistence does not silently create an in-memory mute.
+
+Interactive health checks (`@sre-bot health check`) update finding history and
+queue a report to the original Slack thread. They leave the scheduled digest
+counter unchanged.
+
+## Integration Status and Delivery
+
+Slack Socket Mode receipt and outbound posting report separate health. A
+Socket Mode disconnect does not imply posting failed. `/health` keeps the
+process liveness result and includes integration state; `/api/status` reports
+delivery state and the last check, while `/metrics` exposes fixed metrics
+without per-resource labels.
+
+Scheduled notifications use a Postgres outbox with retries starting at 15
+seconds. Delivery is at least once: a successful Slack post followed by a
+database failure can be retried and appear twice. Delivery failures preserve
+the queued notification instead of advancing it as delivered. Without Postgres,
+there is no persistent retry queue.
+
+## Incident Timelines and GitOps Proposals
+
+The read-only `incident_timeline` tool joins persisted check/finding history,
+Kubernetes Warning and Normal events, node conditions, recent container
+restarts, Argo deployment metadata, and typed VSO conditions. Its window is
+bounded to 1 hour through 7 days and output to 200 observations. Each entry
+includes its source, observed time, resource reference, and evidence
+classification; unavailable or capped sources are reported separately. Events
+can expire before the requested window. Current node and VSO snapshots carry
+transition timestamps, and stale observed generations remain visible as stale.
+
+Supplied maintenance context is unverified input. A nearby rollout or restart
+does not prove a cause or suppress a separate finding. Historical Warning
+events do not establish a current failure, and terminal pod state does not
+prove every previous event resolved. The timeline does not fetch logs or
+Grafana data and omits raw event messages, resource bodies, and secret values.
+
+`get_argocd_application` reports source mappings and sync/health state. Enable
+`get_gitops_source` and `propose_gitops_change` by setting
+`GITOPS_ALLOWED_REPOSITORIES` to verified public GitHub `owner/repo` names; the
+empty default disables them. Optional `GITOPS_REPOSITORY_OWNERSHIP` records
+responsible teams without granting repository access.
+
+A proposal requires an exact current 40-character base SHA, a mapped source
+file, evidence, and reasoning. It returns the before/after content and concrete
+unified diff for review. These tools do not publish changes or apply cluster
+mutations. Publish an approved change through the repository's GitHub/CI/CD
+workflow, then verify the runtime result.
 
 ## Tests
 
@@ -372,9 +435,9 @@ TEST_DATABASE_URL=postgresql://sre_agent:testpw@127.0.0.1:55433/sre_agent \
   python -m pytest tests/ -q
 ```
 
-## Security notes
+## Security Notes
 
-- `k8s/secret.yaml` is in `.gitignore` — never commit it
+- `k8s/secret.yaml` is in `.gitignore`: never commit it
 - The container runs as a non-root user (`uid 1000`)
 - Postgres traffic is unencrypted cluster-internal traffic; a NetworkPolicy in
   `k8s/postgres.yaml` restricts port 5432 to the `sre-agent` pod

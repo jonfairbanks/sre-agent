@@ -79,7 +79,8 @@ def test_valid_and_repairable_reports_keep_findings(monkeypatch, provider, sever
 def test_refusals_and_unusable_reports_degrade_to_warning(monkeypatch, provider, payload):
     _mock_provider(monkeypatch, provider, payload)
     report = scheduler._analyse_snapshot("test snapshot")
-    assert report.overall_severity == "warning"
+    assert report.overall_severity == "unknown"
+    assert report.analysis_valid is False
     assert "review the cluster manually" in report.summary
 
 
@@ -88,7 +89,8 @@ def test_request_failure_does_not_log_snapshot_or_credentials(monkeypatch, caplo
         raise RuntimeError("sensitive-placeholder")
     monkeypatch.setattr(scheduler, "request_health_report", fail)
     report = scheduler._analyse_snapshot("sensitive-snapshot")
-    assert report.overall_severity == "warning"
+    assert report.overall_severity == "unknown"
+    assert report.analysis_valid is False
     assert "sensitive-placeholder" not in caplog.text
     assert "sensitive-snapshot" not in caplog.text
 

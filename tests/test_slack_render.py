@@ -147,7 +147,7 @@ def test_fully_acked_report_is_not_headlined_critical(notifier):
     assert diff.suppressed and not diff.active
     notifier.send_structured_report(report(f), source="scheduled", diff=diff, report_id="r6")
     assert ":red_circle:" not in notifier._client.posted["text"]
-    assert "acked (hidden)" in body(notifier)
+    assert "muted (hidden)" in body(notifier)
     assert "sre_ack" not in body(notifier)
 
 
@@ -238,3 +238,36 @@ def test_recovered_probe_evidence_is_limited_to_ten_records(notifier):
     for attachment in notifier._client.posted["attachments"]:
         for block in attachment.get("blocks", []):
             assert len(block.get("text", {}).get("text", "")) <= 3000
+
+
+def test_large_report_bounds_finding_controls_and_preserves_severity_order(notifier):
+    findings = [finding(severity=severity, resource_name=f"pod-{severity}-{index}", title=f"{severity} Issue {index}")
+                for severity, count in (("info", 90), ("warning", 20), ("critical", 15))
+                for index in range(count)]
+    health_report = report(*findings)
+    diff = diff_report(health_report, {}, NOW)
+    notifier.send_structured_report(health_report, diff=diff, report_id="large-report")
+    payload = notifier._client.posted
+    all_blocks = payload["blocks"] + [block for attachment in payload["attachments"]
+                                         for block in attachment.get("blocks", [])]
+    sections = [block for block in all_blocks if block.get("accessory", {}).get("action_id") == "sre_ignore_finding"]
+    assert len(sections) == 40
+    assert len(all_blocks) < 50
+    text = body(notifier)
+    assert "85 findings omitted" in text
+    assert "Ask for incident history" in text
+    rendered = [section["text"]["text"] for section in sections]
+    assert all("critical Issue" in item for item in rendered[:15])
+    assert all("warning Issue" in item for item in rendered[15:35])
+    assert all("info Issue" in item for item in rendered[35:])
+    # Presentation limits do not change durable report membership.
+    assert len(diff.active) == 125
+
+
+def test_hidden_bucket_uses_muted_wording(notifier):
+    item = finding()
+    fp = fingerprint(item)
+    diff = diff_report(report(item), {fp: stored(fp, ack_until=NOW + timedelta(hours=1))}, NOW)
+    notifier.send_structured_report(report(item), diff=diff)
+    assert "1 muted (hidden)" in body(notifier)
+    assert "acked (hidden)" not in body(notifier)
