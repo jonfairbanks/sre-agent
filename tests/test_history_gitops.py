@@ -173,3 +173,148 @@ def test_null_database_does_not_report_successful_empty_history():
     history, finding = make_incident_history_tools(NullDatabase())
     assert json.loads(history.invoke({}))['health'] == 'unknown'
     assert json.loads(finding.invoke({'fingerprint': 'abc'}))['health'] == 'unknown'
+
+
+@pytest.mark.parametrize('url', [
+    'https://github.com/team/state.git',
+    'git@github.com:team/state.git',
+    'ssh://git@github.com/team/state.git',
+])
+def test_canonical_repository_transports(url):
+    assert gitops._repo(url) == 'team/state'
+    app = {'spec': {'source': {'repoURL': url, 'path': 'applications/demo'}}}
+    source = gitops._sources(app)[0]
+    assert source['repository'] == 'team/state'
+    assert source['repoURL'] == 'https://github.com/team/state'
+
+
+@pytest.mark.parametrize('url', [
+    'git@github.com.evil:team/state.git',
+    'git@github.com:team/../state.git',
+    'git@github.com:team/state.git?token=hidden',
+    'git@github.com:team/state.git#hidden',
+    'ssh://git:hidden@github.com/team/state.git',
+    'ssh://other@github.com/team/state.git',
+    'ssh://git@github.com:22/team/state.git',
+    'ssh://git@github.com.evil/team/state.git',
+    'ssh://git@github.com/team/state.git?token=hidden',
+    'ssh://git@github.com/team/state.git#hidden',
+    'https://github.com:443/team/state.git',
+    'https://github.com/team/state.git?',
+    'ssh://git@github.com/team/state.git#',
+    'https://github.com//team/state.git',
+    'https://github.com/team/%2e%2e/state.git',
+])
+def test_noncanonical_repository_transports_refused(url):
+    with pytest.raises(ValueError):
+        gitops._repo(url)
+
+
+@pytest.mark.parametrize('url', ['git@github.com:team/state.git', 'ssh://git@github.com/team/state.git'])
+def test_mixed_chart_and_ssh_value_source_mapping(url):
+    app = {'spec': {'sources': [
+        {'repoURL': 'https://charts.example', 'chart': 'demo', 'helm': {'valueFiles': ['$values/apps/demo.yaml']}},
+        {'repoURL': url, 'targetRevision': 'main', 'ref': 'values', 'path': 'unrelated'},
+    ]}}
+    mapping = gitops._mapped_sources(app, 'team/state', 'apps/demo.yaml')
+    assert mapping == [{'reference': '$values/apps/demo.yaml', 'repository': 'team/state', 'path': 'apps/demo.yaml', 'targetRevision': 'main'}]
+    sources = gitops._sources(app)
+    assert sources[0]['repoURL'] == 'https://charts.example'
+    assert sources[1]['repoURL'] == 'https://github.com/team/state'
+
+
+def _http_response(payload):
+    response = Mock()
+    response.read.return_value = json.dumps(payload).encode()
+    response.__enter__ = Mock(return_value=response)
+    response.__exit__ = Mock(return_value=False)
+    return response
+
+
+@pytest.mark.parametrize('token', ['', 'example-private-read-token'])
+def test_github_optional_auth_only_on_fixed_get(monkeypatch, token):
+    monkeypatch.setenv('GITOPS_ALLOWED_REPOSITORIES', 'team/state')
+    monkeypatch.setenv('GITOPS_GITHUB_TOKEN', token)
+    with patch.object(gitops, 'build_opener') as factory:
+        factory.return_value.open.return_value = _http_response({'sha': SHA})
+        assert gitops._github('team/state', 'commits/main') == {'sha': SHA}
+    request = factory.return_value.open.call_args.args[0]
+    assert request.full_url == 'https://api.github.com/repos/team/state/commits/main'
+    assert request.get_method() == 'GET'
+    assert request.get_header('Authorization') == ('Bearer ' + token if token else None)
+    assert factory.return_value.open.call_args.kwargs['timeout'] == 10
+    factory.assert_called_once_with(gitops._NoRedirect)
+
+
+def test_private_token_not_used_for_unallowlisted_repository(monkeypatch):
+    monkeypatch.setenv('GITOPS_ALLOWED_REPOSITORIES', 'team/state')
+    monkeypatch.setenv('GITOPS_GITHUB_TOKEN', 'example-private-read-token')
+    with patch.object(gitops, 'build_opener') as factory:
+        with pytest.raises(ValueError, match='GITOPS_ALLOWED_REPOSITORIES'):
+            gitops._github('other/state', 'commits/main')
+    factory.assert_not_called()
+
+
+def test_private_auth_redirect_is_refused_without_followup(monkeypatch):
+    monkeypatch.setenv('GITOPS_ALLOWED_REPOSITORIES', 'team/state')
+    monkeypatch.setenv('GITOPS_GITHUB_TOKEN', 'example-private-read-token')
+    def redirect(request, **kwargs):
+        return gitops._NoRedirect().redirect_request(request, None, 302, 'Found', {}, 'https://evil.example/blob')
+    with patch.object(gitops, 'build_opener') as factory:
+        factory.return_value.open.side_effect = redirect
+        with pytest.raises(ValueError, match='redirects are not permitted') as caught:
+            gitops._github('team/state', 'commits/main')
+    assert 'example-private-read-token' not in str(caught.value)
+    assert factory.return_value.open.call_count == 1
+
+
+def test_authenticated_private_source_and_proposal_do_not_echo_token(monkeypatch):
+    token = 'example-private-read-token'
+    monkeypatch.setenv('GITOPS_ALLOWED_REPOSITORIES', 'team/state')
+    monkeypatch.setenv('GITOPS_GITHUB_TOKEN', token)
+    before = 'kind: Deployment\nspec:\n  replicas: 1\n'
+    blob = {'type': 'file', 'encoding': 'base64', 'content': base64.b64encode(before.encode()).decode()}
+    app = {'spec': {'source': dict(APP['spec']['source'], repoURL='git@github.com:team/state.git')}}
+    with patch.object(gitops, '_application', return_value=app), patch.object(gitops, 'build_opener') as factory:
+        factory.return_value.open.side_effect = [_http_response({'sha': SHA}), _http_response(blob), _http_response({'sha': SHA}), _http_response(blob)]
+        source = gitops.get_gitops_source.invoke({'application': 'demo', 'repository': 'team/state', 'path': 'applications/demo/deployment.yaml'})
+        proposal = _proposal()
+    assert json.loads(source)['base_commit'] == SHA
+    assert proposal['published'] is False
+    assert token not in source + json.dumps(proposal)
+    for call in factory.return_value.open.call_args_list:
+        request = call.args[0]
+        assert request.get_header('Authorization') == 'Bearer ' + token
+        assert request.full_url.startswith('https://api.github.com/repos/team/state/')
+        assert request.get_method() == 'GET'
+
+
+def test_authenticated_errors_do_not_echo_transport_details(monkeypatch):
+    token = 'example-private-read-token'
+    monkeypatch.setenv('GITOPS_ALLOWED_REPOSITORIES', 'team/state')
+    monkeypatch.setenv('GITOPS_GITHUB_TOKEN', token)
+    with patch.object(gitops, '_application', return_value=APP), patch.object(gitops, 'build_opener') as factory:
+        factory.return_value.open.side_effect = RuntimeError('Authorization: Bearer ' + token)
+        result = _proposal()
+    assert token not in json.dumps(result)
+    assert 'unavailable' in result['error']
+
+
+@pytest.mark.parametrize('url', ['git@github.com:team/state.git', 'ssh://git@github.com/team/state.git'])
+def test_ssh_stale_base_refused_before_blob_read(url):
+    app = {'spec': {'source': dict(APP['spec']['source'], repoURL=url)}}
+    with patch.object(gitops, '_application', return_value=app), patch.object(gitops, '_github', return_value={'sha': 'b' * 40}) as github:
+        assert 'Base commit does not match' in _proposal()['error']
+    assert github.call_count == 1
+
+
+@pytest.mark.parametrize('control', ['\r', '\n', '\x7f'])
+def test_private_token_control_characters_refused_before_request(monkeypatch, control):
+    token = 'example-private-read-token' + control
+    monkeypatch.setenv('GITOPS_ALLOWED_REPOSITORIES', 'team/state')
+    monkeypatch.setenv('GITOPS_GITHUB_TOKEN', token)
+    with patch.object(gitops, 'build_opener') as factory:
+        with pytest.raises(ValueError, match='authentication configuration') as caught:
+            gitops._github('team/state', 'commits/main')
+    factory.assert_not_called()
+    assert token not in str(caught.value)

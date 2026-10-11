@@ -120,7 +120,7 @@ spec:
               value: {{ .Values.config.fsToolRunLimit | quote }}
             - name: PROMPT_CACHING
               value: {{ .Values.config.promptCaching | quote }}
-            {{- range $key := list "ANTHROPIC_API_KEY" "OPENAI_API_KEY" "ANTHROPIC_BASE_URL" "OPENAI_BASE_URL" "LC_GATEWAY_KEY" "LANGSMITH_API_KEY" "LANGSMITH_WORKSPACE_ID" "LANGSMITH_RUNS_ENDPOINTS" "SLACK_BOT_TOKEN" "SLACK_APP_TOKEN" "DATABASE_URL" }}
+            {{- range $key := list "ANTHROPIC_API_KEY" "OPENAI_API_KEY" "ANTHROPIC_BASE_URL" "OPENAI_BASE_URL" "LC_GATEWAY_KEY" "LANGSMITH_API_KEY" "LANGSMITH_WORKSPACE_ID" "LANGSMITH_RUNS_ENDPOINTS" "SLACK_BOT_TOKEN" "SLACK_APP_TOKEN" "DATABASE_URL" "GITOPS_GITHUB_TOKEN" }}
             - name: {{ $key }}
               valueFrom:
                 secretKeyRef:

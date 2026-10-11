@@ -129,7 +129,7 @@ config:
   diskUsageCriticalPercent: 90
   diskUsageCriticalClearPercent: 85
 
-  # Empty disables public GitHub source/proposal reads. Use verified owner/repo
+  # Empty disables GitHub source/proposal reads. Use trusted owner/repo
   # names separated by commas; proposals never publish remote changes.
   gitopsAllowedRepositories: ""
   # Optional owner/repo -> responsible team metadata.
@@ -156,7 +156,7 @@ config:
 # Use an existing Secret whenever possible. The chart reads the following keys:
 # ANTHROPIC_API_KEY, OPENAI_API_KEY, ANTHROPIC_BASE_URL, OPENAI_BASE_URL,
 # LC_GATEWAY_KEY, LANGSMITH_API_KEY, LANGSMITH_WORKSPACE_ID,
-# LANGSMITH_RUNS_ENDPOINTS, SLACK_BOT_TOKEN, SLACK_APP_TOKEN, DATABASE_URL.
+# LANGSMITH_RUNS_ENDPOINTS, SLACK_BOT_TOKEN, SLACK_APP_TOKEN, DATABASE_URL, GITOPS_GITHUB_TOKEN.
 existingSecret: ""
 
 # Convenience for development. Values are written to a Kubernetes Secret and
@@ -176,6 +176,7 @@ secrets:
   slackBotToken: ""
   slackAppToken: ""
   databaseUrl: ""
+  gitopsGithubToken: ""
 
 extraEnv: []
 extraEnvFrom: []
