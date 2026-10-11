@@ -109,10 +109,10 @@ def test_unhealthy_or_incomplete_current_pod_evidence_stays_active(path, value):
     assert not scheduler._is_recovered_runtime_probe_event(event, pod, NOW)
 
 
-def test_recent_failed_termination_stays_active_even_when_current_container_is_ready():
+def test_prior_failed_termination_does_not_override_current_ready_probe_recovery():
     pod, event = runtime_probe()
     pod.status.container_statuses[0].last_state.terminated.finished_at = NOW - timedelta(minutes=40)
-    assert not scheduler._is_recovered_runtime_probe_event(event, pod, NOW)
+    assert scheduler._is_recovered_runtime_probe_event(event, pod, NOW)
 
 
 @pytest.mark.parametrize("kind,missing_probe", [("Readiness", "readiness_probe"),
