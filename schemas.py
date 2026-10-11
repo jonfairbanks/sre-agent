@@ -90,6 +90,8 @@ class HealthReport(BaseModel):
         description="Concrete, ordered next steps. May be empty.",
     )
 
+    recovered_events: list[str] = Field(default_factory=list, description="Snapshot-backed recovered container events, separate from active findings.")
+
     @property
     def has_issues(self) -> bool:
         return self.overall_severity in ("critical", "warning")

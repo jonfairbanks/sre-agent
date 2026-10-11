@@ -111,6 +111,8 @@ volumes:
     emptyDir: {}
 
 config:
+  # Optional IANA display timezone; empty inherits TZ or the pod local timezone.
+  alertTimezone: ""
   llmProvider: anthropic
   anthropicModel: claude-sonnet-4-6
   anthropicSubagentModel: claude-haiku-4-5-20251001
