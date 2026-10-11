@@ -8,6 +8,8 @@ import re
 import threading
 import uuid
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
+from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
@@ -16,7 +18,7 @@ from typing import Any, Optional
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 from langgraph.types import Command
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
@@ -30,6 +32,7 @@ from config import (
     make_agent_config,
 )
 from response_text import response_text
+from slack_health import SlackRuntimeHealth, SafeSocketLogger, SafeWebLogger, install_socket_health, safe_error_type
 
 load_dotenv()
 
@@ -121,6 +124,10 @@ _notifier = None   # set in lifespan
 _agent = None      # set in lifespan
 _scheduler = None  # set in lifespan
 _db = None         # set in lifespan (persistence.PostgresDatabase | NullDatabase)
+_delivery = None
+_slack_handler = None
+_slack_shutdown = threading.Event()
+_slack_health = SlackRuntimeHealth()
 
 
 def _save(session: Session) -> None:
@@ -460,62 +467,69 @@ def _run_for_slack(text: str, session: Session, client, channel: str, thread_ts:
     except Exception as e:
         session.status = SessionStatus.ERROR
         _save(session)
-        log.exception("Slack agent error (session=%s)", session.id)
-        client.chat_update(channel=channel, ts=thinking["ts"], text=f":red_circle: Error: {e}")
+        log.error("Slack agent failed (%s)", safe_error_type(e))
+        client.chat_update(channel=channel, ts=thinking["ts"], text=":red_circle: Request could not complete. Try again.")
 
 
 def _run_structured_health_check_for_slack(text: str, session: Session, client, channel: str, thread_ts: str):
-    """Serve a health-check mention via the bounded single-model path (no orchestrator).
-
-    This performs a fixed number of steps (zero-token collection + one structured
-    model call) so it can never hit the recursion limit that the full agent does.
-    """
+    """Collect, reconcile, and persist a manual check before report delivery."""
     thinking = client.chat_postMessage(
-        channel=channel,
-        thread_ts=thread_ts,
+        channel=channel, thread_ts=thread_ts,
         text=":mag: Running a cluster health check...",
     )
     try:
-        from scheduler import annotate_with_history, run_structured_health_check
+        from scheduler import run_structured_health_check
+        from health_evidence import reconcile_report
+        from monitor_state import diff_report, serialize_diff
 
-        report, data = run_structured_health_check()
-        # Read-only diff: annotates each finding with age / occurrence count
-        # without advancing the counters, which stay owned by the scheduler so
-        # ad-hoc requests cannot inflate them. Skipped entirely without a
-        # database, since with no history every finding would be labelled NEW
-        # on every run, which is worse than showing no label at all.
-        diff = (
-            annotate_with_history(report, _db)
-            if (_db is not None and _db.available) else None
-        )
-        log.info(
-            "Slack health check complete (session=%s, severity=%s, findings=%d, %s)",
-            session.id, report.overall_severity, len(report.findings),
-            diff.summary_line() if diff else "no history",
-        )
-        if _notifier and _notifier.enabled:
+        # Share observation order with scheduled checks. Manual observations
+        # advance findings, while check_no=0 leaves digest cadence unchanged.
+        lock = _scheduler._check_lock if _scheduler is not None else nullcontext()
+        with lock:
+            report, data = run_structured_health_check()
+            durable = _db is not None and _db.available
+            stored = _db.load_tracked_findings() if durable else {}
+            report = reconcile_report(report, data, stored)
+            now = datetime.now(timezone.utc)
+            diff = diff_report(report, stored, now) if durable else None
+            if durable:
+                notification = None
+                if _notifier and _notifier.enabled:
+                    notification = {
+                        "report": report.model_dump(mode="json"),
+                        "diff": serialize_diff(diff), "source": "slack",
+                        "channel": channel, "thread_ts": thread_ts,
+                        "recovered_probe_events": data.get("recovered_runtime_probe_events", []),
+                    }
+                # A Slack conversation can request several checks. Every
+                # observation needs a separate durable identity.
+                observation_id = f"{session.id}-check-{uuid.uuid4().hex[:12]}"
+                _db.record_monitor_check(observation_id, 0, report, data, diff, now, notification)
+        log.info("Manual Slack health check saved (severity=%s)", report.overall_severity)
+        if durable and _delivery is not None:
+            _delivery.drain_once()
+        elif _notifier and _notifier.enabled and not durable:
             _notifier.send_structured_report(
                 report, source="slack", channel=channel, thread_ts=thread_ts,
-                diff=diff,
+                recovered_probe_events=data.get("recovered_runtime_probe_events", []),
             )
-            # The structured report is posted as its own threaded message; drop the
-            # transient placeholder (best-effort — ignore missing chat:write scope).
+        if _notifier and _notifier.enabled:
             try:
                 client.chat_delete(channel=channel, ts=thinking["ts"])
             except Exception:
                 client.chat_update(channel=channel, ts=thinking["ts"],
-                                   text=":white_check_mark: Health check complete.")
+                                   text="Health check saved. Report delivery will retry if Slack is unavailable.")
         else:
-            client.chat_update(channel=channel, ts=thinking["ts"],
-                               text=report.summary or "(no findings)")
+            client.chat_update(channel=channel, ts=thinking["ts"], text=report.summary or "Health Unknown")
         session.last_response = report.summary
         session.status = SessionStatus.DONE
         _save(session)
-    except Exception as e:
+    except Exception as error:
         session.status = SessionStatus.ERROR
         _save(session)
-        log.exception("Slack health check error (session=%s)", session.id)
-        client.chat_update(channel=channel, ts=thinking["ts"], text=f":red_circle: Error: {e}")
+        log.error("Slack health check failed (%s)", safe_error_type(error))
+        client.chat_update(channel=channel, ts=thinking["ts"],
+                           text=":red_circle: Health check could not complete. Try again.")
 
 
 def _resume_for_slack(command, session: Session, client):
@@ -539,9 +553,9 @@ def _resume_for_slack(command, session: Session, client):
     except Exception as e:
         session.status = SessionStatus.ERROR
         _save(session)
-        log.exception("Slack resume error (session=%s)", session.id)
-        _finalize_hitl_message(session, result_text=f"Error: {e}")
-        client.chat_update(channel=channel, ts=thinking["ts"], text=f":red_circle: Error: {e}")
+        log.error("Slack resume failed (%s)", safe_error_type(e))
+        _finalize_hitl_message(session, result_text="Request could not complete. Try again.")
+        client.chat_update(channel=channel, ts=thinking["ts"], text=":red_circle: Request could not complete. Try again.")
 
 
 # ---------------------------------------------------------------------------
@@ -550,10 +564,11 @@ def _resume_for_slack(command, session: Session, client):
 
 def _start_slack_bolt(main_loop: asyncio.AbstractEventLoop):
     """Start the Slack Bolt Socket Mode handler in a background thread."""
+    global _slack_handler
     bot_token = os.getenv("SLACK_BOT_TOKEN", "")
     app_token = os.getenv("SLACK_APP_TOKEN", "")
     if not bot_token or not app_token:
-        log.info("SLACK_BOT_TOKEN or SLACK_APP_TOKEN not set — Slack Bolt not started")
+        log.info("Slack Socket Mode is disabled: credentials are not configured")
         return
 
     try:
@@ -562,7 +577,11 @@ def _start_slack_bolt(main_loop: asyncio.AbstractEventLoop):
 
         import re
 
-        bolt = App(token=bot_token)
+        if _slack_shutdown.is_set():
+            return
+        bolt = App(token=bot_token, client=getattr(_notifier, "_client", None), logger=SafeWebLogger())
+        from finding_mutes import register_finding_mute_actions
+        register_finding_mute_actions(bolt, _db, _approver_allowed)
 
         @bolt.event("app_mention")
         def handle_mention(event, body, client):
@@ -603,7 +622,7 @@ def _start_slack_bolt(main_loop: asyncio.AbstractEventLoop):
                 session.slack_thread_ts = thread_ts
                 _save(session)
 
-            log.info("Slack mention from %s: %s", event.get("user"), text[:80])
+            log.info("Slack mention received")
             # Submit to executor so this handler returns immediately (prevents Slack retries).
             # Health-check/audit requests use the bounded single-model path so they can
             # never hit the orchestrator's recursion limit; everything else goes to the agent.
@@ -630,7 +649,7 @@ def _start_slack_bolt(main_loop: asyncio.AbstractEventLoop):
                 try:
                     client.chat_postEphemeral(channel=channel_id, user=actor_id, text=text)
                 except Exception:
-                    log.exception("Failed to post ephemeral reply to %s", actor_id)
+                    log.warning("Could not confirm the Slack action")
 
             if not _approver_allowed(actor_id):
                 log.warning(
@@ -742,7 +761,7 @@ def _start_slack_bolt(main_loop: asyncio.AbstractEventLoop):
                 try:
                     acked = _db.ack_report(report_id, MONITOR_ACK_HOURS)
                 except Exception:
-                    log.exception("Ack failed (report=%s)", report_id)
+                    log.warning("Could not save report acknowledgement")
 
             log.info("Slack ack from %s for report %s (%d findings)", actor, report_id, acked)
             if acked:
@@ -765,13 +784,24 @@ def _start_slack_bolt(main_loop: asyncio.AbstractEventLoop):
                         ),
                     )
                 except Exception:
-                    log.exception("Failed to post ephemeral ack reply")
+                    log.warning("Could not confirm report acknowledgement")
 
-        handler = SocketModeHandler(bolt, app_token)
-        log.info("Starting Slack Bolt Socket Mode handler")
-        handler.start()
-    except Exception:
-        log.exception("Slack Bolt failed to start")
+        handler = SocketModeHandler(bolt, app_token, logger=SafeSocketLogger(_slack_health))
+        _slack_handler = handler
+        install_socket_health(handler, _slack_health)
+        if _slack_shutdown.is_set():
+            handler.close()
+            return
+        log.info("Connecting Slack Socket Mode")
+        handler.connect()
+        if _slack_shutdown.is_set():
+            handler.close()
+        else:
+            _slack_health.status()
+    except Exception as error:
+        _slack_health.socket_error(error)
+        _slack_health.socket_state("disconnected")
+        log.error("Slack Socket Mode startup failed (%s)", safe_error_type(error))
 
 
 # ---------------------------------------------------------------------------
@@ -783,7 +813,7 @@ from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _notifier, _agent, _scheduler, _db
+    global _notifier, _agent, _scheduler, _db, _delivery, _slack_health, _slack_handler
 
     from llm import validate_provider_credentials
     validate_provider_credentials()
@@ -796,6 +826,11 @@ async def lifespan(app: FastAPI):
     # 2. Slack notifier
     from slack_notifier import make_notifier
     _notifier = make_notifier()
+    _slack_health = getattr(_notifier, "health", SlackRuntimeHealth())
+    _slack_handler = None
+    _slack_shutdown.clear()
+    from notification_delivery import NotificationDelivery
+    _delivery = NotificationDelivery(_db, _notifier) if _db.available else None
 
     # 3. Slack tool
     from tools.slack import make_slack_notification_tool
@@ -803,20 +838,27 @@ async def lifespan(app: FastAPI):
 
     # 4. Agent (with Slack tool injected)
     from agent import create_sre_agent
+    from tools.incident_history import make_incident_history_tools
+    from tools.timeline import make_incident_timeline_tools
+    from finding_mutes import make_finding_mute_tools
+    history_tools = make_incident_history_tools(_db) + make_incident_timeline_tools(_db) + make_finding_mute_tools(_db)
     _agent = create_sre_agent(
-        extra_tools=[slack_tool], checkpointer=checkpointer, store=store
+        extra_tools=[slack_tool, *history_tools], checkpointer=checkpointer, store=store
     )
 
     # 5. Slack Bolt Socket Mode in background thread
     main_loop = asyncio.get_event_loop()
-    threading.Thread(target=_start_slack_bolt, args=(main_loop,), daemon=True).start()
+    slack_thread = threading.Thread(target=_start_slack_bolt, args=(main_loop,), daemon=True)
+    slack_thread.start()
 
     # 6. Monitoring scheduler. MONITORING_ENABLED is now actually honoured — it
     #    was previously documented and set in the manifest but read by no code,
     #    so scheduled checks ran regardless of the flag.
     from scheduler import MonitoringScheduler
     interval = int(os.getenv("MONITOR_INTERVAL_MINUTES", "30"))
-    _scheduler = MonitoringScheduler(_agent, _notifier, interval_minutes=interval, db=_db)
+    _scheduler = MonitoringScheduler(_agent, _notifier, interval_minutes=interval, db=_db, delivery=_delivery)
+    if _delivery is not None:
+        await _delivery.start()
     if MONITORING_ENABLED:
         await _scheduler.start()
     else:
@@ -825,8 +867,8 @@ async def lifespan(app: FastAPI):
     if _notifier.enabled:
         _notifier.send_alert(
             "ok",
-            "SRE Bot is up",
-            "I'm online and ready to check the cluster. Run a health check from the dashboard or mention me here.",
+            "SRE Bot Is Up",
+            "Notification delivery is online. Run a health check from the dashboard.",
         )
 
     if not _db.available:
@@ -840,14 +882,25 @@ async def lifespan(app: FastAPI):
         interval, _notifier.enabled, _db.kind,
         f"{len(SLACK_APPROVER_IDS)} allowlisted" if SLACK_APPROVER_IDS else "unrestricted",
     )
-    yield
-
-    # Shutdown
-    if _scheduler:
-        await _scheduler.stop()
-    if _db is not None:
-        _db.close()
-    log.info("SRE Bot shutdown")
+    try:
+        yield
+    finally:
+        _slack_shutdown.set()
+        if _scheduler:
+            await _scheduler.stop()
+        if _delivery is not None:
+            await _delivery.stop()
+        if _slack_handler is not None:
+            try:
+                await asyncio.to_thread(_slack_handler.close)
+            except Exception as error:
+                log.warning("Slack Socket Mode shutdown failed (%s)", safe_error_type(error))
+        await asyncio.to_thread(slack_thread.join, 5)
+        _slack_health._client = None
+        _slack_health.socket_state("stopped")
+        if _db is not None:
+            _db.close()
+        log.info("SRE Bot shutdown")
 
 
 app = FastAPI(title="SRE Bot", version="1.0.0", lifespan=lifespan)
@@ -900,11 +953,94 @@ def health():
         "status": "ok",
         "in_cluster": os.path.exists("/var/run/secrets/kubernetes.io/serviceaccount/token"),
         "slack_enabled": _notifier.enabled if _notifier else False,
+        "slack": _slack_health.status(),
         "scheduler_running": _scheduler._running if _scheduler else False,
         "state_backend": _db.kind if _db else "uninitialized",
         "durable_state": _db.available if _db else False,
         "approvals_restricted": bool(SLACK_APPROVER_IDS),
     }
+
+
+@app.get("/api/status")
+def runtime_status():
+    """Operational status may query durable storage; /health remains liveness."""
+    result = health()
+    result["delivery"] = {"available": False}
+    result["recent_monitor_check"] = None
+    result["database_read_healthy"] = False
+    if _db is not None and _db.available:
+        try:
+            result["delivery"] = _db.delivery_status()
+            checks = _db.recent_monitor_checks(since=datetime.now(timezone.utc) - timedelta(days=30), limit=1)
+            result["database_read_healthy"] = True
+            if checks:
+                row = checks[0]
+                report = row.get("report") or {}
+                result["recent_monitor_check"] = {
+                    "observed_at": row.get("observed_at", row.get("created_at")),
+                    "overall_severity": report.get("overall_severity"),
+                    "analysis_valid": report.get("analysis_valid"),
+                    "coverage": [{"area": c.get("area"), "status": c.get("status")} for c in report.get("coverage", [])],
+                }
+        except Exception as error:
+            log.warning("Operational status storage read failed (%s)", safe_error_type(error))
+            result["delivery"] = {"available": False, "error_type": safe_error_type(error)}
+    return result
+
+
+@app.get("/metrics", response_class=PlainTextResponse)
+def runtime_metrics():
+    """Fixed metric names with no resource, request, or identity labels."""
+    status = runtime_status()
+    slack = status["slack"]
+    socket, outbound = slack["socket"], slack["outbound"]
+    values = {
+        "sre_agent_slack_socket_connected": ("gauge", int(socket["connected"])),
+        "sre_agent_slack_socket_errors_total": ("counter", socket["errors"]),
+        "sre_agent_slack_socket_transitions_total": ("counter", socket["transitions"]),
+        "sre_agent_slack_outbound_healthy": ("gauge", int(outbound["state"] == "healthy")),
+        "sre_agent_slack_outbound_successes_total": ("counter", outbound["successes"]),
+        "sre_agent_slack_outbound_failures_total": ("counter", outbound["failures"]),
+        "sre_agent_durable_state_available": ("gauge", int(_db is not None and _db.available)),
+        "sre_agent_scheduler_running": ("gauge", int(_scheduler is not None and _scheduler._running)),
+    }
+    values["sre_agent_database_read_healthy"] = ("gauge", int(status["database_read_healthy"]))
+    if status["database_read_healthy"]:
+        delivery = status["delivery"]
+        values["sre_agent_notifications_pending"] = ("gauge", delivery["pending"])
+        values["sre_agent_notifications_in_flight"] = ("gauge", delivery["in_flight"])
+        oldest = delivery.get("oldest_pending_at")
+        if oldest is not None:
+            values["sre_agent_notification_oldest_pending_age_seconds"] = (
+                "gauge", max(0, (datetime.now(timezone.utc) - oldest).total_seconds()))
+        elif not delivery["pending"] and not delivery["in_flight"]:
+            values["sre_agent_notification_oldest_pending_age_seconds"] = ("gauge", 0)
+        delivered_at = delivery.get("last_delivered_at")
+        if delivered_at is not None:
+            values["sre_agent_notification_last_delivered_timestamp_seconds"] = ("gauge", delivered_at.timestamp())
+        check = status.get("recent_monitor_check")
+        if check is not None:
+            if check.get("observed_at") is not None:
+                values["sre_agent_monitor_last_check_timestamp_seconds"] = ("gauge", check["observed_at"].timestamp())
+            if check.get("analysis_valid") is not None:
+                values["sre_agent_monitor_last_analysis_valid"] = ("gauge", int(check["analysis_valid"]))
+    text = "".join(f"# TYPE {name} {kind}\n{name} {value}\n" for name, (kind, value) in values.items())
+    return PlainTextResponse(text, media_type="text/plain; version=0.0.4")
+
+
+@app.get("/api/findings/ignored")
+def ignored_findings(limit: int = 50):
+    if not 1 <= limit <= 100:
+        raise HTTPException(422, "Limit must be between 1 and 100")
+    if _db is None or not _db.available:
+        raise HTTPException(503, "Finding history is unavailable")
+    try:
+        rows = _db.list_muted_findings(limit=limit)
+    except Exception as error:
+        log.warning("Ignored findings read failed (%s)", safe_error_type(error))
+        raise HTTPException(503, "Finding history is unavailable") from None
+    from tools.incident_history import _safe_history
+    return {"count": len(rows), "findings": _safe_history(rows)}
 
 
 @app.get("/api/audit")

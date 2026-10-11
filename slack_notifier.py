@@ -7,6 +7,7 @@ from typing import Optional
 
 from config import MONITOR_ACK_HOURS
 from monitor_state import humanize_age
+from slack_health import SlackRuntimeHealth, SafeWebLogger, delivery_error, safe_error_type
 
 log = logging.getLogger("sre-agent.slack")
 
@@ -27,6 +28,7 @@ SEVERITY_COLOR = {
 
 class SlackNotifier:
     def __init__(self, bot_token: str, channel: str):
+        self.health = SlackRuntimeHealth()
         self.channel = channel
         # chat.update requires a channel ID, not a name like "#sre_alerts".
         # Cached from the first successful post to self.channel (Slack returns the
@@ -36,10 +38,17 @@ class SlackNotifier:
         if bot_token:
             try:
                 from slack_sdk import WebClient
-                self._client = WebClient(token=bot_token)
+                self._client = WebClient(token=bot_token, logger=SafeWebLogger())
                 log.info("Slack notifier initialized (channel=%s)", channel)
             except Exception as e:
-                log.warning("Failed to init Slack client: %s", e)
+                log.warning("Failed to init Slack client (%s)", safe_error_type(e))
+
+        self.health.outbound_enabled(self._client is not None)
+
+    def _record_outbound(self, error=None):
+        health = getattr(self, "health", None)
+        if health is not None:
+            health.outbound_result(error)
 
     @property
     def enabled(self) -> bool:
@@ -58,7 +67,7 @@ class SlackNotifier:
     ) -> Optional[str]:
         """Send a severity-tagged alert. Returns message ts or None."""
         if not self.enabled:
-            log.info("[SLACK DISABLED] %s | %s: %s", severity.upper(), title, message[:120])
+            log.info("Slack alert skipped: notifier disabled")
             return None
 
         emoji = SEVERITY_EMOJI.get(severity.lower(), ":white_circle:")
@@ -85,6 +94,8 @@ class SlackNotifier:
         diff=None,
         report_id: Optional[str] = None,
         recovered_probe_events: list[dict] | None = None,
+        notification_id: str | None = None,
+        raise_on_error: bool = False,
     ) -> Optional[str]:
         """Render a typed HealthReport directly into Slack Block Kit.
 
@@ -117,19 +128,24 @@ class SlackNotifier:
             active_sevs = {(d.finding.severity or "").lower() for d in diff.active}
             has_critical = "critical" in active_sevs
             has_issues = bool(active_sevs & {"critical", "warning", "info"})
-            recovered = not diff.active and bool(diff.resolved)
+            recovered = (not diff.active and not getattr(diff, "retained", [])
+                         and any(not getattr(r, "suppressed", False) for r in diff.resolved))
         else:
             has_issues = report.has_issues
             has_critical = report.overall_severity == "critical"
             recovered = False
 
+        unknown = (report.overall_severity == "unknown" or not getattr(report, "analysis_valid", True)
+                   or bool(diff is not None and getattr(diff, "retained", [])))
         emoji = (
-            ":red_circle:" if has_critical
+            ":grey_question:" if unknown
+            else ":red_circle:" if has_critical
             else ":large_yellow_circle:" if has_issues
             else ":large_green_circle:"
         )
         title = "Cluster Health Report" + (
-            ": Critical Issues Found" if has_critical
+            ": Health Unknown" if unknown
+            else ": Critical Issues Found" if has_critical
             else ": Issues Found" if has_issues
             else ": Recovered" if recovered
             else ": All Clear"
@@ -147,6 +163,14 @@ class SlackNotifier:
         ]
 
         attachments = []
+        incomplete = [c for c in getattr(report, "coverage", []) if c.status != "complete"]
+        if incomplete:
+            text = "\n".join(f"• {c.area}: {c.status}" for c in incomplete)
+            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "*Collection Coverage*\n" + text}})
+        if diff is not None and getattr(diff, "retained", []):
+            retained = "\n".join(f"• *{r.title}* ({r.severity})" for r in diff.retained)
+            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": _trunc(
+                "*Unverified Findings*\nCurrent evidence is incomplete.\n" + retained, 2700)}})
 
         def _status_prefix(delta) -> str:
             """Lead each finding with what changed about it since the last check."""
@@ -171,9 +195,15 @@ class SlackNotifier:
             for f in report.findings:
                 grouped.setdefault((f.severity or "").lower(), []).append(f)
 
+        # Leave room for report metadata and evidence within Slack's block limit.
+        finding_budget = 40
+        total_findings = sum(len(group) for group in grouped.values())
+        omitted_findings = max(0, total_findings - finding_budget)
+        rendered_findings = 0
         # One attachment per severity group, in priority order.
         for sev in ("critical", "warning", "info"):
-            group = grouped.get(sev) or []
+            group = (grouped.get(sev) or [])[:max(0, finding_budget - rendered_findings)]
+            rendered_findings += len(group)
             if not group:
                 continue
             sev_emoji = SEVERITY_EMOJI.get(sev, ":white_circle:")
@@ -184,21 +214,23 @@ class SlackNotifier:
                 ns = f" · `{f.namespace}`" if f.namespace else ""
                 prefix = _status_prefix(item) if diff is not None else ""
                 lines.append(f"• {prefix}*{f.title}*{ns}: {f.detail}")
-            attachments.append({
-                "color": color,
-                "blocks": [{
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": _trunc(f"{sev_emoji} *{sev.upper()}*\n" + "\n".join(lines), 2700),
-                    },
-                }],
-            })
+            severity_blocks = [{"type": "section", "text": {
+                "type": "mrkdwn", "text": _trunc(f"{sev_emoji} *{sev.upper()}*\n" + "\n".join(lines), 2700)}}]
+            if report_id and diff is not None:
+                from finding_mutes import build_ignore_accessory
+                severity_blocks = []
+                for index, (item, line) in enumerate(zip(group, lines)):
+                    heading = f"{sev_emoji} *{sev.upper()}*\n" if index == 0 else ""
+                    severity_blocks.append({"type": "section", "text": {
+                        "type": "mrkdwn", "text": _trunc(heading + line, 2700)},
+                        "accessory": build_ignore_accessory(report_id, item.fingerprint)})
+            attachments.append({"color": color, "blocks": severity_blocks})
 
-        if diff is not None and diff.resolved:
+        visible_resolved = [r for r in diff.resolved if not getattr(r, "suppressed", False)] if diff is not None else []
+        if visible_resolved:
             lines = [
                 f"• *{r.title}*" + (f" · `{r.namespace}`" if r.namespace else "")
-                for r in diff.resolved
+                for r in visible_resolved
             ]
             attachments.append({
                 "color": "#38a169",
@@ -279,7 +311,11 @@ class SlackNotifier:
         if diff is not None:
             context_bits.append(diff.summary_line())
             if diff.suppressed:
-                context_bits.append(f"{len(diff.suppressed)} acked (hidden)")
+                context_bits.append(f"{len(diff.suppressed)} muted (hidden)")
+        if omitted_findings:
+            context_bits.append(
+                f"{omitted_findings} findings omitted. Ask for incident history to see the complete report."
+            )
         attachments.append({
             "color": "#2d3748",
             "blocks": [{
@@ -296,13 +332,20 @@ class SlackNotifier:
         }
         if thread_ts:
             post_kwargs["thread_ts"] = thread_ts
+        if notification_id:
+            post_kwargs["client_msg_id"] = notification_id
         try:
             resp = self._client.chat_postMessage(**post_kwargs)
             if not channel:  # posted to the default channel — cache its resolved ID
                 self._channel_id = resp.get("channel") or self._channel_id
-            return resp["ts"]
+            message_ts = resp["ts"]
+            self._record_outbound()
+            return message_ts
         except Exception as e:
-            log.error("Slack post failed: %s", e)
+            self._record_outbound(e)
+            log.error("Slack post failed (%s)", safe_error_type(e))
+            if raise_on_error:
+                raise delivery_error(e) from None
             return None
 
     def send_health_report(
@@ -405,9 +448,12 @@ class SlackNotifier:
                 text=f"{emoji} {title}",
                 attachments=attachments,
             )
-            return resp["ts"]
+            message_ts = resp["ts"]
+            self._record_outbound()
+            return message_ts
         except Exception as e:
-            log.error("Slack post failed: %s", e)
+            self._record_outbound(e)
+            log.error("Slack post failed (%s)", safe_error_type(e))
             return None
 
     def send_hitl_request(
@@ -489,8 +535,10 @@ class SlackNotifier:
                     ],
                 }],
             )
+            self._record_outbound()
         except Exception as e:
-            log.warning("Failed to mark HITL processing: %s", e)
+            self._record_outbound(e)
+            log.warning("Failed to mark HITL processing (%s)", safe_error_type(e))
 
     def update_hitl_resolved(
         self,
@@ -531,8 +579,10 @@ class SlackNotifier:
                     ],
                 }],
             )
+            self._record_outbound()
         except Exception as e:
-            log.warning("Failed to update HITL message: %s", e)
+            self._record_outbound(e)
+            log.warning("Failed to update HITL message (%s)", safe_error_type(e))
 
     # ------------------------------------------------------------------
     # Internal
@@ -552,9 +602,12 @@ class SlackNotifier:
                 attachments=[{"color": color, "blocks": blocks}],
             )
             self._channel_id = resp.get("channel") or self._channel_id
-            return resp["ts"]
+            message_ts = resp["ts"]
+            self._record_outbound()
+            return message_ts
         except Exception as e:
-            log.error("Slack post failed: %s", e)
+            self._record_outbound(e)
+            log.error("Slack post failed (%s)", safe_error_type(e))
             return None
 
 

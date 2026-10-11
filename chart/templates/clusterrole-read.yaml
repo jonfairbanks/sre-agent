@@ -28,6 +28,13 @@ rules:
   - apiGroups: ["autoscaling"]
     resources: ["horizontalpodautoscalers"]
     verbs: ["get", "list", "watch"]
+  # Read only the custom resources needed for source mappings and timelines.
+  - apiGroups: ["argoproj.io"]
+    resources: ["applications"]
+    verbs: ["get", "list"]
+  - apiGroups: ["secrets.hashicorp.com"]
+    resources: ["vaultstaticsecrets", "vaultdynamicsecrets", "vaultauths", "vaultconnections"]
+    verbs: ["get", "list"]
   - apiGroups: ["keda.sh"]
     resources: ["scaledobjects"]
     verbs: ["get"]

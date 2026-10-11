@@ -70,6 +70,18 @@ spec:
               value: {{ .Values.config.monitorNotifyOnResolved | quote }}
             - name: MONITOR_ACK_HOURS
               value: {{ .Values.config.monitorAckHours | quote }}
+            - name: PVC_USAGE_ALERT_PERCENT
+              value: {{ .Values.config.pvcUsageAlertPercent | quote }}
+            - name: DISK_USAGE_CLEAR_PERCENT
+              value: {{ .Values.config.diskUsageClearPercent | quote }}
+            - name: DISK_USAGE_CRITICAL_PERCENT
+              value: {{ .Values.config.diskUsageCriticalPercent | quote }}
+            - name: DISK_USAGE_CRITICAL_CLEAR_PERCENT
+              value: {{ .Values.config.diskUsageCriticalClearPercent | quote }}
+            - name: GITOPS_ALLOWED_REPOSITORIES
+              value: {{ .Values.config.gitopsAllowedRepositories | quote }}
+            - name: GITOPS_REPOSITORY_OWNERSHIP
+              value: {{ .Values.config.gitopsRepositoryOwnership | toJson | quote }}
             - name: LANGSMITH_TRACING
               value: {{ .Values.config.langsmithTracing | quote }}
             - name: LANGCHAIN_TRACING_V2

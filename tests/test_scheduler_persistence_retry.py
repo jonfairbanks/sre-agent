@@ -24,7 +24,7 @@ class DatabaseWithOneTransientFailure:
     def load_tracked_findings(self):
         return {}
 
-    def apply_diff(self, diff, now):
+    def record_monitor_check(self, session_id, check_no, report, data, diff, now, notification=None):
         self.applied.append(diff)
 
 

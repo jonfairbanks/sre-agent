@@ -30,11 +30,15 @@ def test_recovered_probe_evidence_does_not_force_a_notification(
     monkeypatch.setattr(scheduler, "MONITOR_DIGEST_EVERY_N_CHECKS", 12)
     monkeypatch.setattr(scheduler, "MONITOR_NOTIFY_ON_RESOLVED", True)
     applied, posts, alerts = [], [], []
+
+    def record(session_id, check_no, report, data, diff, now, notification):
+        applied.append(diff)
+        if notification:
+            posts.append(notification)
     database = SimpleNamespace(
         available=True, next_check_number=lambda: check,
         load_tracked_findings=lambda: {},
-        apply_diff=lambda diff, now: applied.append(diff),
-        save_report=lambda fingerprints: "report-1",
+        record_monitor_check=record,
     )
     notifier = SimpleNamespace(
         enabled=True,
@@ -48,7 +52,7 @@ def test_recovered_probe_evidence_does_not_force_a_notification(
     assert len(applied) == 1
     assert len(posts) == expected_posts
     if posts:
-        assert posts[0][0] is report
-        assert posts[0][1]["recovered_probe_events"] == recovered
-        assert bool(posts[0][1]["diff"].active) is active
-        assert posts[0][1]["source"] == ("scheduled" if active else "scheduled digest")
+        assert posts[0]["recovered_probe_events"] == recovered
+        from monitor_state import deserialize_diff
+        assert bool(deserialize_diff(posts[0]["diff"]).active) is active
+        assert posts[0]["source"] == ("scheduled" if active else "scheduled digest")

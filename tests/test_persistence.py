@@ -28,7 +28,7 @@ pytestmark = pytest.mark.skipif(
     not TEST_DSN, reason="TEST_DATABASE_URL not set"
 )
 
-NOW = datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc)
+NOW = datetime.now(timezone.utc)
 
 
 @pytest.fixture(scope="module")
@@ -45,7 +45,7 @@ def clean(db):
     """Each test starts from an empty schema."""
     with db._pool.connection() as conn:
         conn.execute(
-            "TRUNCATE sessions, hitl_audit, finding_state, monitor_reports, monitor_meta"
+            "TRUNCATE sessions, hitl_audit, finding_state, monitor_reports, monitor_meta, monitor_checks, finding_observations, notification_outbox"
         )
     yield
 

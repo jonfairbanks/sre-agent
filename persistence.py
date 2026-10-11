@@ -17,12 +17,14 @@ mode is live so the degradation is never silent.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
+import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-from monitor_state import ReportDiff, StoredFinding
+from monitor_state import ReportDiff, StoredFinding, serialize_diff
 
 log = logging.getLogger("sre-agent.persistence")
 
@@ -93,6 +95,51 @@ CREATE TABLE IF NOT EXISTS monitor_meta (
     key   text PRIMARY KEY,
     value text
 );
+ALTER TABLE finding_state ADD COLUMN IF NOT EXISTS ignored_until timestamptz;
+ALTER TABLE finding_state ADD COLUMN IF NOT EXISTS ignored_forever boolean NOT NULL DEFAULT false;
+
+CREATE TABLE IF NOT EXISTS monitor_checks (
+    session_id text PRIMARY KEY,
+    check_no bigint NOT NULL,
+    observed_at timestamptz NOT NULL,
+    analysis_valid boolean NOT NULL,
+    coverage jsonb NOT NULL,
+    report jsonb NOT NULL,
+    diff jsonb NOT NULL
+);
+CREATE INDEX IF NOT EXISTS monitor_checks_time_idx ON monitor_checks (observed_at DESC);
+CREATE TABLE IF NOT EXISTS finding_observations (
+    session_id text NOT NULL,
+    observed_at timestamptz NOT NULL,
+    check_no bigint NOT NULL,
+    fingerprint text NOT NULL,
+    status text NOT NULL,
+    severity text NOT NULL,
+    title text NOT NULL DEFAULT '',
+    namespace text NOT NULL DEFAULT '',
+    kind text NOT NULL DEFAULT '',
+    resource_name text NOT NULL DEFAULT '',
+    reason text NOT NULL DEFAULT '',
+    detail text NOT NULL DEFAULT '',
+    PRIMARY KEY (session_id, fingerprint)
+);
+CREATE INDEX IF NOT EXISTS finding_observations_history_idx
+    ON finding_observations (fingerprint, observed_at DESC);
+CREATE TABLE IF NOT EXISTS notification_outbox (
+    id text PRIMARY KEY,
+    session_id text NOT NULL UNIQUE,
+    payload jsonb NOT NULL,
+    status text NOT NULL DEFAULT 'pending',
+    attempts integer NOT NULL DEFAULT 0,
+    created_at timestamptz NOT NULL,
+    next_attempt_at timestamptz NOT NULL,
+    lease_until timestamptz,
+    delivered_at timestamptz,
+    message_ts text,
+    last_error_type text
+);
+CREATE INDEX IF NOT EXISTS notification_outbox_due_idx
+    ON notification_outbox (next_attempt_at) WHERE status <> 'delivered';
 """
 
 # How far back a resolved finding is still remembered. Keeps flap detection
@@ -147,6 +194,34 @@ class NullDatabase:
 
     def next_check_number(self) -> int:
         return 0
+
+    def record_monitor_check(self, session_id, check_no, report, data, diff, now, notification):
+        return None
+
+    def recent_monitor_checks(self, since=None, namespace='', limit=20):
+        return []
+
+    def finding_history(self, fingerprint, limit=20):
+        return []
+
+    def claim_pending_notifications(self, now, limit=10):
+        return []
+
+    def mark_notification_delivered(self, notification_id, message_ts, now, *, attempts=None):
+        pass
+
+    def reschedule_notification(self, notification_id, error_type, now, retry_after_seconds, *, attempts=None):
+        pass
+
+    def delivery_status(self):
+        return {'available': False, 'pending': 0, 'in_flight': 0,
+                'oldest_pending_at': None, 'last_delivered_at': None}
+
+    def mute_report_finding(self, report_id, fingerprint_hash, hours, forever=False):
+        return False
+
+    def list_muted_findings(self, limit=50):
+        return []
 
 
 class PostgresDatabase:
@@ -282,11 +357,12 @@ class PostgresDatabase:
             cur = conn.execute(
                 """
                 SELECT fingerprint, severity, title, namespace, first_seen,
-                       last_seen, times_seen, resolved_at, ack_until
+                       last_seen, times_seen, resolved_at, ack_until,
+                       kind, resource_name, reason, detail, ignored_until, ignored_forever
                   FROM finding_state
                  WHERE resolved_at IS NULL
                     OR resolved_at > now() - make_interval(days => %s)
-                    OR ack_until > now()
+                    OR ack_until > now() OR ignored_until > now() OR ignored_forever
                 """,
                 (_RESOLVED_RETENTION_DAYS,),
             )
@@ -303,70 +379,81 @@ class PostgresDatabase:
                 times_seen=r["times_seen"],
                 resolved_at=r["resolved_at"],
                 ack_until=r["ack_until"],
+                kind=r['kind'], resource_name=r['resource_name'],
+                reason=r['reason'], detail=r['detail'],
+                ignored_until=r['ignored_until'], ignored_forever=r['ignored_forever'],
+                mute_expired=(not r['ignored_forever'] and r['ignored_until'] is not None
+                              and r['ignored_until'] <= datetime.now(timezone.utc)),
             )
             for r in rows
         }
 
     def apply_diff(self, diff: ReportDiff, now: Optional[datetime] = None) -> None:
-        """Persist the outcome of one monitoring run, atomically."""
+        """Persist finding transitions without altering unverified incidents."""
         now = now or datetime.now(timezone.utc)
+        with self._pool.connection() as conn, conn.transaction():
+            self._apply_diff_on_connection(conn, diff, now)
+
+    def _apply_diff_on_connection(self, conn, diff, now):
         seen = diff.active + diff.suppressed
+        for delta in seen:
+            f = delta.finding
+            conn.execute(
+                """
+                INSERT INTO finding_state (
+                    fingerprint, namespace, kind, resource_name, reason,
+                    severity, title, detail, first_seen, last_seen,
+                    times_seen, resolved_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL)
+                ON CONFLICT (fingerprint) DO UPDATE SET
+                    namespace     = EXCLUDED.namespace,
+                    kind          = EXCLUDED.kind,
+                    resource_name = EXCLUDED.resource_name,
+                    reason        = EXCLUDED.reason,
+                    severity      = EXCLUDED.severity,
+                    title         = EXCLUDED.title,
+                    detail        = EXCLUDED.detail,
+                    last_seen     = EXCLUDED.last_seen,
+                    times_seen    = EXCLUDED.times_seen,
+                    resolved_at   = NULL,
+                    ignored_until = CASE WHEN NOT finding_state.ignored_forever
+                        AND finding_state.ignored_until <= EXCLUDED.last_seen
+                        THEN NULL ELSE finding_state.ignored_until END,
+                    -- A finding that had been resolved and came back
+                    -- restarts its clock; one that never closed keeps
+                    -- the earliest first_seen we know about.
+                    first_seen    = CASE
+                        WHEN finding_state.resolved_at IS NOT NULL
+                            THEN EXCLUDED.first_seen
+                        ELSE LEAST(finding_state.first_seen, EXCLUDED.first_seen)
+                    END
+                """,
+                (
+                    delta.fingerprint,
+                    getattr(f, "namespace", "") or "",
+                    getattr(f, "kind", "") or "",
+                    getattr(f, "resource_name", "") or "",
+                    getattr(f, "reason", "") or "",
+                    f.severity,
+                    (getattr(f, "title", "") or "")[:500],
+                    (getattr(f, "detail", "") or "")[:4000],
+                    delta.first_seen,
+                    now,
+                    delta.times_seen,
+                ),
+            )
 
-        with self._pool.connection() as conn:
-            with conn.transaction():
-                for delta in seen:
-                    f = delta.finding
-                    conn.execute(
-                        """
-                        INSERT INTO finding_state (
-                            fingerprint, namespace, kind, resource_name, reason,
-                            severity, title, detail, first_seen, last_seen,
-                            times_seen, resolved_at
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL)
-                        ON CONFLICT (fingerprint) DO UPDATE SET
-                            namespace     = EXCLUDED.namespace,
-                            kind          = EXCLUDED.kind,
-                            resource_name = EXCLUDED.resource_name,
-                            reason        = EXCLUDED.reason,
-                            severity      = EXCLUDED.severity,
-                            title         = EXCLUDED.title,
-                            detail        = EXCLUDED.detail,
-                            last_seen     = EXCLUDED.last_seen,
-                            times_seen    = EXCLUDED.times_seen,
-                            resolved_at   = NULL,
-                            -- A finding that had been resolved and came back
-                            -- restarts its clock; one that never closed keeps
-                            -- the earliest first_seen we know about.
-                            first_seen    = CASE
-                                WHEN finding_state.resolved_at IS NOT NULL
-                                    THEN EXCLUDED.first_seen
-                                ELSE LEAST(finding_state.first_seen, EXCLUDED.first_seen)
-                            END
-                        """,
-                        (
-                            delta.fingerprint,
-                            getattr(f, "namespace", "") or "",
-                            getattr(f, "kind", "") or "",
-                            getattr(f, "resource_name", "") or "",
-                            getattr(f, "reason", "") or "",
-                            f.severity,
-                            (getattr(f, "title", "") or "")[:500],
-                            (getattr(f, "detail", "") or "")[:4000],
-                            delta.first_seen,
-                            now,
-                            delta.times_seen,
-                        ),
-                    )
-
-                if diff.resolved:
-                    conn.execute(
-                        """
-                        UPDATE finding_state
-                           SET resolved_at = %s
-                         WHERE fingerprint = ANY(%s)
-                        """,
-                        (now, [r.fingerprint for r in diff.resolved]),
-                    )
+        if diff.resolved:
+            conn.execute(
+                """
+                UPDATE finding_state
+                   SET resolved_at = %s,
+                       ignored_until = CASE WHEN NOT ignored_forever AND ignored_until <= %s
+                           THEN NULL ELSE ignored_until END
+                 WHERE fingerprint = ANY(%s)
+                """,
+                (now, now, [r.fingerprint for r in diff.resolved]),
+            )
 
     def save_report(self, fingerprints: list[str]) -> Optional[str]:
         """Record which fingerprints a posted report covered; return its id."""
@@ -404,6 +491,171 @@ class PostgresDatabase:
                 (until, fingerprints),
             )
             return cur.rowcount
+
+    def record_monitor_check(self, session_id, check_no, report, data, diff, now, notification):
+        """Commit an observation, its state changes and its alert in one transaction.
+
+        The session ID makes a retry idempotent. Raw collection data is deliberately
+        omitted from history; it may contain logs or resource configuration.
+        """
+        from psycopg.types.json import Jsonb
+
+        report_json = report.model_dump(mode='json')
+        diff_json = serialize_diff(diff)
+        notification_id = str(uuid.uuid4()) if notification else None
+        with self._pool.connection() as conn, conn.transaction():
+            inserted = conn.execute(
+                '''INSERT INTO monitor_checks
+                   (session_id, check_no, observed_at, analysis_valid, coverage, report, diff)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING RETURNING session_id''',
+                (session_id, check_no, now, report.analysis_valid, Jsonb(report_json.get('coverage', [])),
+                 Jsonb(report_json), Jsonb(diff_json)),
+            ).fetchone()
+            if not inserted:
+                row = conn.execute('SELECT id FROM notification_outbox WHERE session_id=%s',
+                                   (session_id,)).fetchone()
+                return row['id'] if row else None
+            self._apply_diff_on_connection(conn, diff, now)
+            for status in ('new', 'escalated', 'ongoing', 'suppressed', 'resolved', 'retained'):
+                for entry in getattr(diff, status):
+                    finding = getattr(entry, 'finding', entry)
+                    conn.execute(
+                        '''INSERT INTO finding_observations
+                           (session_id,check_no,observed_at,fingerprint,status,severity,title,
+                            namespace,kind,resource_name,reason,detail)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)''',
+                        (session_id, check_no, now, entry.fingerprint, status, finding.severity,
+                         finding.title[:500], getattr(finding, 'namespace', '') or '',
+                         getattr(finding, 'kind', '') or '', getattr(finding, 'resource_name', '') or '',
+                         getattr(finding, 'reason', '') or '', (getattr(finding, 'detail', '') or '')[:4000]),
+                    )
+            if notification:
+                report_id = uuid.uuid4().hex[:12]
+                covered = list(dict.fromkeys(d.fingerprint for d in diff.active + diff.suppressed + diff.retained))
+                conn.execute('INSERT INTO monitor_reports(report_id,created_at,fingerprints) VALUES (%s,%s,%s)',
+                             (report_id, now, Jsonb(covered)))
+                payload = {**notification, 'report_id': report_id}
+                conn.execute(
+                    '''INSERT INTO notification_outbox
+                       (id,session_id,payload,created_at,next_attempt_at) VALUES (%s,%s,%s,%s,%s)''',
+                    (notification_id, session_id, Jsonb(payload), now, now),
+                )
+            cutoff = now - timedelta(days=30)
+            conn.execute('DELETE FROM finding_observations WHERE observed_at < %s', (cutoff,))
+            conn.execute('DELETE FROM monitor_checks WHERE observed_at < %s', (cutoff,))
+            conn.execute("DELETE FROM notification_outbox WHERE status='delivered' AND delivered_at < %s", (cutoff,))
+            # Keep report references for pending alerts, even after history retention.
+            conn.execute('''DELETE FROM monitor_reports r WHERE created_at < %s
+                            AND NOT EXISTS (SELECT 1 FROM notification_outbox o
+                              WHERE o.status <> 'delivered' AND o.payload->>'report_id'=r.report_id)''', (cutoff,))
+        return notification_id
+
+    def recent_monitor_checks(self, since=None, namespace='', limit=20):
+        since = since or datetime.now(timezone.utc) - timedelta(days=1)
+        with self._pool.connection() as conn:
+            return conn.execute(
+                '''SELECT * FROM monitor_checks c WHERE observed_at >= %s
+                   AND (%s='' OR EXISTS (SELECT 1 FROM finding_observations f
+                       WHERE f.session_id=c.session_id AND f.namespace=%s))
+                   ORDER BY observed_at DESC,session_id DESC LIMIT %s''',
+                (since, namespace, namespace, max(1, min(int(limit), 100))),
+            ).fetchall()
+
+    def finding_history(self, fingerprint, limit=20):
+        with self._pool.connection() as conn:
+            return conn.execute(
+                '''SELECT * FROM finding_observations WHERE fingerprint=%s
+                   ORDER BY observed_at DESC,session_id DESC LIMIT %s''',
+                (fingerprint, max(1, min(int(limit), 100))),
+            ).fetchall()
+
+    def claim_pending_notifications(self, now, limit=10):
+        """Lease due work atomically; expired leases can be retried after a restart."""
+        with self._pool.connection() as conn, conn.transaction():
+            return conn.execute(
+                '''WITH due AS (
+                       SELECT id FROM notification_outbox
+                       WHERE (status='pending' AND next_attempt_at <= %s)
+                          OR (status='sending' AND lease_until <= %s)
+                       ORDER BY next_attempt_at,id FOR UPDATE SKIP LOCKED LIMIT %s
+                   ) UPDATE notification_outbox o
+                     SET status='sending', attempts=attempts+1, lease_until=%s
+                     FROM due WHERE o.id=due.id RETURNING o.id,o.payload,o.attempts''',
+                (now, now, max(1, min(int(limit), 100)), now + timedelta(minutes=2)),
+            ).fetchall()
+
+    def mark_notification_delivered(self, notification_id, message_ts, now, *, attempts=None):
+        with self._pool.connection() as conn:
+            row = conn.execute(
+                """UPDATE notification_outbox SET status='delivered', delivered_at=%s,
+                   message_ts=%s,lease_until=NULL,last_error_type=NULL
+                   WHERE id=%s AND status='sending' AND (%s::integer IS NULL OR attempts=%s)
+                   RETURNING id""",
+                (now, message_ts, notification_id, attempts, attempts),
+            ).fetchone()
+        return row is not None
+
+    def reschedule_notification(self, notification_id, error_type, now, retry_after_seconds, *, attempts=None):
+        safe_type = re.sub(r'[^A-Za-z0-9_]', '', str(error_type))[:80] or 'DeliveryError'
+        delay = max(1, min(float(retry_after_seconds), 86400))
+        with self._pool.connection() as conn:
+            row = conn.execute(
+                """UPDATE notification_outbox SET status='pending', next_attempt_at=%s,
+                   lease_until=NULL,last_error_type=%s WHERE id=%s AND status='sending'
+                   AND (%s::integer IS NULL OR attempts=%s) RETURNING id""",
+                (now + timedelta(seconds=delay), safe_type, notification_id, attempts, attempts),
+            ).fetchone()
+        return row is not None
+
+    def delivery_status(self):
+        with self._pool.connection() as conn:
+            row = conn.execute(
+                '''SELECT count(*) FILTER (WHERE status='pending') AS pending,
+                   count(*) FILTER (WHERE status='sending') AS in_flight,
+                   min(created_at) FILTER (WHERE status <> 'delivered') AS oldest_pending_at,
+                   max(delivered_at) AS last_delivered_at FROM notification_outbox''',
+            ).fetchone()
+        return {'available': True, **row}
+
+    def mute_report_finding(self, report_id, fingerprint_hash, hours, forever=False):
+        """Resolve an opaque Slack value only against its report's covered findings."""
+        if hours is not None and type(hours) is not int:
+            return False
+        if (forever and hours not in (None, 0)) or (not forever and hours not in (0, 1, 8, 24, 168)):
+            return False
+        if not re.fullmatch(r'[a-f0-9]{64}', fingerprint_hash):
+            return False
+        now = datetime.now(timezone.utc)
+        with self._pool.connection() as conn, conn.transaction():
+            row = conn.execute('SELECT fingerprints FROM monitor_reports WHERE report_id=%s',
+                               (report_id,)).fetchone()
+            if not row:
+                return False
+            matches = [fp for fp in row['fingerprints']
+                       if hashlib.sha256(fp.encode()).hexdigest() == fingerprint_hash]
+            if len(matches) != 1:
+                return False
+            unignore = not forever and hours == 0
+            until = None if forever else now + timedelta(hours=hours)
+            row = conn.execute(
+                '''UPDATE finding_state SET ignored_until=%s,ignored_forever=%s,
+                   ack_until=CASE WHEN %s THEN NULL ELSE ack_until END
+                   WHERE fingerprint=%s AND (resolved_at IS NULL OR %s) RETURNING fingerprint''',
+                (until, forever, unignore, matches[0], unignore),
+            ).fetchone()
+            return row is not None
+
+    def list_muted_findings(self, limit=50):
+        with self._pool.connection() as conn:
+            return conn.execute(
+                '''SELECT f.fingerprint,f.namespace,f.kind,f.resource_name AS name,
+                   f.reason,f.title,f.severity,f.ignored_until,f.ignored_forever,f.resolved_at,
+                   (SELECT r.report_id FROM monitor_reports r
+                    WHERE r.fingerprints ? f.fingerprint ORDER BY r.created_at DESC LIMIT 1) AS report_id
+                   FROM finding_state f WHERE ignored_forever OR ignored_until > now()
+                   ORDER BY f.last_seen DESC LIMIT %s''',
+                (max(1, min(int(limit), 100)),),
+            ).fetchall()
 
     # -- meta -------------------------------------------------------------
 

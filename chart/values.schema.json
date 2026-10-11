@@ -17,7 +17,16 @@
       "type": "object",
       "required": ["llmProvider"],
       "properties": {
-        "llmProvider": { "type": "string", "enum": ["anthropic", "openai"] }
+        "llmProvider": { "type": "string", "enum": ["anthropic", "openai"] },
+        "pvcUsageAlertPercent": { "type": "number", "minimum": 0, "maximum": 100 },
+        "diskUsageClearPercent": { "type": "number", "minimum": 0, "maximum": 100 },
+        "diskUsageCriticalPercent": { "type": "number", "minimum": 0, "maximum": 100 },
+        "diskUsageCriticalClearPercent": { "type": "number", "minimum": 0, "maximum": 100 },
+        "gitopsAllowedRepositories": { "type": "string" },
+        "gitopsRepositoryOwnership": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        }
       }
     },
     "rbac": {

@@ -122,6 +122,16 @@ config:
   monitorDigestEveryNChecks: 12
   monitorNotifyOnResolved: true
   monitorAckHours: 24
+  pvcUsageAlertPercent: 70
+  diskUsageClearPercent: 65
+  diskUsageCriticalPercent: 90
+  diskUsageCriticalClearPercent: 85
+
+  # Empty disables public GitHub source/proposal reads. Use verified owner/repo
+  # names separated by commas; proposals never publish remote changes.
+  gitopsAllowedRepositories: ""
+  # Optional owner/repo -> responsible team metadata.
+  gitopsRepositoryOwnership: {}
 
   langsmithTracing: false
   langsmithProject: sre-agent

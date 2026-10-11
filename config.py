@@ -87,9 +87,11 @@ ANTHROPIC_PROMPT_CACHING = PROMPT_CACHING and LLM_PROVIDER == "anthropic"
 # Durable state
 # ---------------------------------------------------------------------------
 # Postgres DSN backing the langgraph checkpointer/store, the session table, the
-# HITL audit log, and monitoring finding-state. When unset the process falls
+# HITL audit log, monitoring finding-state, 30-day check/history records, and
+# Slack delivery outbox. When unset the process falls
 # back to in-memory equivalents (fine for `python main.py` locally, but pending
-# HITL approvals and monitoring state do NOT survive a restart).
+# HITL approvals and monitoring state do NOT survive a restart). Persistent
+# finding ignores, history, and delivery retries are unavailable in this mode.
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 # ---------------------------------------------------------------------------
@@ -114,7 +116,8 @@ MONITOR_NOTIFY_ON_RESOLVED = os.getenv("MONITOR_NOTIFY_ON_RESOLVED", "true").low
 # channel still proves the bot is alive. 0 disables the digest entirely.
 MONITOR_DIGEST_EVERY_N_CHECKS = int(os.getenv("MONITOR_DIGEST_EVERY_N_CHECKS", "12"))
 
-# How long the Slack "Ack" button suppresses a finding from notifications.
+# Report-level Ack duration. Individual finding ignores have fixed durations
+# (1h, 8h, 1d, 1wk, forever) and do not stop tracking or resolution.
 MONITOR_ACK_HOURS = int(os.getenv("MONITOR_ACK_HOURS", "24"))
 
 # ---------------------------------------------------------------------------
@@ -129,6 +132,12 @@ SLACK_APPROVER_IDS = {
     uid.strip() for uid in os.getenv("SLACK_APPROVER_IDS", "").split(",") if uid.strip()
 }
 
+
+# Disk hysteresis is validated in health_evidence.py: PVC_USAGE_ALERT_PERCENT,
+# DISK_USAGE_CLEAR_PERCENT, DISK_USAGE_CRITICAL_PERCENT, and
+# DISK_USAGE_CRITICAL_CLEAR_PERCENT. GitOps tools read GITOPS_ALLOWED_REPOSITORIES
+# and optional GITOPS_REPOSITORY_OWNERSHIP at call time. Empty allowlist disables
+# public GitHub source/proposal reads; tools never publish changes.
 
 def make_agent_config(thread_id: str) -> dict:
     """Build the langgraph invoke config for an agent run.
