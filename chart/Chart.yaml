@@ -2,8 +2,8 @@ apiVersion: v2
 name: sre-agent
 description: Kubernetes SRE agent with provider-selectable LLMs and approval-gated remediation
 type: application
-version: 0.1.6
-appVersion: "0.1.6"
+version: 0.1.7
+appVersion: "0.1.7"
 home: https://github.com/jonfairbanks/sre-agent
 sources:
   - https://github.com/jonfairbanks/sre-agent

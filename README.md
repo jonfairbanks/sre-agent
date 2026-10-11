@@ -96,7 +96,8 @@ python api.py         # API + web UI at http://localhost:8080
 | `DISK_USAGE_CLEAR_PERCENT` | No | Disk findings clear below this percentage (default: `65`) |
 | `DISK_USAGE_CRITICAL_PERCENT` | No | Disk critical entry threshold (default: `90`) |
 | `DISK_USAGE_CRITICAL_CLEAR_PERCENT` | No | Critical disk findings step down below this percentage (default: `85`) |
-| `GITOPS_ALLOWED_REPOSITORIES` | No | Comma-separated verified public GitHub `owner/repo` names; empty disables source reads and proposals |
+| `GITOPS_ALLOWED_REPOSITORIES` | No | Comma-separated trusted GitHub `owner/repo` names; empty disables source reads and proposals |
+| `GITOPS_GITHUB_TOKEN` | No | Optional GitHub token for private source reads. Use a fine-grained token restricted to allowlisted repositories with Contents read-only permission; store it in the existing Secret. |
 | `GITOPS_REPOSITORY_OWNERSHIP` | No | Optional JSON object mapping repository names to responsible teams; metadata only |
 | `DASHBOARD_URL` | No | HTTP(S) dashboard URL used for the Slack startup link. Helm: `config.dashboardUrl`. Unset or invalid URLs leave the word as plain text. |
 | `ALERT_TIMEZONE` | No | IANA timezone for report timestamps. Falls back to `TZ`, then the pod local timezone (usually UTC). Invalid values are skipped. |
@@ -424,8 +425,12 @@ Grafana data and omits raw event messages, resource bodies, and secret values.
 
 `get_argocd_application` reports source mappings and sync/health state. Enable
 `get_gitops_source` and `propose_gitops_change` by setting
-`GITOPS_ALLOWED_REPOSITORIES` to verified public GitHub `owner/repo` names; the
-empty default disables them. Optional `GITOPS_REPOSITORY_OWNERSHIP` records
+`GITOPS_ALLOWED_REPOSITORIES` to trusted GitHub `owner/repo` names; the
+empty default disables them. HTTPS and GitHub SSH source URLs map to the same
+repository identity. Private repository reads require `GITOPS_GITHUB_TOKEN` in
+the existing Secret. Use a fine-grained token with Contents read-only permission
+for only the allowed repositories. Requests stay on `api.github.com` and reject
+redirects. The token is never included in tool output. Optional `GITOPS_REPOSITORY_OWNERSHIP` records
 responsible teams without granting repository access.
 
 A proposal requires an exact current 40-character base SHA, a mapped source

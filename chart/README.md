@@ -81,8 +81,13 @@ The reader role includes `get` and `list` on Argo Applications and the four
 VSO resource types used by incident timelines. It does not add Secret access.
 
 `config.gitopsAllowedRepositories` defaults to empty, disabling GitHub source
-reads and change proposals. Set a comma-separated list of verified public
+reads and change proposals. Set a comma-separated list of verified trusted
 GitHub `owner/repo` names to enable them. `config.gitopsRepositoryOwnership`
 is an optional YAML object mapping those names to their responsible teams.
 Ownership metadata does not grant access. Proposals return an exact base SHA
 and a unified diff; they do not commit, open a PR, or apply a change.
+
+For private GitHub sources, add `GITOPS_GITHUB_TOKEN` to the existing Secret.
+Use a fine-grained token with Contents read-only permission for only the
+allowlisted repositories. HTTPS and GitHub SSH sources are supported; source
+reads and proposals never publish changes.

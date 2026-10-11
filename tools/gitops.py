@@ -1,4 +1,4 @@
-"""Read Argo state and prepare public-GitHub diffs without publishing."""
+"""Read Argo state and prepare GitHub diffs without publishing."""
 import base64
 import difflib
 import json
@@ -23,13 +23,33 @@ def _result(payload):
 
 
 def _repo(url):
-    parsed = urlsplit(url)
-    if parsed.scheme != 'https' or parsed.netloc != 'github.com' or parsed.query or parsed.fragment:
-        raise ValueError('Only HTTPS github.com repository sources are supported')
-    path = parsed.path.removesuffix('.git').strip('/')
+    if not isinstance(url, str) or any(c.isspace() for c in url) or '?' in url or '#' in url:
+        raise ValueError('Invalid GitHub repository URL')
+    if url.startswith('git@github.com:'):
+        path = url.removeprefix('git@github.com:')
+    else:
+        parsed = urlsplit(url)
+        if parsed.query or parsed.fragment:
+            raise ValueError('Invalid GitHub repository URL')
+        if parsed.scheme == 'https' and parsed.netloc == 'github.com':
+            path = parsed.path.removeprefix('/')
+        elif parsed.scheme == 'ssh' and parsed.netloc == 'git@github.com':
+            path = parsed.path.removeprefix('/')
+        else:
+            raise ValueError('Only canonical HTTPS or Git SSH github.com sources are supported')
+    path = path.removesuffix('.git')
     if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', path) or any(p in ('.', '..') for p in path.split('/')):
         raise ValueError('Invalid GitHub repository path')
     return path
+
+
+def _source_url(url, repository):
+    if repository:
+        return 'https://github.com/' + repository
+    parsed = urlsplit(url)
+    if parsed.scheme == 'https' and not (parsed.username or parsed.password or parsed.query or parsed.fragment):
+        return url
+    return '[UNAVAILABLE]'
 
 
 def _path(path):
@@ -53,12 +73,11 @@ def _sources(application):
     result = []
     for source in sources[:20]:
         entry = {k: source[k] for k in ('path', 'chart', 'targetRevision', 'ref') if k in source}
-        source_url = urlsplit(source.get('repoURL', ''))
-        entry['repoURL'] = source.get('repoURL') if source_url.scheme == 'https' and not (source_url.username or source_url.password or source_url.query or source_url.fragment) else '[UNAVAILABLE]'
         try:
             entry['repository'] = _repo(source.get('repoURL', ''))
         except ValueError:
             entry['repository'] = None
+        entry['repoURL'] = _source_url(source.get('repoURL', ''), entry['repository'])
         entry['value_files'] = []
         for filename in source.get('helm', {}).get('valueFiles', [])[:50]:
             if filename.startswith('$'):
@@ -91,7 +110,15 @@ def _github(repository, endpoint):
     if repository not in _allowed() or not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repository):
         raise ValueError('Repository is not in GITOPS_ALLOWED_REPOSITORIES')
     url = f'https://api.github.com/repos/{repository}/{endpoint}'
-    request = Request(url, headers={'Accept': 'application/vnd.github+json', 'User-Agent': 'sre-agent-readonly'})
+    if any(part in ('.', '..') for part in repository.split('/')):
+        raise ValueError('Invalid GitHub repository path')
+    headers = {'Accept': 'application/vnd.github+json', 'User-Agent': 'sre-agent-readonly'}
+    token = os.getenv('GITOPS_GITHUB_TOKEN', '')
+    if token:
+        if any(ord(c) < 32 or ord(c) == 127 for c in token):
+            raise ValueError('Invalid GitHub authentication configuration')
+        headers['Authorization'] = 'Bearer ' + token
+    request = Request(url, headers=headers, method='GET')
     with build_opener(_NoRedirect).open(request, timeout=10) as response:
         payload = response.read(_MAX_BYTES * 4 + 1)
     if len(payload) > _MAX_BYTES * 4:
@@ -200,7 +227,7 @@ def _read_source(repository, path, commit):
 
 @tool
 def get_gitops_source(application: str, repository: str, path: str, namespace: str = 'argocd') -> str:
-    """Read one allowed public GitHub YAML source mapped by Argo, returning its exact commit for a reviewable proposal. Refuses sensitive content."""
+    """Read one allowed GitHub YAML source mapped by Argo, returning its exact commit for a reviewable proposal. Refuses sensitive content."""
     try:
         path = _path(path)
         candidates = _mapped_sources(_application(application, namespace), repository, path)
@@ -217,7 +244,7 @@ def get_gitops_source(application: str, repository: str, path: str, namespace: s
 def propose_gitops_change(application: str, repository: str, path: str, base_commit: str,
                           old_text: str, new_text: str, reasoning: str, evidence: str,
                           namespace: str = 'argocd') -> str:
-    """Prepare a unified diff against an exact public GitHub commit mapped by Argo. Replaces one unique match; never commits, opens a PR, or writes to the cluster."""
+    """Prepare a unified diff against an exact GitHub commit mapped by Argo. Replaces one unique match; never commits, opens a PR, or writes to the cluster."""
     try:
         path = _path(path)
         if not re.fullmatch(r'[0-9a-f]{40}', base_commit):
