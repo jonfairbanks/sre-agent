@@ -48,6 +48,7 @@ def container(ready=True, restarts=0, waiting=None,
         return NS(reason=reason, exit_code=exit_code,
                   finished_at=NOW - timedelta(minutes=mins_ago))
     return NS(
+        name="app",
         ready=ready,
         restart_count=restarts,
         state=NS(waiting=NS(reason=waiting) if waiting else None,
@@ -105,12 +106,12 @@ def test_stuck_waiting_reasons_are_unhealthy(reason):
     assert status == reason
 
 
-def test_recent_oomkill_is_unhealthy_even_though_running_again():
+def test_recent_oomkill_is_history_after_running_and_ready():
     p = pod(containers=[container(ready=True, restarts=3,
                                   last_terminated=("OOMKilled", 137, 5))])
     unhealthy, status, _ = _classify_pod(p, NOW)
-    assert unhealthy is True
-    assert "OOMKilled" in status
+    assert unhealthy is False
+    assert status == "Running"
 
 
 def test_old_oomkill_is_no_longer_current():
@@ -121,9 +122,9 @@ def test_old_oomkill_is_no_longer_current():
     assert _classify_pod(p, NOW)[0] is False
 
 
-def test_nonzero_exit_counts_as_failure_even_with_an_odd_reason():
+def test_unknown_nonzero_termination_is_history_after_running_and_ready():
     p = pod(containers=[container(ready=True, last_terminated=("Unknown", 1, 5))])
-    assert _classify_pod(p, NOW)[0] is True
+    assert _classify_pod(p, NOW)[0] is False
 
 
 def test_running_but_not_ready_past_grace_is_unhealthy():
@@ -200,7 +201,7 @@ def test_healthy_pods_restart_history_is_not_sent_to_the_model(reason, ago):
 
 
 @pytest.mark.parametrize("reason,exit_code", [("Error", 1), ("OOMKilled", 137)])
-def test_recovered_failure_ages_out_of_the_snapshot(reason, exit_code):
+def test_recovered_failure_is_context_without_active_fault(reason, exit_code):
     p = pod(containers=[container(restarts=37, last_terminated=(reason, exit_code, 0))])
 
     def snapshot_after(minutes):
@@ -209,17 +210,21 @@ def test_recovered_failure_ages_out_of_the_snapshot(reason, exit_code):
         row.update(extra)
         return _format_snapshot(base_data(pods=[row], unhealthy_pods=[row] if unhealthy else []))
 
-    # Keep reporting the failure through the configured window, then drop it
-    # even though Kubernetes still reports the same lifetime restart count.
+    # Readiness confirms recovery immediately. The context window can still
+    # retain the prior termination without promoting it to an active fault.
     for minutes in (5, POD_FAILURE_RECENCY_MINUTES):
         out = snapshot_after(minutes)
-        assert f"Restarted/{reason}" in out
-        assert "restarts=37" in out
+        assert "all 1 pods healthy" in out
+        assert "Recovered Container Terminations (History)" in out
+        assert f"reason={reason}" in out
+        assert "UNHEALTHY PODS" not in out
+        assert "restarts=37" not in out
     for minutes in (POD_FAILURE_RECENCY_MINUTES + 1, 2 * 24 * 60, 9 * 30 * 24 * 60):
         out = snapshot_after(minutes)
         assert "all 1 pods healthy" in out
         assert "api-1" not in out
         assert "restarts=" not in out
+
 
 
 @pytest.mark.parametrize("waiting", ["CrashLoopBackOff", "ImagePullBackOff"])

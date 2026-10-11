@@ -270,7 +270,7 @@ def diff_report(
     for fp, prev in stored.items():
         if fp in current or prev.resolved_at is not None:
             continue
-        if not _can_resolve(report, fp):
+        if not _can_resolve(report, fp, prev):
             diff.retained.append(prev)
             continue
         if not prev.is_ignored(now) and prev.is_acked(now):
@@ -310,16 +310,20 @@ def humanize_age(delta: Optional[timedelta]) -> str:
     return f"{s // 86400}d"
 
 
-def _can_resolve(report, fp: str) -> bool:
+def _can_resolve(report, fp: str, previous: StoredFinding | None = None) -> bool:
     """Resolve only after successful analysis and the relevant collection."""
     if not getattr(report, "analysis_valid", True):
         return False
     coverage = getattr(report, "coverage", [])
-    if not coverage:
-        return True
-    states = {item.area: item.status for item in coverage}
     reason = fp.rsplit(":", 1)[-1]
     kind = fp.split("/")[1] if "/" in fp else ""
+    unknown_pod = reason == "unknown" and (
+        (previous is not None and previous.kind.lower() == "pod")
+        or kind in {"pod", "deployment", "daemonset", "statefulset", "replicaset", "job", "cronjob"}
+    )
+    if not coverage:
+        return not unknown_pod
+    states = {item.area: item.status for item in coverage}
     disk_reasons = {"nodefilesystemusage", "pvcusage", "localfilesystemusage"}
     pod_reasons = {"crashloopbackoff", "imagepullbackoff", "errimagepull", "invalidimagename",
                    "createcontainerconfigerror", "createcontainererror", "errimageneverpull",
@@ -331,7 +335,7 @@ def _can_resolve(report, fp: str) -> bool:
         required = ["nodes"]
         if "node_readiness" in states:
             required.append("node_readiness")
-    elif reason in pod_reasons:
+    elif reason in pod_reasons or unknown_pod:
         required = ["pods"]
     elif kind == "deployment" and reason == "unavailable":
         required = ["deployments"]

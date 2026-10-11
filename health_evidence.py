@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from monitor_state import fingerprint
 from schemas import CollectionCoverage, Finding, HealthReport
@@ -36,6 +38,62 @@ def collection_coverage(data: dict) -> list[CollectionCoverage]:
     return coverage
 
 
+
+def _termination_detail(record: dict) -> str:
+    """Render source time separately from the Kubernetes reason token."""
+    container = record.get("container") or "(name unavailable)"
+    stamp = record.get("finished_at")
+    finished = None
+    if isinstance(stamp, str) and len(stamp) <= 80:
+        try:
+            finished = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+            if finished.utcoffset() is None:
+                finished = None
+        except (ValueError, OverflowError):
+            pass
+    if finished is None:
+        text = f"Container {container}: termination time unavailable."
+    else:
+        exact = finished.astimezone(timezone.utc).isoformat()
+        try:
+            pacific = finished.astimezone(ZoneInfo("America/Los_Angeles"))
+            clock = pacific.strftime("%I:%M:%S %p").lstrip("0")
+            when = f"{pacific.strftime('%b')} {pacific.day}, {pacific.year:04d} at {clock} {pacific.tzname()}"
+        except (ValueError, OverflowError):
+            when = exact
+        age = record.get("minutes_ago")
+        age_text = f" ({age}m ago)" if isinstance(age, int) and not isinstance(age, bool) and 0 <= age <= 5_256_000 else ""
+        text = f"Container {container} last terminated {when}{age_text}."
+    reason = record.get("reason")
+    if reason == "Unknown":
+        text += " Kubernetes reason: Unknown (no specific reason supplied)."
+    elif reason:
+        text += f" Kubernetes reason: {reason}."
+    else:
+        text += " Kubernetes reason unavailable."
+    return text
+
+
+def _pod_evidence_detail(pod: dict) -> str:
+    current = pod.get("current_termination_records") or []
+    current_failures = [record for record in current if record.get("reason") in
+                        {"OOMKilled", "Error", "ContainerCannotRun", "DeadlineExceeded", "Evicted"}
+                        or (record.get("reason") != "Completed" and (record.get("exit_code") or 0) != 0)]
+    records = current_failures or current or pod.get("last_termination_records") or []
+    if not records and any(pod.get(key) is not None for key in
+                           ("last_termination", "last_exit_code", "last_termination_finished_at")):
+        records = [{"container": pod.get("last_termination_container"),
+                    "reason": pod.get("last_termination"), "exit_code": pod.get("last_exit_code"),
+                    "signal": pod.get("last_signal"), "finished_at": pod.get("last_termination_finished_at"),
+                    "minutes_ago": pod.get("last_termination_min_ago")}]
+    if not records:
+        return f"Current pod state: {pod['status']}. No container termination evidence is available."
+    details = [_termination_detail(record) for record in records[:4]]
+    if len(records) > 4:
+        details.append(f"{len(records) - 4} other containers share this latest termination observation.")
+    return f"Current pod state: {pod['status']}. " + " ".join(details)
+
+
 def reconcile_report(report: HealthReport, data: dict, stored: dict | None = None) -> HealthReport:
     """Derive factual findings and preserve independent model observations."""
     stored = stored or {}
@@ -61,8 +119,10 @@ def reconcile_report(report: HealthReport, data: dict, stored: dict | None = Non
     for pod in data.get("unhealthy_pods", []):
         reason = pod.get("status", "NotReady").removeprefix("Restarted/")
         add("Pod", pod["name"], pod["namespace"], reason, "critical",
-            f"Current pod evidence: {pod['status']}; last termination: {pod.get('last_termination') or 'none'}.",
+            _pod_evidence_detail(pod),
             pod.get("owner_kind", ""), pod.get("owner_name", ""))
+        if pod.get("status") == "Restarted/Unknown":
+            facts[-1].title = f"Recent Container Restart on {pod['name']}"
     for hpa in data.get("hpas", []):
         keda = hpa.get("keda") or {}
         for condition in hpa.get("conditions", []):
@@ -119,16 +179,33 @@ def reconcile_report(report: HealthReport, data: dict, stored: dict | None = Non
     fact_ids = {fingerprint(f) for f in facts}
     fact_resources = {(f.kind.lower(), f.namespace, f.resource_name) for f in facts}
     known_pods = {(p["namespace"], p["name"]) for p in data.get("pods", [])}
+    recovered_resources = set()
+    for pod in data.get("pods", []):
+        if pod.get("status") == "Running" and pod.get("ready") is True:
+            identity = Finding(severity="info", title="", detail="", kind="Pod", namespace=pod["namespace"],
+                               resource_name=pod["name"], owner_kind=pod.get("owner_kind", ""),
+                               owner_name=pod.get("owner_name", ""), reason="History")
+            recovered_resources.add(fingerprint(identity).rsplit(":", 1)[0])
+            direct = identity.model_copy(update={"owner_kind": "", "owner_name": ""})
+            recovered_resources.add(fingerprint(direct).rsplit(":", 1)[0])
     known_hpas = {(h["namespace"], h["name"]): h for h in data.get("hpas", [])}
     pod_reasons = {"CrashLoopBackOff", "ImagePullBackOff", "ErrImagePull", "InvalidImageName",
                    "CreateContainerConfigError", "CreateContainerError", "ErrImageNeverPull",
-                   "Failed", "Pending", "NotReady", "OOMKilled", "Error", "ContainerCannotRun",
+                   "Failed", "Pending", "NotReady", "OOMKilled", "Error", "Unknown", "ContainerCannotRun",
                    "DeadlineExceeded", "Evicted"}
     model = []
+    dropped_history = False
     for finding in report.findings:
         if finding.evidence_source == "snapshot":
             continue
         resource = (finding.kind.lower(), finding.namespace, finding.resource_name)
+        recovered = fingerprint(finding).rsplit(":", 1)[0] in recovered_resources
+        restart_claim = (finding.reason.removeprefix("Restarted/") in {"Unknown", "Error", "OOMKilled"}
+                         or "restart" in finding.reason.lower() or "termination" in finding.reason.lower()
+                         or "restart" in finding.title.lower())
+        if recovered and restart_claim:
+            dropped_history = True
+            continue
         if (finding.kind.lower() == "pod" and (finding.namespace, finding.resource_name) in known_pods
                 and finding.reason.removeprefix("Restarted/") in pod_reasons):
             continue
@@ -160,7 +237,11 @@ def reconcile_report(report: HealthReport, data: dict, stored: dict | None = Non
     incomplete = any(c.status != "complete" for c in coverage) or not report.analysis_valid
     severity = max((f.severity for f in findings), key={"info": 1, "warning": 2, "critical": 3}.get, default="unknown" if incomplete else "ok")
     summary = report.summary
+    actions = report.recommended_actions
+    if dropped_history:
+        summary = f"{len(findings)} active findings remain; highest severity is {severity}." if findings else "No active issues found."
+        actions = []
     if incomplete and not findings:
         summary = "Health is unknown because collection or analysis is incomplete. Open incidents remain tracked."
     return report.model_copy(update={"findings": findings, "coverage": coverage, "summary": summary,
-                                     "overall_severity": severity})
+                                     "overall_severity": severity, "recommended_actions": actions})

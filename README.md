@@ -98,7 +98,7 @@ python api.py         # API + web UI at http://localhost:8080
 | `DISK_USAGE_CRITICAL_CLEAR_PERCENT` | No | Critical disk findings step down below this percentage (default: `85`) |
 | `GITOPS_ALLOWED_REPOSITORIES` | No | Comma-separated verified public GitHub `owner/repo` names; empty disables source reads and proposals |
 | `GITOPS_REPOSITORY_OWNERSHIP` | No | Optional JSON object mapping repository names to responsible teams; metadata only |
-| `POD_FAILURE_RECENCY_MINUTES` | No | Recovered failures drop out after this many minutes (default: `240`, or 4 hours). Set this variable to override the window. Lifetime restart counts alone are not reported; active faults still are. |
+| `POD_FAILURE_RECENCY_MINUTES` | No | Lookback for failed Pods (default: `240`, or 4 hours). Running, Ready pods treat prior terminations as history; active container faults still alert. |
 | `POD_STARTUP_GRACE_MINUTES` | No | Grace before Pending or not-ready counts as a fault (default: `10`) |
 | `EVENT_MAX_AGE_MINUTES` | No | Warning events older than this are dropped (default: `60`) |
 | `DATABASE_URL` | No | Postgres DSN for sessions, findings, ignores, 30-day check history and Slack delivery retries. Unset = in-memory; persistent features are unavailable |
@@ -353,6 +353,12 @@ container identities match, every container is healthy, none restarted after the
 warning, the node is Ready, and at least one minute and the nominal probe retry
 window have passed without recurrence. Repeated warnings, recent failed
 terminations, and missing or uncertain evidence remain eligible for analysis.
+A Running pod with all containers Ready is recovered. Its previous termination
+remains historical evidence, even within the four-hour lookback. Active waiting
+failures, failed Pods and non-ready containers still alert. Findings with
+termination evidence show the container and recorded termination time in Pacific
+time. A Kubernetes reason of `Unknown` does not make a known time unavailable.
+
 Recovered probe events stay in the collected evidence and appear separately in
 scheduled reports or digests; they do not trigger a notification on their own.
 Slack's **First Seen** label means the checker first identified a finding, not

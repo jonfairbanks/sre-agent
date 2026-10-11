@@ -57,8 +57,8 @@ FAILURE_TERMINATION_REASONS = {
 }
 
 # How recently a *failed* termination must have happened to still count as a
-# current problem. Restart count alone cannot distinguish a crashloop from a
-# healthy redeploy, so recency plus failure reason is used instead.
+# current problem while a pod is still failed or unready. Ready, Running pods
+# have recovered; recent terminations remain historical context.
 POD_FAILURE_RECENCY_MINUTES = int(os.getenv("POD_FAILURE_RECENCY_MINUTES", "240"))
 
 # Grace period before Pending or not-ready is treated as a fault, so pods that
@@ -215,12 +215,23 @@ def _classify_pod(pod, now) -> tuple[bool, str, dict]:
 
     # Most recent termination across containers, and whether it was a fault.
     last_reason, last_exit, last_ago = None, None, float("inf")
+    terminations = []
     for cs in statuses:
         for state in (getattr(cs, "last_state", None), cs.state):
             term = getattr(state, "terminated", None) if state else None
             if not term:
                 continue
-            ago = _minutes_since(term.finished_at, now)
+            finished_at = term.finished_at if _known_timestamp(term.finished_at) else None
+            ago = _minutes_since(finished_at, now)
+            terminations.append({
+                "container": getattr(cs, "name", None),
+                "current": state is cs.state,
+                "reason": term.reason,
+                "exit_code": term.exit_code,
+                "signal": getattr(term, "signal", None),
+                "finished_at": finished_at.astimezone(timezone.utc).isoformat() if finished_at else None,
+                "minutes_ago": None if ago == float("inf") else round(ago),
+            })
             if ago < last_ago:
                 last_ago, last_reason, last_exit = ago, term.reason, term.exit_code
 
@@ -229,10 +240,27 @@ def _classify_pod(pod, now) -> tuple[bool, str, dict]:
         or (last_reason != "Completed" and (last_exit or 0) != 0)
     )
 
+    # Keep every container sharing the latest observation. Sort only the
+    # evidence, preserving the existing classification and recency rules.
+    known = [item for item in terminations if item["finished_at"] is not None]
+    latest_stamp = max((item["finished_at"] for item in known), default=None)
+    latest = ([item for item in known if item["finished_at"] == latest_stamp]
+              if known else terminations)
+    unique = {tuple(item.items()): item for item in latest}
+    latest = sorted(unique.values(), key=lambda item: (item["container"] or "", str(item["reason"] or "")))
+    selected = latest[0] if latest else {}
     extra = {
         "ready": ready,
-        "last_termination": last_reason,
-        "last_exit_code": last_exit,
+        "last_termination": selected.get("reason", last_reason),
+        "last_exit_code": selected.get("exit_code", last_exit),
+        "last_signal": selected.get("signal"),
+        "last_termination_container": selected.get("container"),
+        "last_termination_finished_at": selected.get("finished_at"),
+        "last_termination_records": latest,
+        "current_termination_records": sorted(
+            [item for item in terminations if item["current"]],
+            key=lambda item: (item["container"] or "", str(item["reason"] or "")),
+        ),
         "last_termination_min_ago": None if last_ago == float("inf") else round(last_ago),
     }
 
@@ -241,6 +269,15 @@ def _classify_pod(pod, now) -> tuple[bool, str, dict]:
         waiting = getattr(cs.state, "waiting", None) if cs.state else None
         if waiting and waiting.reason in UNHEALTHY_WAITING_REASONS:
             return True, waiting.reason, extra
+
+    # A current failed container state is active evidence, even if another
+    # container has a newer, recovered last_state termination.
+    if phase == "Running":
+        for record in extra["current_termination_records"]:
+            reason, exit_code = record["reason"], record["exit_code"]
+            if (reason in FAILURE_TERMINATION_REASONS
+                    or (reason != "Completed" and (exit_code or 0) != 0)):
+                return True, reason or "Error", extra
 
     # 2. Failed pod, but only while the failure is still recent. Job pods that
     #    failed weeks ago and were never garbage collected are not today's problem.
@@ -259,8 +296,11 @@ def _classify_pod(pod, now) -> tuple[bool, str, dict]:
     if not ready and age_minutes > POD_STARTUP_GRACE_MINUTES:
         return True, "NotReady", extra
 
-    # 5. Recently failed and came back: flapping, still worth reporting.
-    if failed_termination and last_ago <= POD_FAILURE_RECENCY_MINUTES:
+    # 5. A current failed termination or an unready container is still a fault.
+    # A prior failed termination alone is history once Running containers are Ready.
+    current_termination = any(getattr(cs.state, "terminated", None) for cs in statuses if cs.state)
+    if (failed_termination and last_ago <= POD_FAILURE_RECENCY_MINUTES
+            and (phase != "Running" or not ready or current_termination)):
         return True, f"Restarted/{last_reason}", extra
 
     # Healthy. Lifetime restart counts and recovered old failures are history.
@@ -858,9 +898,29 @@ def _format_snapshot(data: dict) -> str:
         total = len(data["pods"])
         lines.append(f"\n=== PODS === all {total} pods healthy")
 
-    # Do not send healthy pods' lifetime restart history to the model. It can
-    # turn even explicitly historical context into a fresh finding every check.
-    # Recent failed terminations and active faults are already included above.
+    recovered = [p for p in data["pods"]
+                 if p.get("status") == "Running" and p.get("ready") is True
+                 and isinstance(p.get("last_termination_min_ago"), (int, float))
+                 and 0 <= p["last_termination_min_ago"] <= POD_FAILURE_RECENCY_MINUTES
+                 and (p.get("last_termination") in FAILURE_TERMINATION_REASONS
+                      or (p.get("last_termination") != "Completed" and (p.get("last_exit_code") or 0) != 0))]
+    if recovered:
+        lines.append("\n=== Recovered Container Terminations (History) ===")
+        lines.append("  These pods are Running and Ready. Prior terminations are not active faults.")
+        for pod in sorted(recovered, key=lambda p: (p["namespace"], p["name"]))[:10]:
+            records = pod.get("last_termination_records") or [{
+                "container": pod.get("last_termination_container"),
+                "finished_at": pod.get("last_termination_finished_at"),
+                "reason": pod.get("last_termination"),
+            }]
+            for record in records[:4]:
+                lines.append(f"  {pod['namespace']}/{pod['name']} container={record.get('container') or '?'} "
+                             f"finishedAt={record.get('finished_at') or 'unavailable'} "
+                             f"reason={record.get('reason') or 'unavailable'} now=Running/Ready")
+
+
+    # Keep lifetime restart counts and old failures outside model context.
+    # The bounded history above preserves recent source timestamps and readiness.
 
     # Busiest pods. Capped at 10 so a large cluster cannot inflate the prompt,
     # and so a hot-but-healthy pod is still visible to the analysis step.
@@ -1068,6 +1128,9 @@ def _health_prompt(snapshot: str) -> tuple[str, str]:
         "and produce a structured health report. Focus on actionable issues and name "
         "specific resources. Skip healthy resources. Lifetime restart counts alone "
         "are not findings; do not report recovered historical restarts. "
+        "A Running pod whose containers are Ready has recovered even when its prior "
+        "termination was Error, OOMKilled, or Unknown within the last four hours. "
+        "Recovered Container Terminations are history, not active faults. "
         "Warning events are historical observations, not proof of a current fault. "
         "Use their counts, ages, and current pod state to distinguish recurrence "
         "from isolated warnings. Do not infer resource exhaustion or a storage "
