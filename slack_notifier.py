@@ -4,6 +4,8 @@ import logging
 import os
 import re
 from typing import Optional
+from urllib.parse import quote, urlsplit
+from html import escape
 
 from config import MONITOR_ACK_HOURS
 from monitor_state import humanize_age
@@ -24,6 +26,23 @@ SEVERITY_COLOR = {
     "info": "#3182ce",
     "ok": "#38a169",
 }
+
+
+def dashboard_link() -> str:
+    """Render an optional configured dashboard URL as a Slack link."""
+    url = os.getenv("DASHBOARD_URL", "").strip()
+    if not url or len(url) > 2048 or any(ord(char) < 32 or ord(char) == 127 for char in url):
+        return "dashboard"
+    try:
+        parsed = urlsplit(url)
+        if (parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password
+                or any(char.isspace() for char in parsed.hostname)):
+            return "dashboard"
+        parsed.port  # Reject invalid ports before publishing a link.
+    except ValueError:
+        return "dashboard"
+    encoded = quote(url, safe=":/?#[]@!$&'()*+,;=%")
+    return f"<{escape(encoded, quote=False)}|dashboard>"
 
 
 class SlackNotifier:

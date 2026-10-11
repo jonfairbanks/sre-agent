@@ -84,7 +84,8 @@ def test_startup_injects_history_tools_and_manages_delivery(api_state, monkeypat
     monkeypatch.setattr(llm, "validate_provider_credentials", lambda: None)
     db = Mock(available=durable, kind="postgres" if durable else "memory")
     monkeypatch.setattr(persistence, "init_persistence", lambda url: ("checkpoint", "store", db))
-    notifier = Mock(enabled=False, health=SlackRuntimeHealth())
+    monkeypatch.setenv("DASHBOARD_URL", "https://example.com/sre/")
+    notifier = Mock(enabled=True, health=SlackRuntimeHealth())
     monkeypatch.setattr(slack_notifier, "make_notifier", lambda: notifier)
     created = {}
     def create_agent(**kwargs):
@@ -117,6 +118,10 @@ def test_startup_injects_history_tools_and_manages_delivery(api_state, monkeypat
                 assert deliveries[0].started
         if durable:
             assert deliveries[0].stopped
+        notifier.send_alert.assert_called_once_with(
+            "ok", "SRE Bot Is Up",
+            "Notification delivery is online. Run a health check from the <https://example.com/sre/|dashboard>.",
+        )
         db.close.assert_called_once()
         assert api._slack_health.status()["socket"]["state"] == "stopped"
     asyncio.run(run())

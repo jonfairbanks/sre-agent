@@ -138,6 +138,8 @@ config:
   langsmithTracing: false
   langsmithProject: sre-agent
   slackChannel: "#sre-alerts"
+  # Public or private HTTP(S) URL reachable by dashboard users.
+  dashboardUrl: ""
   slackApproverIds: ""
 
   defaultNamespaces: ""

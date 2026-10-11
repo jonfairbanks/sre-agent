@@ -94,6 +94,10 @@ spec:
               value: {{ .Values.config.langsmithProject | quote }}
             - name: LANGCHAIN_PROJECT
               value: {{ .Values.config.langsmithProject | quote }}
+            {{- if .Values.config.dashboardUrl }}
+            - name: DASHBOARD_URL
+              value: {{ .Values.config.dashboardUrl | quote }}
+            {{- end }}
             - name: SLACK_CHANNEL
               value: {{ .Values.config.slackChannel | quote }}
             - name: SLACK_APPROVER_IDS
