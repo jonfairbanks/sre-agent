@@ -98,6 +98,7 @@ python api.py         # API + web UI at http://localhost:8080
 | `DISK_USAGE_CRITICAL_CLEAR_PERCENT` | No | Critical disk findings step down below this percentage (default: `85`) |
 | `GITOPS_ALLOWED_REPOSITORIES` | No | Comma-separated verified public GitHub `owner/repo` names; empty disables source reads and proposals |
 | `GITOPS_REPOSITORY_OWNERSHIP` | No | Optional JSON object mapping repository names to responsible teams; metadata only |
+| `ALERT_TIMEZONE` | No | IANA timezone for report timestamps. Falls back to `TZ`, then the pod local timezone (usually UTC). Invalid values are skipped. |
 | `POD_FAILURE_RECENCY_MINUTES` | No | Lookback for failed Pods (default: `240`, or 4 hours). Running, Ready pods treat prior terminations as history; active container faults still alert. |
 | `POD_STARTUP_GRACE_MINUTES` | No | Grace before Pending or not-ready counts as a fault (default: `10`) |
 | `EVENT_MAX_AGE_MINUTES` | No | Warning events older than this are dropped (default: `60`) |
@@ -356,8 +357,13 @@ terminations, and missing or uncertain evidence remain eligible for analysis.
 A Running pod with all containers Ready is recovered. Its previous termination
 remains historical evidence, even within the four-hour lookback. Active waiting
 failures, failed Pods and non-ready containers still alert. Findings with
-termination evidence show the container and recorded termination time in Pacific
-time. A Kubernetes reason of `Unknown` does not make a known time unavailable.
+termination evidence show the container and recorded termination time in the configured display timezone. A Kubernetes reason of `Unknown` does not make a known time unavailable.
+Recent recovered terminations appear separately under **Recovered Container Events**
+in scheduled and on-demand reports. They do not raise severity or trigger extra
+notifications. Previously alerted incidents still receive resolved callouts.
+Set `ALERT_TIMEZONE` or the Helm `config.alertTimezone` value to an IANA timezone,
+or inherit the deployment's `TZ` or local timezone. Kubernetes does not expose a
+standard cluster-wide timezone; configure the pod from your cluster's desired settings.
 
 Recovered probe events stay in the collected evidence and appear separately in
 scheduled reports or digests; they do not trigger a notification on their own.

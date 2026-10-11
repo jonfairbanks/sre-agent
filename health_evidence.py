@@ -3,8 +3,9 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from health_history import recovered_termination_details
 from monitor_state import fingerprint
 from schemas import CollectionCoverage, Finding, HealthReport
 
@@ -39,6 +40,23 @@ def collection_coverage(data: dict) -> list[CollectionCoverage]:
 
 
 
+def _alert_local_time(source: datetime) -> datetime:
+    """Use pod configuration, then the system timezone at the event's date."""
+    for setting in ("ALERT_TIMEZONE", "TZ"):
+        name = os.getenv(setting, "").strip()
+        if not name:
+            continue
+        try:
+            zone = ZoneInfo(name)
+        except (ZoneInfoNotFoundError, ValueError):
+            continue
+        return source.astimezone(zone)
+    try:
+        return source.astimezone()
+    except (OSError, ValueError, OverflowError):
+        return source.astimezone(timezone.utc)
+
+
 def _termination_detail(record: dict) -> str:
     """Render source time separately from the Kubernetes reason token."""
     container = record.get("container") or "(name unavailable)"
@@ -56,9 +74,9 @@ def _termination_detail(record: dict) -> str:
     else:
         exact = finished.astimezone(timezone.utc).isoformat()
         try:
-            pacific = finished.astimezone(ZoneInfo("America/Los_Angeles"))
-            clock = pacific.strftime("%I:%M:%S %p").lstrip("0")
-            when = f"{pacific.strftime('%b')} {pacific.day}, {pacific.year:04d} at {clock} {pacific.tzname()}"
+            local = _alert_local_time(finished)
+            clock = local.strftime("%I:%M:%S %p").lstrip("0")
+            when = f"{local.strftime('%b')} {local.day}, {local.year:04d} at {clock} {local.tzname()}"
         except (ValueError, OverflowError):
             when = exact
         age = record.get("minutes_ago")
@@ -244,4 +262,5 @@ def reconcile_report(report: HealthReport, data: dict, stored: dict | None = Non
     if incomplete and not findings:
         summary = "Health is unknown because collection or analysis is incomplete. Open incidents remain tracked."
     return report.model_copy(update={"findings": findings, "coverage": coverage, "summary": summary,
-                                     "overall_severity": severity, "recommended_actions": actions})
+                                     "overall_severity": severity, "recommended_actions": actions,
+                                     "recovered_events": recovered_termination_details(data, _termination_detail)})

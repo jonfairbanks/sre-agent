@@ -50,6 +50,10 @@ spec:
               containerPort: 8080
               protocol: TCP
           env:
+            {{- if .Values.config.alertTimezone }}
+            - name: ALERT_TIMEZONE
+              value: {{ .Values.config.alertTimezone | quote }}
+            {{- end }}
             - name: LLM_PROVIDER
               value: {{ .Values.config.llmProvider | quote }}
             - name: ANTHROPIC_MODEL

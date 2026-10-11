@@ -246,6 +246,12 @@ class SlackNotifier:
                 }],
             })
 
+        if report.recovered_events:
+            text = ":white_check_mark: *Recovered Container Events*\nHistorical terminations; pods are Running and Ready.\n"
+            text += "\n".join(f"• {event}" for event in report.recovered_events[:11])
+            attachments.append({"color": "#38a169", "blocks": [{"type": "section", "text": {
+                "type": "mrkdwn", "text": _trunc(text, 2700)}}]})
+
         if recovered_probe_events:
             lines = []
             for event in recovered_probe_events[:10]:

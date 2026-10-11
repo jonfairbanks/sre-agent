@@ -271,3 +271,17 @@ def test_hidden_bucket_uses_muted_wording(notifier):
     notifier.send_structured_report(report(item), diff=diff)
     assert "1 muted (hidden)" in body(notifier)
     assert "acked (hidden)" not in body(notifier)
+
+
+def test_recovered_container_events_are_visible_without_new_alert_eligibility(notifier):
+    healthy = report(severity="ok").model_copy(update={"recovered_events": [
+        "apps/api: Running and Ready. Container app last terminated Oct 10 at 7:37 PM PDT."
+    ]})
+    diff = diff_report(healthy, {}, NOW)
+    notifier.send_structured_report(healthy, diff=diff)
+    text = body(notifier)
+    assert "Recovered Container Events" in text
+    assert "apps/api" in text and "Running and Ready" in text
+    assert "All Clear" in notifier._client.posted["text"]
+    assert not diff.should_notify()
+    assert "sre_ignore" not in text

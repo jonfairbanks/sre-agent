@@ -9,6 +9,11 @@ from monitor_state import fingerprint
 from scheduler import _classify_pod
 from schemas import Finding, HealthReport
 
+@pytest.fixture(autouse=True)
+def display_timezone(monkeypatch):
+    monkeypatch.setenv("ALERT_TIMEZONE", "America/Los_Angeles")
+
+
 NOW = datetime(2026, 10, 11, 3, 7, 15, tzinfo=timezone.utc)
 FINISHED = datetime(2026, 10, 11, 2, 37, 15, tzinfo=timezone.utc)
 
