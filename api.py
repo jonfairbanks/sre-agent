@@ -865,10 +865,11 @@ async def lifespan(app: FastAPI):
         log.info("MONITORING_ENABLED is false — scheduled health checks not started")
 
     if _notifier.enabled:
+        from slack_notifier import dashboard_link
         _notifier.send_alert(
             "ok",
             "SRE Bot Is Up",
-            "Notification delivery is online. Run a health check from the dashboard.",
+            f"Notification delivery is online. Run a health check from the {dashboard_link()}.",
         )
 
     if not _db.available:

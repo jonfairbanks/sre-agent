@@ -98,6 +98,7 @@ python api.py         # API + web UI at http://localhost:8080
 | `DISK_USAGE_CRITICAL_CLEAR_PERCENT` | No | Critical disk findings step down below this percentage (default: `85`) |
 | `GITOPS_ALLOWED_REPOSITORIES` | No | Comma-separated verified public GitHub `owner/repo` names; empty disables source reads and proposals |
 | `GITOPS_REPOSITORY_OWNERSHIP` | No | Optional JSON object mapping repository names to responsible teams; metadata only |
+| `DASHBOARD_URL` | No | HTTP(S) dashboard URL used for the Slack startup link. Helm: `config.dashboardUrl`. Unset or invalid URLs leave the word as plain text. |
 | `ALERT_TIMEZONE` | No | IANA timezone for report timestamps. Falls back to `TZ`, then the pod local timezone (usually UTC). Invalid values are skipped. |
 | `POD_FAILURE_RECENCY_MINUTES` | No | Lookback for failed Pods (default: `240`, or 4 hours). Running, Ready pods treat prior terminations as history; active container faults still alert. |
 | `POD_STARTUP_GRACE_MINUTES` | No | Grace before Pending or not-ready counts as a fault (default: `10`) |
