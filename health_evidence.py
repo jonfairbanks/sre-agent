@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from health_history import recovered_termination_details
-from monitor_state import fingerprint
+from monitor_state import canonicalize_stored_findings, fingerprint
 from schemas import CollectionCoverage, Finding, HealthReport
 
 DISK_ENTER_PERCENT = float(os.getenv("PVC_USAGE_ALERT_PERCENT", "70"))
@@ -114,7 +114,16 @@ def _pod_evidence_detail(pod: dict) -> str:
 
 def reconcile_report(report: HealthReport, data: dict, stored: dict | None = None) -> HealthReport:
     """Derive factual findings and preserve independent model observations."""
-    stored = stored or {}
+    aliases = dict(data.get("filesystem_aliases", {}))
+    # Reuse a confirmed identity only when today's topology lookup failed.
+    # Fresh verified mount evidence owns identity after a path moves disks.
+    known_aliases = data.get("known_filesystem_aliases", {})
+    for key, usage in data.get("local_filesystem_usage", {}).items():
+        if not usage.get("topology_verified", False):
+            old = f"-/node/{usage['node']}:{usage.get('filesystem_id', key)}:localfilesystemusage".lower()
+            if old in known_aliases:
+                aliases[old] = known_aliases[old]
+    stored = canonicalize_stored_findings(stored or {}, aliases)
     facts = []
     disk_observations = set()
 
@@ -174,25 +183,44 @@ def reconcile_report(report: HealthReport, data: dict, stored: dict | None = Non
     for area, kind, reason in (("node_disk_usage", "Node", "NodeFilesystemUsage"),
                                ("pvc_usage", "PersistentVolumeClaim", "PVCUsage"),
                                ("local_filesystem_usage", "Node", "LocalFilesystemUsage")):
-        for key, usage in data.get(area, {}).items():
+        for key, usage in sorted(data.get(area, {}).items(), key=lambda item: item[1].get("percent") or 0, reverse=True):
             namespace, name = (key.split("/", 1) if kind == "PersistentVolumeClaim" else ("", usage.get("node", key)))
+            disk_objects.add((kind.lower(), namespace, name))
+            display_name = name
+            if area == "local_filesystem_usage":
+                name = f"{usage['node']}:{usage.get('filesystem_id', key)}"
+                display_name = f"{usage['node']} ({usage.get('mountpoint') or usage.get('path') or key})"
             disk_objects.add((kind.lower(), namespace, name))
             candidate = Finding(severity="warning", title="Disk Usage", detail="", kind=kind,
                                 resource_name=name, namespace=namespace, reason=reason)
             candidate_fp = fingerprint(candidate)
+            if candidate_fp in aliases:
+                candidate_fp = aliases[candidate_fp]
+                identity, _, canonical_reason = candidate_fp.rpartition(":")
+                ns, canonical_kind, name = identity.split("/", 2)
+                namespace = "" if ns == "-" else ns
+                kind = {"node": "Node", "persistentvolumeclaim": "PersistentVolumeClaim"}[canonical_kind]
+                candidate = candidate.model_copy(update={"resource_name": name, "namespace": namespace, "kind": kind,
+                    "reason": {"nodefilesystemusage": "NodeFilesystemUsage", "localfilesystemusage": "LocalFilesystemUsage", "pvcusage": "PVCUsage"}[canonical_reason]})
+                display_name = name
             previous = stored.get(candidate_fp)
             open_previous = previous is not None and previous.resolved_at is None
             percent = usage.get("percent")
             if not isinstance(percent, (int, float)):
                 continue
+            already_observed = candidate_fp in disk_observations
             disk_observations.add(candidate_fp)
+            if already_observed:
+                continue
             threshold = DISK_CLEAR_PERCENT if open_previous else DISK_ENTER_PERCENT
             if percent >= threshold:
                 severity = "critical" if percent >= DISK_CRITICAL_PERCENT else "warning"
                 if open_previous and previous.severity == "critical" and percent >= DISK_CRITICAL_CLEAR_PERCENT:
                     severity = "critical"
                 qualifier = " Shared filesystem usage is not PVC data size." if kind == "Node" else ""
-                add(kind, name, namespace, reason, severity, f"Filesystem usage is {percent}%.{qualifier}")
+                finding = add(kind, name, namespace, candidate.reason, severity, f"Filesystem usage is {percent}%.{qualifier}")
+                if candidate.reason == "LocalFilesystemUsage":
+                    finding.title = f"Local Filesystem Usage on {display_name}"
 
     fact_ids = {fingerprint(f) for f in facts}
     fact_resources = {(f.kind.lower(), f.namespace, f.resource_name) for f in facts}
@@ -259,8 +287,16 @@ def reconcile_report(report: HealthReport, data: dict, stored: dict | None = Non
     if dropped_history:
         summary = f"{len(findings)} active findings remain; highest severity is {severity}." if findings else "No active issues found."
         actions = []
+    if facts:
+        counts = {level: sum(f.severity == level for f in findings) for level in ("critical", "warning", "info")}
+        levels = ", ".join(f"{count} {level}" for level, count in counts.items() if count)
+        summary = f"{len(findings)} active finding{'s' if len(findings) != 1 else ''}: {levels}."
+        ready_nodes = sum(node.get("status") == "Ready" for node in data.get("nodes", []))
+        if data.get("nodes") and ready_nodes == len(data["nodes"]):
+            summary += f" All {ready_nodes} nodes are Ready." if ready_nodes != 1 else " The node is Ready."
     if incomplete and not findings:
         summary = "Health is unknown because collection or analysis is incomplete. Open incidents remain tracked."
     return report.model_copy(update={"findings": findings, "coverage": coverage, "summary": summary,
                                      "overall_severity": severity, "recommended_actions": actions,
-                                     "recovered_events": recovered_termination_details(data, _termination_detail)})
+                                     "recovered_events": recovered_termination_details(data, _termination_detail),
+                                     "finding_aliases": aliases})

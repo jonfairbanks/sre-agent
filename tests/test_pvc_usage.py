@@ -152,11 +152,19 @@ def volume_stats(name="vault-0", capacity=55 * 1024 ** 3, used=39 * 1024 ** 3):
             "availableBytes": capacity - used}
 
 
+def local_source(path="/var/lib/local/data"):
+    return {"shared": True, "path": path}
+
+
+ROOT_MOUNTS = [{"mountpoint": "/", "device": "/dev/root"}]
+DATA_MOUNTS = ROOT_MOUNTS + [{"mountpoint": "/data", "device": "/dev/data"}]
+
+
 def test_local_claims_report_one_node_disk_instead_of_pvc_consumption():
     from scheduler import _collect_storage_usage, _health_prompt
     data = storage_result()
     summary = storage_summary(volume_stats(), volume_stats("vault-1"), volume_stats())
-    _collect_storage_usage(data, summary, "n1", {"prod/vault-0": True, "prod/vault-1": True})
+    _collect_storage_usage(data, summary, "n1", {"prod/vault-0": local_source(), "prod/vault-1": local_source()}, ROOT_MOUNTS)
     assert data["pvc_usage"] == {}
     assert data["local_filesystem_usage"] == {}
     assert data["node_disk_usage"]["n1"]["local_claims"] == ["prod/vault-0", "prod/vault-1"]
@@ -171,7 +179,7 @@ def test_local_claim_on_a_separate_disk_keeps_its_filesystem_warning():
     from scheduler import _collect_storage_usage
     data = storage_result()
     vol = volume_stats(capacity=100 * 1024 ** 3, used=90 * 1024 ** 3)
-    _collect_storage_usage(data, storage_summary(vol), "n1", {"prod/vault-0": True})
+    _collect_storage_usage(data, storage_summary(vol), "n1", {"prod/vault-0": local_source("/data/vault")}, DATA_MOUNTS)
     assert data["pvc_usage"] == {}
     assert data["node_disk_usage"]["n1"]["local_claims"] == []
     out = _format_snapshot(data)
@@ -209,7 +217,107 @@ def test_same_size_local_disk_with_different_usage_keeps_full_disk_warning():
     from scheduler import _collect_storage_usage
     data = storage_result()
     vol = volume_stats(used=54 * 1024 ** 3)
-    _collect_storage_usage(data, storage_summary(vol), "n1", {"prod/vault-0": True})
+    _collect_storage_usage(data, storage_summary(vol), "n1", {"prod/vault-0": local_source("/data/vault")}, DATA_MOUNTS)
     assert data["node_disk_usage"]["n1"]["local_claims"] == []
     assert data["local_filesystem_usage"]["prod/vault-0"]["percent"] == 98.2
     assert "54.0Gi/55.0Gi" in _format_snapshot(data)
+
+
+def test_root_alias_survives_counter_sampling_skew():
+    from scheduler import _collect_storage_usage
+    data = storage_result()
+    vol = volume_stats(used=39 * 1024 ** 3 + 2 * 1024 ** 2)
+    _collect_storage_usage(data, storage_summary(vol), "n1", {"prod/vault-0": local_source()}, ROOT_MOUNTS)
+    assert data["local_filesystem_usage"] == {}
+    assert data["node_disk_usage"]["n1"]["local_claims"] == ["prod/vault-0"]
+    assert data["filesystem_aliases"]["-/node/n1:localfilesystemusage"] == "-/node/n1:nodefilesystemusage"
+
+
+def test_identical_counters_do_not_merge_distinct_mounts():
+    from scheduler import _collect_storage_usage
+    data = storage_result()
+    _collect_storage_usage(data, storage_summary(volume_stats()), "n1",
+                           {"prod/vault-0": local_source("/data/vault")}, DATA_MOUNTS)
+    assert data["node_disk_usage"]["n1"]["local_claims"] == []
+    local = data["local_filesystem_usage"]["prod/vault-0"]
+    assert local["filesystem_id"] == "device:/dev/data"
+    assert local["topology_verified"] is True
+    assert data["filesystem_aliases"]["-/node/n1:localfilesystemusage"] == "-/node/n1:device:/dev/data:localfilesystemusage"
+
+
+def test_missing_topology_preserves_distinct_paths_and_no_root_alias():
+    from scheduler import _collect_storage_usage
+    data = storage_result()
+    _collect_storage_usage(data, storage_summary(volume_stats(), volume_stats("vault-1")), "n1",
+                           {"prod/vault-0": local_source("/data/one"), "prod/vault-1": local_source("/data/two")})
+    assert {v["filesystem_id"] for v in data["local_filesystem_usage"].values()} == {
+        "path:/data/one", "path:/data/two"}
+    assert not data.get("filesystem_aliases")
+
+
+def test_bind_mount_same_device_is_root_and_longest_mount_wins():
+    from scheduler import _collect_storage_usage
+    data = storage_result()
+    mounts = ROOT_MOUNTS + [{"mountpoint": "/data", "device": "/dev/root"},
+                            {"mountpoint": "/database", "device": "/dev/other"}]
+    _collect_storage_usage(data, storage_summary(volume_stats()), "n1",
+                           {"prod/vault-0": local_source("/data/vault")}, mounts)
+    assert data["local_filesystem_usage"] == {}
+    assert data["node_disk_usage"]["n1"]["local_claims"] == ["prod/vault-0"]
+
+
+def test_missing_local_sample_blocks_root_alias_migration():
+    from scheduler import _collect_storage_usage
+    data = storage_result()
+    missing = volume_stats("vault-1")
+    del missing["usedBytes"]
+    _collect_storage_usage(data, storage_summary(volume_stats(), missing), "n1",
+                           {"prod/vault-0": local_source(), "prod/vault-1": local_source()}, ROOT_MOUNTS)
+    assert "-/node/n1:localfilesystemusage" not in data.get("filesystem_aliases", {})
+
+
+def test_node_exporter_mount_parser_skips_unreadable_or_invalid_metrics():
+    from scheduler import _filesystem_mounts
+    metrics = '\n'.join([
+        'node_filesystem_size_bytes{device="/dev/root",fstype="ext4",mountpoint="/"} 55',
+        'node_filesystem_size_bytes{mountpoint="/data",device="/dev/data"} 100',
+        'node_filesystem_size_bytes{device="/dev/error",mountpoint="/bad",device_error="permission denied"} 12',
+        'node_filesystem_size_bytes{device="/dev/nan",mountpoint="/nan"} NaN',
+        'node_filesystem_size_bytes{device="/dev/nope",mountpoint="relative"} 12',
+        'node_filesystem_avail_bytes{device="/dev/root",mountpoint="/"} 12',
+    ])
+    assert _filesystem_mounts(metrics) == [{"mountpoint": "/", "device": "/dev/root"},
+                                          {"mountpoint": "/data", "device": "/dev/data"}]
+
+
+def test_optional_node_exporter_failure_does_not_fail_disk_collection(monkeypatch):
+    import scheduler
+    def unavailable(*args, **kwargs):
+        raise OSError("offline")
+    monkeypatch.setattr(scheduler.urllib.request, "urlopen", unavailable)
+    assert scheduler._collect_filesystem_mounts("192.0.2.1") == []
+
+
+def test_optional_node_exporter_response_is_bounded(monkeypatch):
+    import scheduler
+    from io import BytesIO
+    monkeypatch.setattr(scheduler.urllib.request, "urlopen", lambda *args, **kwargs: BytesIO(b"x" * (2 * 1024 * 1024 + 1)))
+    assert scheduler._collect_filesystem_mounts("192.0.2.1") == []
+
+
+def test_missing_bound_node_claim_blocks_legacy_alias():
+    from scheduler import _collect_storage_usage
+    data = storage_result()
+    _collect_storage_usage(data, storage_summary(volume_stats()), "n1", {
+        "prod/vault-0": local_source(),
+        "prod/vault-1": {**local_source(), "nodes": ["n1"]}}, ROOT_MOUNTS)
+    assert "-/node/n1:localfilesystemusage" not in data.get("filesystem_aliases", {})
+
+
+def test_verified_mount_maps_fallback_paths_and_claims():
+    from scheduler import _collect_storage_usage
+    data = storage_result()
+    _collect_storage_usage(data, storage_summary(volume_stats()), "n1", {"prod/vault-0": local_source()}, ROOT_MOUNTS)
+    aliases = data["filesystem_aliases"]
+    assert aliases["-/node/n1:path:/var/lib/local/data:localfilesystemusage"] == "-/node/n1:nodefilesystemusage"
+    assert aliases["-/node/n1:claim:prod/vault-0:localfilesystemusage"] == "-/node/n1:nodefilesystemusage"

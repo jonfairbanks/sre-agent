@@ -82,6 +82,14 @@ CREATE TABLE IF NOT EXISTS finding_state (
 CREATE INDEX IF NOT EXISTS finding_state_open_idx
     ON finding_state (last_seen DESC) WHERE resolved_at IS NULL;
 
+CREATE TABLE IF NOT EXISTS finding_aliases (
+    alias_fingerprint text PRIMARY KEY,
+    canonical_fingerprint text NOT NULL,
+    CHECK (alias_fingerprint <> canonical_fingerprint)
+);
+CREATE INDEX IF NOT EXISTS finding_aliases_canonical_idx
+    ON finding_aliases (canonical_fingerprint);
+
 -- Maps a posted report to the fingerprints it covered, so the Slack "Ack"
 -- button can carry a short opaque id instead of a fingerprint list that would
 -- blow past Slack's 2000-character button value limit.
@@ -181,6 +189,9 @@ class NullDatabase:
         return []
 
     def load_tracked_findings(self) -> dict[str, StoredFinding]:
+        return {}
+
+    def load_finding_aliases(self) -> dict[str, str]:
         return {}
 
     def apply_diff(self, diff: ReportDiff, now: Optional[datetime] = None) -> None:
@@ -388,13 +399,84 @@ class PostgresDatabase:
             for r in rows
         }
 
+    def load_finding_aliases(self) -> dict[str, str]:
+        with self._pool.connection() as conn:
+            rows = conn.execute(
+                'SELECT alias_fingerprint,canonical_fingerprint FROM finding_aliases'
+            ).fetchall()
+        return {row['alias_fingerprint']: row['canonical_fingerprint'] for row in rows}
+
     def apply_diff(self, diff: ReportDiff, now: Optional[datetime] = None) -> None:
         """Persist finding transitions without altering unverified incidents."""
         now = now or datetime.now(timezone.utc)
         with self._pool.connection() as conn, conn.transaction():
             self._apply_diff_on_connection(conn, diff, now)
 
+    @staticmethod
+    def _canonical_fingerprint(conn, fingerprint):
+        seen = set()
+        while fingerprint not in seen:
+            seen.add(fingerprint)
+            row = conn.execute(
+                'SELECT canonical_fingerprint FROM finding_aliases WHERE alias_fingerprint=%s',
+                (fingerprint,),
+            ).fetchone()
+            if row is None:
+                return fingerprint
+            fingerprint = row['canonical_fingerprint']
+        raise ValueError('Finding aliases contain a cycle')
+
     def _apply_diff_on_connection(self, conn, diff, now):
+        aliases = getattr(diff, 'aliases', {})
+        if aliases:
+            # Slack actions hold a shared lock while resolving and mutating state.
+            conn.execute('LOCK TABLE finding_aliases IN SHARE ROW EXCLUSIVE MODE')
+        for alias, target in aliases.items():
+            # A device path can be reused. Existing Slack buttons remain bound
+            # to the original device rather than muting its replacement.
+            bound = conn.execute(
+                'SELECT canonical_fingerprint FROM finding_aliases WHERE alias_fingerprint=%s',
+                (alias,),
+            ).fetchone()
+            if bound:
+                continue
+            canonical = self._canonical_fingerprint(conn, target)
+            old = alias
+            if old == canonical:
+                continue
+            conn.execute('SELECT fingerprint FROM finding_state WHERE fingerprint=%s FOR UPDATE',
+                         (old,))
+            conn.execute(
+                """INSERT INTO finding_state (
+                    fingerprint, namespace, kind, resource_name, reason, severity,
+                    title, detail, first_seen, last_seen, times_seen, resolved_at,
+                    ack_until, ignored_until, ignored_forever
+                ) SELECT %s, namespace, kind, resource_name, reason, severity,
+                    title, detail, first_seen, last_seen, times_seen, resolved_at,
+                    ack_until, ignored_until, ignored_forever
+                  FROM finding_state WHERE fingerprint=%s
+                ON CONFLICT (fingerprint) DO UPDATE SET
+                    first_seen = LEAST(finding_state.first_seen, EXCLUDED.first_seen),
+                    last_seen = GREATEST(finding_state.last_seen, EXCLUDED.last_seen),
+                    times_seen = GREATEST(finding_state.times_seen, EXCLUDED.times_seen),
+                    ack_until = GREATEST(finding_state.ack_until, EXCLUDED.ack_until),
+                    ignored_until = GREATEST(finding_state.ignored_until, EXCLUDED.ignored_until),
+                    ignored_forever = finding_state.ignored_forever OR EXCLUDED.ignored_forever,
+                    resolved_at = CASE WHEN finding_state.resolved_at IS NULL
+                        OR EXCLUDED.resolved_at IS NULL THEN NULL
+                        ELSE GREATEST(finding_state.resolved_at, EXCLUDED.resolved_at) END
+                """,
+                (canonical, old),
+            )
+            conn.execute('DELETE FROM finding_state WHERE fingerprint=%s', (old,))
+            conn.execute('UPDATE finding_aliases SET canonical_fingerprint=%s WHERE canonical_fingerprint=%s',
+                         (canonical, old))
+            conn.execute(
+                """INSERT INTO finding_aliases(alias_fingerprint,canonical_fingerprint)
+                   VALUES (%s,%s) ON CONFLICT (alias_fingerprint) DO UPDATE
+                   SET canonical_fingerprint=EXCLUDED.canonical_fingerprint""",
+                (old, canonical),
+            )
         seen = diff.active + diff.suppressed
         for delta in seen:
             f = delta.finding
@@ -413,8 +495,8 @@ class PostgresDatabase:
                     severity      = EXCLUDED.severity,
                     title         = EXCLUDED.title,
                     detail        = EXCLUDED.detail,
-                    last_seen     = EXCLUDED.last_seen,
-                    times_seen    = EXCLUDED.times_seen,
+                    last_seen     = GREATEST(finding_state.last_seen, EXCLUDED.last_seen),
+                    times_seen    = GREATEST(finding_state.times_seen, EXCLUDED.times_seen),
                     resolved_at   = NULL,
                     ignored_until = CASE WHEN NOT finding_state.ignored_forever
                         AND finding_state.ignored_until <= EXCLUDED.last_seen
@@ -451,6 +533,8 @@ class PostgresDatabase:
                        ignored_until = CASE WHEN NOT ignored_forever AND ignored_until <= %s
                            THEN NULL ELSE ignored_until END
                  WHERE fingerprint = ANY(%s)
+                   AND NOT EXISTS (SELECT 1 FROM finding_aliases a
+                                   WHERE a.alias_fingerprint=finding_state.fingerprint)
                 """,
                 (now, now, [r.fingerprint for r in diff.resolved]),
             )
@@ -470,7 +554,8 @@ class PostgresDatabase:
     def ack_report(self, report_id: str, hours: int) -> int:
         """Suppress every finding in a report for ``hours``. Returns rows acked."""
         until = datetime.now(timezone.utc) + timedelta(hours=hours)
-        with self._pool.connection() as conn:
+        with self._pool.connection() as conn, conn.transaction():
+            conn.execute('LOCK TABLE finding_aliases IN SHARE MODE')
             cur = conn.execute(
                 "SELECT fingerprints FROM monitor_reports WHERE report_id = %s",
                 (report_id,),
@@ -478,7 +563,8 @@ class PostgresDatabase:
             row = cur.fetchone()
             if not row:
                 return 0
-            fingerprints = list(row["fingerprints"] or [])
+            fingerprints = list({self._canonical_fingerprint(conn, fp)
+                                 for fp in row["fingerprints"] or []})
             if not fingerprints:
                 return 0
             cur = conn.execute(
@@ -565,8 +651,11 @@ class PostgresDatabase:
         with self._pool.connection() as conn:
             return conn.execute(
                 '''SELECT * FROM finding_observations WHERE fingerprint=%s
+                   OR fingerprint IN (SELECT alias_fingerprint FROM finding_aliases
+                                      WHERE canonical_fingerprint=%s)
                    ORDER BY observed_at DESC,session_id DESC LIMIT %s''',
-                (fingerprint, max(1, min(int(limit), 100))),
+                (self._canonical_fingerprint(conn, fingerprint),
+                 self._canonical_fingerprint(conn, fingerprint), max(1, min(int(limit), 100))),
             ).fetchall()
 
     def claim_pending_notifications(self, now, limit=10):
@@ -627,12 +716,15 @@ class PostgresDatabase:
             return False
         now = datetime.now(timezone.utc)
         with self._pool.connection() as conn, conn.transaction():
+            conn.execute('LOCK TABLE finding_aliases IN SHARE MODE')
             row = conn.execute('SELECT fingerprints FROM monitor_reports WHERE report_id=%s',
                                (report_id,)).fetchone()
             if not row:
                 return False
-            matches = [fp for fp in row['fingerprints']
-                       if hashlib.sha256(fp.encode()).hexdigest() == fingerprint_hash]
+            matches = {self._canonical_fingerprint(conn, fp) for fp in row['fingerprints']
+                       if hashlib.sha256(fp.encode()).hexdigest() == fingerprint_hash
+                       or hashlib.sha256(self._canonical_fingerprint(conn, fp).encode()).hexdigest()
+                       == fingerprint_hash}
             if len(matches) != 1:
                 return False
             unignore = not forever and hours == 0
@@ -641,7 +733,7 @@ class PostgresDatabase:
                 '''UPDATE finding_state SET ignored_until=%s,ignored_forever=%s,
                    ack_until=CASE WHEN %s THEN NULL ELSE ack_until END
                    WHERE fingerprint=%s AND (resolved_at IS NULL OR %s) RETURNING fingerprint''',
-                (until, forever, unignore, matches[0], unignore),
+                (until, forever, unignore, next(iter(matches)), unignore),
             ).fetchone()
             return row is not None
 
@@ -651,7 +743,10 @@ class PostgresDatabase:
                 '''SELECT f.fingerprint,f.namespace,f.kind,f.resource_name AS name,
                    f.reason,f.title,f.severity,f.ignored_until,f.ignored_forever,f.resolved_at,
                    (SELECT r.report_id FROM monitor_reports r
-                    WHERE r.fingerprints ? f.fingerprint ORDER BY r.created_at DESC LIMIT 1) AS report_id
+                    WHERE r.fingerprints ? f.fingerprint OR EXISTS (
+                      SELECT 1 FROM finding_aliases a WHERE a.canonical_fingerprint=f.fingerprint
+                        AND r.fingerprints ? a.alias_fingerprint)
+                    ORDER BY r.created_at DESC LIMIT 1) AS report_id
                    FROM finding_state f WHERE ignored_forever OR ignored_until > now()
                    ORDER BY f.last_seen DESC LIMIT %s''',
                 (max(1, min(int(limit), 100)),),

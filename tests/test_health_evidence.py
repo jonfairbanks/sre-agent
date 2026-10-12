@@ -286,3 +286,91 @@ def test_model_prompt_preserves_intentional_replica_cap():
     prompt, _ = scheduler._health_prompt("snapshot")
     assert "Do not flag replica equality or TooManyReplicas alone" in prompt
     assert "without independent evidence of workload harm" in prompt
+
+
+def test_confirmed_root_alias_stays_one_incident_and_keeps_ignore():
+    now = datetime.now(timezone.utc)
+    current = reconcile_report(report(), snapshot(node_disk_usage={"k2": {"percent": 71.8}}))
+    root = stored_for(current.findings[0], ignored_until=now + timedelta(hours=1))
+    root.times_seen = 25
+    legacy_finding = current.findings[0].model_copy(update={"reason": "LocalFilesystemUsage", "title": "Local Filesystem Usage on k2"})
+    legacy = stored_for(legacy_finding, ignored_forever=True)
+    legacy.first_seen = root.first_seen - timedelta(hours=3)
+    stored = {item.fingerprint: item for item in (root, legacy)}
+    data = snapshot(node_disk_usage={"k2": {"percent": 71.8, "local_claims": ["vault/data"]}},
+                    filesystem_aliases={legacy.fingerprint: root.fingerprint})
+    result = reconcile_report(report(), data, stored)
+    diff = diff_report(result, stored, now)
+    assert len(result.findings) == 1
+    assert all(c.status == "complete" for c in result.coverage)
+    assert not diff.retained and not diff.resolved and not diff.new
+    assert len(diff.suppressed) == 1
+    assert diff.suppressed[0].first_seen == legacy.first_seen
+    assert diff.suppressed[0].times_seen == 26
+    assert deserialize_diff(serialize_diff(diff)) == diff
+
+
+def test_separate_local_filesystems_on_same_node_keep_separate_identities():
+    result = reconcile_report(report(), snapshot(local_filesystem_usage={
+        "app/a": {"node": "k2", "filesystem_id": "device:/dev/a", "percent": 72},
+        "app/b": {"node": "k2", "filesystem_id": "device:/dev/b", "percent": 72},
+    }))
+    assert len({fingerprint(f) for f in result.findings}) == 2
+
+
+def test_alias_recovery_resolves_once_after_canonical_clear_boundary():
+    old = Finding(kind="Node", resource_name="k2", reason="LocalFilesystemUsage",
+                  severity="warning", title="Local Filesystem Usage on k2", detail="Filesystem usage is 71.8%.")
+    previous = stored_for(old)
+    canonical = old.model_copy(update={"reason": "NodeFilesystemUsage"})
+    data = snapshot(node_disk_usage={"k2": {"percent": 64}},
+                    filesystem_aliases={previous.fingerprint: fingerprint(canonical)})
+    stored = {previous.fingerprint: previous}
+    result = reconcile_report(report(), data, stored)
+    diff = diff_report(result, stored)
+    assert not diff.retained and not diff.new
+    assert [f.fingerprint for f in diff.resolved] == [fingerprint(canonical)]
+
+
+def test_active_facts_replace_misleading_healthy_summary():
+    result = reconcile_report(report(), snapshot(nodes=[{"name": "k2", "status": "Ready"}],
+                              node_disk_usage={"k2": {"percent": 71.8}}))
+    assert result.summary == "1 active finding: 1 warning. The node is Ready."
+    assert result.overall_severity == "warning"
+
+
+def test_topology_outage_reuses_confirmed_alias_without_resurrection():
+    old = "-/node/k2:path:/data:localfilesystemusage"
+    canonical = "-/node/k2:nodefilesystemusage"
+    data = snapshot(node_disk_usage={"k2": {"percent": 72}},
+                    local_filesystem_usage={"app/a": {"node": "k2", "filesystem_id": "path:/data", "percent": 72}},
+                    known_filesystem_aliases={old: canonical})
+    initial = reconcile_report(report(), snapshot(node_disk_usage={"k2": {"percent": 72}}))
+    previous = stored_for(initial.findings[0], ignored_forever=True)
+    stored = {canonical: previous}
+    result = reconcile_report(report(), data, stored)
+    diff = diff_report(result, stored)
+    assert [fingerprint(f) for f in result.findings] == [canonical]
+    assert not diff.new and not diff.retained
+    assert len(diff.suppressed) == 1
+
+
+def test_shared_local_device_counts_once_and_keeps_highest_pressure():
+    result = reconcile_report(report(), snapshot(local_filesystem_usage={
+        "app/a": {"node": "k2", "filesystem_id": "device:/dev/a", "percent": 91},
+        "app/b": {"node": "k2", "filesystem_id": "device:/dev/a", "percent": 92},
+    }))
+    assert len(result.findings) == 1
+    assert "92%" in result.findings[0].detail
+    assert result.summary == "1 active finding: 1 critical."
+
+
+def test_alias_critical_history_preserves_clear_threshold():
+    root_finding = Finding(kind="Node", resource_name="k2", reason="NodeFilesystemUsage",
+                           severity="warning", title="Root", detail="")
+    local_finding = root_finding.model_copy(update={"reason": "LocalFilesystemUsage", "severity": "critical"})
+    root, local = stored_for(root_finding), stored_for(local_finding)
+    data = snapshot(node_disk_usage={"k2": {"percent": 87}},
+                    filesystem_aliases={local.fingerprint: root.fingerprint})
+    result = reconcile_report(report(), data, {f.fingerprint: f for f in (root, local)})
+    assert result.findings[0].severity == "critical"

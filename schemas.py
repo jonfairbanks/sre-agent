@@ -74,6 +74,7 @@ class CollectionCoverage(BaseModel):
 class HealthReport(BaseModel):
     """A structured cluster health report."""
 
+    finding_aliases: dict[str, str] = Field(default_factory=dict, description="Snapshot-confirmed filesystem identity aliases.")
     analysis_valid: bool = True
     coverage: list[CollectionCoverage] = Field(default_factory=list)
 

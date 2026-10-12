@@ -18,7 +18,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from monitor_state import StoredFinding, diff_report, fingerprint
+from monitor_state import ReportDiff, StoredFinding, diff_report, fingerprint
 from persistence import NullDatabase, PostgresDatabase, init_persistence
 from schemas import Finding, HealthReport
 
@@ -45,7 +45,7 @@ def clean(db):
     """Each test starts from an empty schema."""
     with db._pool.connection() as conn:
         conn.execute(
-            "TRUNCATE sessions, hitl_audit, finding_state, monitor_reports, monitor_meta, monitor_checks, finding_observations, notification_outbox"
+            "TRUNCATE sessions, hitl_audit, finding_aliases, finding_state, monitor_reports, monitor_meta, monitor_checks, finding_observations, notification_outbox"
         )
     yield
 
@@ -238,3 +238,99 @@ def test_unusable_dsn_degrades_to_memory(dsn):
     assert isinstance(database, NullDatabase)
     assert not database.available
     assert type(checkpointer).__name__ in ("MemorySaver", "InMemorySaver")
+
+
+# Legacy device identities must remain useful in posted Slack reports.
+def test_alias_migration_preserves_mutes_without_duplicate_findings(db):
+    import hashlib
+
+    old_finding = finding(resource_name="nvme0", title="Disk Is Hot")
+    old_fp = fingerprint(old_finding)
+    canonical = "prod/device/serial-123:crashloopbackoff"
+    db.apply_diff(diff_report(report(old_finding), {}, NOW), NOW)
+    report_id = db.save_report([old_fp])
+    old_hash = hashlib.sha256(old_fp.encode()).hexdigest()
+    assert db.mute_report_finding(report_id, old_hash, None, forever=True)
+    assert db.ack_report(report_id, 24) == 1
+    before = db.load_tracked_findings()[old_fp]
+
+    db.apply_diff(ReportDiff(aliases={old_fp: canonical}), NOW + timedelta(minutes=5))
+    tracked = db.load_tracked_findings()
+    assert set(tracked) == {canonical}
+    assert tracked[canonical].first_seen == before.first_seen
+    assert tracked[canonical].last_seen == before.last_seen
+    assert tracked[canonical].times_seen == before.times_seen
+    assert tracked[canonical].ignored_forever
+    assert tracked[canonical].ack_until == before.ack_until
+    muted = db.list_muted_findings()
+    assert len(muted) == 1
+    assert muted[0]['fingerprint'] == canonical
+    assert muted[0]['report_id'] == report_id
+
+    assert db.mute_report_finding(report_id, old_hash, 0)
+    assert not db.load_tracked_findings()[canonical].ignored_forever
+    assert db.load_tracked_findings()[canonical].ack_until is None
+    canonical_hash = hashlib.sha256(canonical.encode()).hexdigest()
+    assert db.mute_report_finding(report_id, canonical_hash, 8)
+    assert db.ack_report(report_id, 24) == 1
+    assert db.load_tracked_findings()[canonical].is_acked(datetime.now(timezone.utc))
+
+
+def test_alias_merge_uses_max_observations_and_latest_mute_deadlines(db):
+    old_finding = finding(resource_name="nvme0")
+    canonical_finding = finding(resource_name="serial-123")
+    old_fp, canonical = fingerprint(old_finding), fingerprint(canonical_finding)
+    db.apply_diff(diff_report(report(old_finding), {}, NOW), NOW)
+    db.apply_diff(diff_report(report(canonical_finding), {}, NOW + timedelta(hours=1)),
+                  NOW + timedelta(hours=1))
+    with db._pool.connection() as conn:
+        conn.execute("""UPDATE finding_state SET times_seen=7,ack_until=%s,
+                     ignored_until=%s WHERE fingerprint=%s""",
+                     (NOW + timedelta(hours=2), NOW + timedelta(hours=10), old_fp))
+        conn.execute("""UPDATE finding_state SET times_seen=4,ack_until=%s,
+                     ignored_until=%s WHERE fingerprint=%s""",
+                     (NOW + timedelta(hours=6), NOW + timedelta(hours=3), canonical))
+    db.apply_diff(ReportDiff(aliases={old_fp: canonical}), NOW + timedelta(hours=2))
+    tracked = db.load_tracked_findings()
+    assert set(tracked) == {canonical}
+    merged = tracked[canonical]
+    assert merged.first_seen == NOW
+    assert merged.last_seen == NOW + timedelta(hours=1)
+    assert merged.times_seen == 7
+    assert merged.ack_until == NOW + timedelta(hours=6)
+    assert merged.ignored_until == NOW + timedelta(hours=10)
+
+
+def test_alias_history_and_old_actions_follow_successive_migrations(db):
+    import hashlib
+
+    f = finding(resource_name="nvme0")
+    old_fp = fingerprint(f)
+    middle, canonical = "prod/device/intermediate:hot", "prod/device/serial-123:hot"
+    first = diff_report(report(f), {}, NOW)
+    db.record_monitor_check("legacy-device", 1, report(f), {}, first, NOW, None)
+    report_id = db.save_report([old_fp])
+    db.apply_diff(ReportDiff(aliases={old_fp: middle}), NOW)
+    db.apply_diff(ReportDiff(aliases={middle: canonical}), NOW)
+    assert set(db.load_tracked_findings()) == {canonical}
+    for fp in (old_fp, middle, canonical):
+        rows = db.finding_history(fp)
+        assert len(rows) == 1
+        assert rows[0]['fingerprint'] == old_fp
+    assert db.mute_report_finding(report_id, hashlib.sha256(old_fp.encode()).hexdigest(), 24)
+    assert db.list_muted_findings()[0]['fingerprint'] == canonical
+    assert db.ack_report(report_id, 24) == 1
+
+
+def test_reused_path_alias_does_not_move_previous_device_state(db):
+    old_finding = finding(resource_name="nvme0")
+    old_fp = fingerprint(old_finding)
+    first_device = "prod/device/serial-123:hot"
+    replacement_device = "prod/device/serial-456:hot"
+    db.apply_diff(diff_report(report(old_finding), {}, NOW), NOW)
+    db.apply_diff(ReportDiff(aliases={old_fp: first_device}), NOW)
+    db.apply_diff(ReportDiff(aliases={old_fp: replacement_device}), NOW)
+    assert set(db.load_tracked_findings()) == {first_device}
+    assert db.load_finding_aliases()[old_fp] == first_device
+    assert db.ack_report(db.save_report([old_fp]), 24) == 1
+    assert db.load_tracked_findings()[first_device].is_acked(datetime.now(timezone.utc))

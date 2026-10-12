@@ -12,6 +12,10 @@ import logging
 import os
 import uuid
 import threading
+import math
+import posixpath
+import re
+import urllib.request
 from datetime import datetime, timezone
 from datetime import datetime as Timestamp
 from langsmith import traceable
@@ -321,12 +325,75 @@ def _filesystem_usage(stats):
     }
 
 
-def _collect_storage_usage(result, summary, node_name, volume_sources):
-    """Keep shared local filesystems separate from dedicated PVC consumption."""
-    root = summary.get("node", {}).get("fs", {})
-    root_usage = _filesystem_usage(root)
+def _filesystem_mounts(metrics: str) -> list[dict]:
+    """Read device and mount labels without interpreting usage as topology."""
+    mounts = []
+    for line in metrics.splitlines():
+        match = re.fullmatch(r'node_filesystem_size_bytes\{(.+)\}\s+(\S+)(?:\s+\S+)?', line)
+        if not match:
+            continue
+        label_pattern = r'(\w+)="((?:\\.|[^"\\])*)"'
+        if not re.fullmatch(label_pattern + r'(?:,' + label_pattern + r')*', match.group(1)):
+            continue
+        try:
+            size = float(match.group(2))
+            labels = {key: json.loads('"' + value + '"') for key, value in
+                      re.findall(label_pattern, match.group(1))}
+        except ValueError:
+            continue
+        mountpoint, device = labels.get("mountpoint", ""), labels.get("device", "")
+        if (not math.isfinite(size) or size <= 0 or not device
+                or not mountpoint.startswith("/") or labels.get("device_error")):
+            continue
+        mounts.append({"mountpoint": posixpath.normpath(mountpoint), "device": device})
+    return mounts
+
+
+def _collect_filesystem_mounts(address: str) -> list[dict]:
+    """Node-exporter topology is optional and has bounded read time and size."""
+    template = os.getenv("NODE_EXPORTER_URL_TEMPLATE", "http://{address}:9100/metrics").strip()
+    if not address or not template:
+        return []
+    try:
+        address = f"[{address}]" if ":" in address else address
+        url = template.format(address=address)
+        with urllib.request.urlopen(url, timeout=3) as response:
+            raw = response.read(2 * 1024 * 1024 + 1)
+        if len(raw) > 2 * 1024 * 1024:
+            return []
+        return _filesystem_mounts(raw.decode("utf-8"))
+    except Exception:
+        # Missing exporter access cannot turn a sampled disk into a collection failure.
+        return []
+
+
+def _backing_mount(path: str, mounts: list[dict]) -> dict | None:
+    if not path.startswith("/"):
+        return None
+    path = posixpath.normpath(path)
+    ancestors = [mount for mount in mounts if mount["mountpoint"] == "/"
+                 or path == mount["mountpoint"] or path.startswith(mount["mountpoint"] + "/")]
+    if not ancestors:
+        return None
+    longest = max(len(mount["mountpoint"]) for mount in ancestors)
+    selected = [mount for mount in ancestors if len(mount["mountpoint"]) == longest]
+    return selected[0] if len({mount["device"] for mount in selected}) == 1 else None
+
+
+def _collect_storage_usage(result, summary, node_name, volume_sources, filesystem_mounts=()):
+    """Use mount evidence for shared disks; paths retain identity when unavailable."""
+    root_usage = _filesystem_usage(summary.get("node", {}).get("fs", {}))
+    root_mount = _backing_mount("/", filesystem_mounts)
     if root_usage:
-        result["node_disk_usage"][node_name] = {**root_usage, "local_claims": []}
+        result["node_disk_usage"][node_name] = {
+            **root_usage, "local_claims": [], "filesystem_id": "root",
+            "mountpoint": "/", "device": root_mount["device"] if root_mount else "",
+        }
+    local_seen = 0
+    all_root = True
+    all_local_verified = True
+    local_ids = set()
+    observed_claims = set()
     for pod in summary.get("pods", []) or []:
         for vol in pod.get("volume", []) or []:
             ref = vol.get("pvcRef") or {}
@@ -334,32 +401,68 @@ def _collect_storage_usage(result, summary, node_name, volume_sources):
             if not name or not ns:
                 continue
             key = f"{ns}/{name}"
+            observed_claims.add(key)
+            source = volume_sources.get(key)
+            shared = source.get("shared") if isinstance(source, dict) else source
+            path = source.get("path", "") if isinstance(source, dict) else ""
+            if shared:
+                local_seen += 1
             stats = _filesystem_usage(vol)
             if not stats:
+                if shared:
+                    all_root = False
+                    all_local_verified = False
                 continue
-            shared = volume_sources.get(key)
             if shared is None:
+                all_root = False
+                all_local_verified = False
                 result["errors"].append(f"pvc usage ({key}): backing PV unavailable")
                 continue
             if shared:
-                # Local directories expose statfs of their backing device, not
-                # bytes in the directory. Require matching usage as well as
-                # geometry; separate same-size disks can have different pressure.
-                # Allow 1 MiB of writes between kubelet sampling times.
-                if (root_usage and vol.get("inodes") is not None
-                        and vol.get("capacityBytes") == root.get("capacityBytes")
-                        and vol.get("inodes") == root.get("inodes")
-                        and abs(vol["usedBytes"] - root["usedBytes"]) <= 1024 ** 2
-                        and vol.get("availableBytes") is not None
-                        and root.get("availableBytes") is not None
-                        and abs(vol["availableBytes"] - root["availableBytes"]) <= 1024 ** 2):
+                mount = _backing_mount(path, filesystem_mounts)
+                all_local_verified = all_local_verified and mount is not None
+                on_root = bool(root_usage and root_mount and mount
+                               and mount["device"] == root_mount["device"])
+                if on_root:
                     claims = result["node_disk_usage"][node_name]["local_claims"]
                     if key not in claims:
                         claims.append(key)
                 else:
-                    result["local_filesystem_usage"][key] = {**stats, "node": node_name}
+                    all_root = False
+                    if mount:
+                        filesystem_id = f"device:{mount['device']}"
+                    elif path:
+                        filesystem_id = f"path:{posixpath.normpath(path)}"
+                    else:
+                        filesystem_id = f"claim:{key}"
+                    local_ids.add(filesystem_id)
+                    result["local_filesystem_usage"][key] = {
+                        **stats, "node": node_name, "filesystem_id": filesystem_id,
+                        "mountpoint": mount["mountpoint"] if mount else path,
+                        "device": mount["device"] if mount else "",
+                        "topology_verified": mount is not None,
+                    }
+                if mount and root_usage and root_mount:
+                    target = (f"-/node/{node_name}:nodefilesystemusage" if on_root else
+                              f"-/node/{node_name}:device:{mount['device']}:localfilesystemusage")
+                    aliases = result.setdefault("filesystem_aliases", {})
+                    aliases[f"-/node/{node_name}:claim:{key}:localfilesystemusage".lower()] = target.lower()
+                    if path:
+                        aliases[f"-/node/{node_name}:path:{posixpath.normpath(path)}:localfilesystemusage".lower()] = target.lower()
             else:
                 result["pvc_usage"][key] = stats
+    for key, source in volume_sources.items():
+        if (isinstance(source, dict) and source.get("shared") and node_name in source.get("nodes", [])
+                and key not in observed_claims):
+            all_root = False
+            all_local_verified = False
+    if local_seen and all_root and root_usage:
+        result.setdefault("filesystem_aliases", {})[f"-/node/{node_name}:localfilesystemusage"] = f"-/node/{node_name}:nodefilesystemusage"
+    elif (local_seen and all_local_verified and len(local_ids) == 1 and root_usage and root_mount
+          and not result["node_disk_usage"][node_name]["local_claims"]):
+        identity = next(iter(local_ids))
+        result.setdefault("filesystem_aliases", {})[f"-/node/{node_name}:localfilesystemusage"] = (
+            f"-/node/{node_name}:{identity}:localfilesystemusage".lower())
 
 
 def _keda_hpa_context(hpa, scaled_object: dict, deployment) -> dict:
@@ -480,6 +583,8 @@ def _collect_cluster_data() -> dict:
                 # pushes it to invent load-based causation.
                 "cpu_allocatable": allocatable.get("cpu", ""),
                 "memory_allocatable": allocatable.get("memory", ""),
+                "internal_ip": next((a.address for a in (getattr(n.status, "addresses", None) or [])
+                                     if a.type == "InternalIP"), ""),
             })
     except Exception as e:
         result["errors"].append(f"nodes: {_collection_failure(e)}")
@@ -696,9 +801,15 @@ def _collect_cluster_data() -> dict:
         for pv in core_v1().list_persistent_volume().items:
             ref = pv.spec.claim_ref
             if ref and ref.namespace and ref.name:
-                volume_sources[f"{ref.namespace}/{ref.name}"] = bool(
-                    pv.spec.local or pv.spec.host_path
-                )
+                backing = pv.spec.local or pv.spec.host_path
+                volume_sources[f"{ref.namespace}/{ref.name}"] = {
+                    "shared": bool(backing), "path": getattr(backing, "path", "") or "",
+                    "pv": pv.metadata.name,
+                    "nodes": [value for term in (getattr(getattr(getattr(pv.spec, "node_affinity", None), "required", None), "node_selector_terms", None) or [])
+                              for expression in (term.match_expressions or [])
+                              if expression.key == "kubernetes.io/hostname" and expression.operator == "In"
+                              for value in (expression.values or [])],
+                }
     except Exception as e:
         result["errors"].append(f"volume sources: {_collection_failure(e)}")
 
@@ -710,7 +821,8 @@ def _collect_cluster_data() -> dict:
             resp = core_v1().connect_get_node_proxy_with_path(
                 node_name, "stats/summary", _preload_content=False
             )
-            _collect_storage_usage(result, json.loads(resp.data), node_name, volume_sources)
+            mounts = _collect_filesystem_mounts(node.get("internal_ip", ""))
+            _collect_storage_usage(result, json.loads(resp.data), node_name, volume_sources, mounts)
         except Exception as e:
             result["errors"].append(f"pvc usage ({node_name}): {_collection_failure(e)}")
 
@@ -1368,6 +1480,7 @@ class MonitoringScheduler:
                 )
                 check_no = self._db.next_check_number()
             stored = self._db.load_tracked_findings()
+            data["known_filesystem_aliases"] = getattr(self._db, "load_finding_aliases", lambda: {})()
             from health_evidence import reconcile_report
             report = reconcile_report(report, data, stored)
             diff = diff_report(report, stored, now)

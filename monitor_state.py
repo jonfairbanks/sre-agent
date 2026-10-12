@@ -12,7 +12,7 @@ database; persistence lives in ``persistence.py``.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import Iterable, Optional
 
@@ -164,6 +164,7 @@ class ResolvedFinding:
 
 @dataclass
 class ReportDiff:
+    aliases: dict[str, str] = field(default_factory=dict)
     retained: list[StoredFinding] = field(default_factory=list)
     new: list[FindingDelta] = field(default_factory=list)
     escalated: list[FindingDelta] = field(default_factory=list)
@@ -212,6 +213,36 @@ def _dedupe(findings: Iterable) -> dict[str, object]:
     return best
 
 
+def canonicalize_stored_findings(stored, aliases):
+    """Join confirmed aliases without counting duplicate observations twice."""
+    result = dict(stored)
+    for old, canonical in aliases.items():
+        if old == canonical or old not in result:
+            continue
+        source = result.pop(old)
+        target = result.get(canonical)
+        if target is None:
+            result[canonical] = replace(source, fingerprint=canonical)
+            continue
+        def latest(a, b):
+            return max(v for v in (a, b) if v is not None) if a or b else None
+        def earliest(a, b):
+            return min(v for v in (a, b) if v is not None) if a or b else None
+        result[canonical] = replace(
+            target, severity=max((row.severity for row in (source, target) if row.resolved_at is None),
+                         key=_rank, default=target.severity), first_seen=earliest(source.first_seen, target.first_seen),
+            last_seen=latest(source.last_seen, target.last_seen),
+            times_seen=max(source.times_seen, target.times_seen),
+            resolved_at=(latest(source.resolved_at, target.resolved_at)
+                         if source.resolved_at and target.resolved_at else None),
+            ack_until=latest(source.ack_until, target.ack_until),
+            ignored_until=latest(source.ignored_until, target.ignored_until),
+            ignored_forever=source.ignored_forever or target.ignored_forever,
+            mute_expired=source.mute_expired or target.mute_expired,
+        )
+    return result
+
+
 def diff_report(
     report,
     stored: dict[str, StoredFinding],
@@ -227,7 +258,9 @@ def diff_report(
     ``times_seen`` so the report can show it is a repeat offender.
     """
     now = now or datetime.now(timezone.utc)
-    diff = ReportDiff()
+    aliases = getattr(report, "finding_aliases", {})
+    stored = canonicalize_stored_findings(stored, aliases)
+    diff = ReportDiff(aliases=dict(aliases))
 
     current = _dedupe(getattr(report, "findings", []) or [])
 
@@ -353,7 +386,7 @@ def _can_resolve(report, fp: str, previous: StoredFinding | None = None) -> bool
 
 def serialize_diff(diff: ReportDiff) -> dict:
     from dataclasses import asdict
-    payload = {}
+    payload = {"aliases": dict(diff.aliases)}
     for bucket in ("new", "escalated", "ongoing", "suppressed", "resolved", "retained"):
         rows = []
         for item in getattr(diff, bucket):
@@ -370,7 +403,7 @@ def serialize_diff(diff: ReportDiff) -> dict:
 
 def deserialize_diff(payload: dict) -> ReportDiff:
     from schemas import Finding
-    diff = ReportDiff()
+    diff = ReportDiff(aliases=dict(payload.get("aliases", {})))
     for bucket in ("new", "escalated", "ongoing", "suppressed", "resolved", "retained"):
         for raw in payload.get(bucket, []):
             row = dict(raw)
