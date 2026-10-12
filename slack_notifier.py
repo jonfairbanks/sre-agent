@@ -150,22 +150,31 @@ class SlackNotifier:
             recovered = (not diff.active and not getattr(diff, "retained", [])
                          and any(not getattr(r, "suppressed", False) for r in diff.resolved))
         else:
-            has_issues = report.has_issues
-            has_critical = report.overall_severity == "critical"
+            active_sevs = {(finding.severity or "").lower() for finding in report.findings}
+            has_issues = bool(active_sevs & {"critical", "warning", "info"}) or report.has_issues
+            has_critical = "critical" in active_sevs or report.overall_severity == "critical"
             recovered = False
 
-        unknown = (report.overall_severity == "unknown" or not getattr(report, "analysis_valid", True)
-                   or bool(diff is not None and getattr(diff, "retained", [])))
+        unknown = not has_issues and (
+            report.overall_severity == "unknown" or not getattr(report, "analysis_valid", True)
+            or any(c.status != "complete" for c in getattr(report, "coverage", []))
+            or bool(diff is not None and getattr(diff, "retained", []))
+        )
+        ignored = not has_issues and not unknown and bool(diff is not None and diff.suppressed)
+        summary = report.summary
+        if ignored:
+            summary = f"{len(diff.suppressed)} finding{'s' if len(diff.suppressed) != 1 else ''} {'are' if len(diff.suppressed) != 1 else 'is'} ignored or acknowledged."
         emoji = (
             ":grey_question:" if unknown
             else ":red_circle:" if has_critical
-            else ":large_yellow_circle:" if has_issues
+            else ":large_yellow_circle:" if has_issues or ignored
             else ":large_green_circle:"
         )
         title = "Cluster Health Report" + (
             ": Health Unknown" if unknown
             else ": Critical Issues Found" if has_critical
             else ": Issues Found" if has_issues
+            else ": Issues Ignored" if ignored
             else ": Recovered" if recovered
             else ": All Clear"
         )
@@ -178,18 +187,37 @@ class SlackNotifier:
         # which avoids the title showing twice (once as text, once as the header).
         blocks = [
             {"type": "header", "text": {"type": "plain_text", "text": f"{emoji}  {title}"}},
-            {"type": "section", "text": {"type": "mrkdwn", "text": _trunc(report.summary, 2700)}},
+            {"type": "section", "text": {"type": "mrkdwn", "text": _trunc(summary, 2700)}},
         ]
 
         attachments = []
         incomplete = [c for c in getattr(report, "coverage", []) if c.status != "complete"]
         if incomplete:
-            text = "\n".join(f"• {c.area}: {c.status}" for c in incomplete)
-            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "*Collection Coverage*\n" + text}})
+            def coverage_label(area: str) -> str:
+                if area.startswith("disk:"):
+                    identity = area.removeprefix("disk:")
+                    resource, _, _reason = identity.rpartition(":")
+                    parts = resource.split("/", 2)
+                    if len(parts) == 3:
+                        namespace, kind, name = parts
+                        if namespace != "-":
+                            name = f"{namespace}/{name}"
+                        kind = {"pvc": "PVC", "node": "Node", "persistentvolumeclaim": "PVC"}.get(
+                            kind, kind.replace("_", " ").title())
+                        return f"{kind} `{name}` Filesystem"
+                    return "Filesystem Collection"
+                return {"hpas": "HPAs", "keda": "KEDA", "storage": "PVC Usage"}.get(
+                    area, area.replace("_", " ").title())
+
+            text = "\n".join(
+                f"• {coverage_label(c.area)}: {c.detail or ('No samples returned.' if c.status == 'unavailable' else 'Only part of this area was collected.')}"
+                for c in incomplete
+            )
+            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": _trunc("*Collection Coverage*\n" + text, 2700)}})
         if diff is not None and getattr(diff, "retained", []):
             retained = "\n".join(f"• *{r.title}* ({r.severity})" for r in diff.retained)
             blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": _trunc(
-                "*Unverified Findings*\nCurrent evidence is incomplete.\n" + retained, 2700)}})
+                "*Previous Findings*\nCurrent collection did not confirm these findings.\n" + retained, 2700)}})
 
         def _status_prefix(delta) -> str:
             """Lead each finding with what changed about it since the last check."""

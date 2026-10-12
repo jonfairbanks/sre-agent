@@ -43,9 +43,17 @@ class NotificationDelivery:
                 diff = deserialize_diff(payload["diff"]) if payload.get("diff") is not None else None
                 muted_any = False
                 if diff is not None:
+                    alias_loader = getattr(self.db, "load_finding_aliases", None)
+                    aliases = alias_loader() if alias_loader is not None else {}
                     current = self.db.load_tracked_findings()
                     now = self.clock()
                     def muted(fingerprint):
+                        seen = set()
+                        while fingerprint in aliases:
+                            if fingerprint in seen:
+                                raise ValueError("Finding aliases contain a cycle")
+                            seen.add(fingerprint)
+                            fingerprint = aliases[fingerprint]
                         finding = current.get(fingerprint)
                         return finding is not None and (finding.is_ignored(now) or finding.is_acked(now))
                     for bucket in ("new", "escalated", "ongoing"):

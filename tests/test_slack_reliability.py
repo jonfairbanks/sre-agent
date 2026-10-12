@@ -166,7 +166,7 @@ def test_unverified_incident_does_not_render_all_clear_or_recovered():
     assert "Health Unknown" in payload["text"]
     assert "All Clear" not in payload["text"]
     assert "Recovered" not in payload["text"]
-    assert "Unverified Findings" in str(payload["blocks"])
+    assert "Previous Findings" in str(payload["blocks"])
     assert "API Pod Not Ready" in str(payload["blocks"])
     assert "Collection Coverage" in str(payload["blocks"])
 
@@ -238,3 +238,56 @@ def test_current_mute_read_failure_defers_without_sending():
     assert NotificationDelivery(db, notifier, clock=lambda: NOW).drain_once() == 0
     notifier.send_structured_report.assert_not_called()
     assert db.errors == ["RuntimeError"]
+
+
+@pytest.mark.parametrize("severity,headline", [
+    ("critical", "Critical Issues Found"), ("warning", "Issues Found"),
+])
+@pytest.mark.parametrize("with_diff", [False, True])
+def test_active_findings_set_headline_despite_unrelated_collection_failure(severity, headline, with_diff):
+    from monitor_state import StoredFinding, diff_report
+    report = HealthReport(overall_severity="unknown", analysis_valid=False,
+        summary="k2 /var remains above the filesystem alert threshold.", findings=[
+            {"severity": severity, "title": "High Filesystem Usage", "detail": "k2 /var is 94% full.",
+             "kind": "Node", "resource_name": "k2:/var", "reason": "NodeFilesystemUsage"}],
+        coverage=[{"area": "pods", "status": "unavailable", "detail": "Pod API request timed out."}])
+    diff = diff_report(report, {}, NOW) if with_diff else None
+    if diff is not None:
+        diff.retained.append(StoredFinding(fingerprint="prod/pod/api:notready", severity="critical",
+            title="API Pod Not Ready", namespace="prod", first_seen=NOW, last_seen=NOW, times_seen=1))
+    notifier = SlackNotifier("", "C1")
+    notifier._client = Mock()
+    notifier.send_structured_report(report, diff=diff)
+    payload = notifier._client.chat_postMessage.call_args.kwargs
+    assert headline in payload["text"]
+    assert "Health Unknown" not in payload["text"]
+    assert "Pods: Pod API request timed out." in str(payload["blocks"])
+    assert "k2 /var is 94% full." in str(payload["attachments"])
+    if with_diff:
+        assert "Previous Findings" in str(payload["blocks"])
+        assert "Current collection did not confirm these findings." in str(payload["blocks"])
+
+
+def test_missing_filesystem_coverage_names_resource_and_collection_detail():
+    report = HealthReport(overall_severity="unknown", summary="Filesystem samples were not returned.",
+        coverage=[{"area": "disk:-/node/k2:/var:nodefilesystemusage", "status": "unavailable",
+                   "detail": "Node metrics request timed out; k2 /var was not sampled."}])
+    notifier = SlackNotifier("", "C1")
+    notifier._client = Mock()
+    notifier.send_structured_report(report)
+    payload = notifier._client.chat_postMessage.call_args.kwargs
+    assert "Health Unknown" in payload["text"]
+    assert "Node `k2:/var` Filesystem: Node metrics request timed out; k2 /var was not sampled." in str(payload["blocks"])
+    assert "disk:-/node/" not in str(payload["blocks"])
+
+
+def test_no_active_findings_with_missing_collection_never_claims_all_clear():
+    report = HealthReport(overall_severity="ok", summary="No active pod issues found.",
+        coverage=[{"area": "node_metrics", "status": "unavailable"}])
+    notifier = SlackNotifier("", "C1")
+    notifier._client = Mock()
+    notifier.send_structured_report(report)
+    payload = notifier._client.chat_postMessage.call_args.kwargs
+    assert "Health Unknown" in payload["text"]
+    assert "All Clear" not in payload["text"]
+    assert "Node Metrics: No samples returned." in str(payload["blocks"])
