@@ -139,8 +139,8 @@ def test_startup_injects_history_tools_and_manages_delivery(api_state, monkeypat
         if durable:
             assert deliveries[0].stopped
         notifier.send_alert.assert_called_once_with(
-            "ok", "SRE Bot Is Up",
-            "Notification delivery is online. Run a health check from the <https://example.com/sre/|dashboard>.",
+            "ok", "SRE Agent Is Online",
+            "Slack delivery is online.\nRun a health check from the <https://example.com/sre/|dashboard>.",
         )
         db.close.assert_called_once()
         assert api._slack_health.status()["socket"]["state"] == "stopped"

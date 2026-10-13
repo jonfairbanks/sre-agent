@@ -108,12 +108,13 @@ class SlackNotifier:
             label, separator, detail = section.partition("\n")
             text = f"*{label.rstrip(':')}*\n{detail}" if separator and label.startswith("Recent ") else section
             blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": text[:2900]}})
-        context = [severity.title()]
+        context = [] if severity.lower() == "ok" else [severity.title()]
         if namespace:
             context.append(f"Namespace: `{namespace}`")
-        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": " · ".join(context)}]})
+        if context:
+            blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": " · ".join(context)}]})
         return self._post(blocks=blocks, color=color, text=f"{emoji} {title}",
-                          notification_id=notification_id, raise_on_error=raise_on_error)
+                          notification_id=notification_id, raise_on_error=raise_on_error, top_level=True)
 
     def send_structured_report(
         self,
@@ -660,10 +661,14 @@ class SlackNotifier:
         *,
         notification_id: str | None = None,
         raise_on_error: bool = False,
+        top_level: bool = False,
     ) -> Optional[str]:
         """Post a message and return the ts."""
         post_kwargs = {"channel": self.channel, "text": text,
                        "attachments": [{"color": color, "blocks": blocks}]}
+        if top_level:
+            post_kwargs.pop("attachments")
+            post_kwargs["blocks"] = blocks
         if notification_id:
             post_kwargs["client_msg_id"] = notification_id
         try:

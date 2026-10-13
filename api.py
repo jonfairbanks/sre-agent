@@ -875,8 +875,8 @@ async def lifespan(app: FastAPI):
         from slack_notifier import dashboard_link
         _notifier.send_alert(
             "ok",
-            "SRE Bot Is Up",
-            f"Notification delivery is online. Run a health check from the {dashboard_link()}.",
+            "SRE Agent Is Online",
+            f"Slack delivery is online.\nRun a health check from the {dashboard_link()}.",
         )
 
     if not _db.available:

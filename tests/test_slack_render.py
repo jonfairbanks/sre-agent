@@ -292,7 +292,7 @@ def test_crash_alert_separates_summary_logs_and_context(notifier):
         "Pod `worker`, container `app`: `Error`.\nTermination: Error (exit 42).\n"
         "Recent Logs (Current Container):\n```\nfirst line\nRecent Logs: application output\nsecond line\n```\n"
         "Recent Warning Events:\nBackOff: restarting failed container", namespace="apps")
-    blocks = notifier._client.posted["attachments"][0]["blocks"]
+    blocks = notifier._client.posted["blocks"]
     assert [b["type"] for b in blocks] == ["header", "section", "section", "section", "context"]
     assert "Termination: Error (exit 42)" in blocks[1]["text"]["text"]
     assert blocks[2]["text"]["text"] == "*Recent Logs (Current Container)*\n```\nfirst line\nRecent Logs: application output\nsecond line\n```"
@@ -308,3 +308,12 @@ def test_all_clear_report_has_compact_summary(notifier):
     assert payload["blocks"][1]["text"]["text"] == "No active findings in this check."
     assert "scheduled digest" in body(notifier)
     assert "sre_ack" not in body(notifier)
+
+
+def test_startup_alert_has_one_header_and_no_ok_footer(notifier):
+    notifier.send_alert("ok", "SRE Agent Is Online", "Slack delivery is online.\nOpen the dashboard.")
+    payload = notifier._client.posted
+    assert "attachments" not in payload
+    assert [b["type"] for b in payload["blocks"]] == ["header", "section"]
+    assert payload["blocks"][0]["text"]["text"].count("SRE Agent Is Online") == 1
+    assert "Ok" not in str(payload["blocks"])
