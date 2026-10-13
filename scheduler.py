@@ -1404,6 +1404,9 @@ class MonitoringScheduler:
         self._interval = interval_minutes * 60
         self._task: asyncio.Task | None = None
         self._running = False
+        self._stopping = False
+        self._stop_task: asyncio.Task | None = None
+        self._inflight_checks: set[asyncio.Future] = set()
         if db is None:
             from persistence import NullDatabase
 
@@ -1413,20 +1416,36 @@ class MonitoringScheduler:
         self._check_lock = threading.Lock()
 
     async def start(self):
+        if self._stop_task is not None:
+            await asyncio.shield(self._stop_task)
+            self._stop_task = None
         if self._task and not self._task.done():
             return
+        self._stopping = False
         self._running = True
         self._task = asyncio.create_task(self._loop())
         log.info("Monitoring scheduler started (interval=%dm)", self._interval // 60)
 
     async def stop(self):
+        self._stopping = True
         self._running = False
+        if self._stop_task is None:
+            self._stop_task = asyncio.create_task(self._finish_stop())
+        # Canceling a shutdown caller must not cancel the worker drain or let
+        # that caller continue to close resources used by executor threads.
+        await asyncio.shield(self._stop_task)
+
+    async def _finish_stop(self):
         if self._task:
             self._task.cancel()
             try:
                 await self._task
             except asyncio.CancelledError:
                 pass
+        # Canceling an asyncio task does not stop its executor thread. Keep
+        # both scheduled and manual checks alive until persistence completes.
+        if self._inflight_checks:
+            await asyncio.gather(*tuple(self._inflight_checks), return_exceptions=True)
 
     async def trigger_now(self) -> str:
         """Trigger an immediate health check outside the schedule. Returns session_id."""
@@ -1447,11 +1466,16 @@ class MonitoringScheduler:
             await asyncio.sleep(self._interval)
 
     async def _run_check(self) -> str:
+        if self._stopping:
+            raise RuntimeError("Monitoring scheduler is stopping")
         session_id = f"sched-{uuid.uuid4().hex[:8]}"
         log.info("Starting scheduled health check (session=%s)", session_id)
 
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, self._do_check, session_id)
+        loop = asyncio.get_running_loop()
+        check = loop.run_in_executor(None, self._do_check, session_id)
+        self._inflight_checks.add(check)
+        check.add_done_callback(self._inflight_checks.discard)
+        await asyncio.shield(check)
         return session_id
 
     def _do_check(self, session_id: str):
