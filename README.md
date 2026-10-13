@@ -394,6 +394,36 @@ Interactive health checks (`@sre-bot health check`) update finding history and
 queue a report to the original Slack thread. They leave the scheduled digest
 counter unchanged.
 
+### Continuous Crash Alerts
+SRE Agent watches pods and Warning events across all namespaces while the scheduled
+health checks keep their configured interval (60 minutes in the deployment).
+`CrashLoopBackOff`, recent failed container exits, and failed-container restart
+events trigger alerts without an LLM call. Init containers are included. Alerts
+include the termination reason and exit code when available, up to six recent
+log lines from the affected container, and up to three recent Warning events for
+the same pod UID. Log reads use the current container for a terminated state and
+the previous container after a restart. Each read has at most one-second
+connection and read timeouts within a four-second collection budget. Messages
+stay under 2,500 characters. Common credential patterns are redacted and Slack mention markup is escaped. Missing logs or events do not
+block delivery. These excerpts are context, not a confirmed root cause. Clean
+exits, image-pull backoff, and old events do not trigger crash alerts.
+
+Pod and event signals share one notification per pod UID and container, retained
+for 30 days. A replacement pod can trigger a new alert; further crashes of the
+same container in the same pod are covered by scheduled health reports. The
+watcher uses the durable Slack outbox when Postgres is available, including
+retries after delivery failures and deduplication across SRE Agent restarts.
+Without Postgres, deduplication and pending retries last only for this process.
+Hourly reports remain independent and may include an already alerted crash.
+
+Watches resume from their resource version after disconnects and relist when
+Kubernetes expires that version. Startup lists catch current failures and restart
+events from the last five minutes, including events for pods already deleted.
+`/health` exposes pod/event connection status under `crash_watcher`. Existing
+read RBAC already grants `list` and `watch` for pods and events. Set
+`CRASH_WATCH_ENABLED=false` to keep only scheduled checks, or
+`MONITORING_ENABLED=false` to stop both.
+
 ## Integration Status and Delivery
 
 Slack Socket Mode receipt and outbound posting report separate health. A
@@ -467,26 +497,3 @@ TEST_DATABASE_URL=postgresql://sre_agent:testpw@127.0.0.1:55433/sre_agent \
 
 MIT. See [LICENSE](LICENSE).
 
-### Continuous Crash Alerts
-
-SRE Agent watches pods and Warning events across all namespaces while the scheduled
-health checks keep their configured interval (60 minutes in the deployment).
-`CrashLoopBackOff`, recent failed container exits, and failed-container restart
-events trigger alerts without an LLM call. Init containers are included. Clean
-exits, image-pull backoff, and old events do not trigger crash alerts.
-
-Pod and event signals share one notification per pod UID and container, retained
-for 30 days. A replacement pod can trigger a new alert; further crashes of the
-same container in the same pod are covered by scheduled health reports. The
-watcher uses the durable Slack outbox when Postgres is available, including
-retries after delivery failures and deduplication across SRE Agent restarts.
-Without Postgres, deduplication and pending retries last only for this process.
-Hourly reports remain independent and may include an already alerted crash.
-
-Watches resume from their resource version after disconnects and relist when
-Kubernetes expires that version. Startup lists catch current failures and restart
-events from the last five minutes, including events for pods already deleted.
-`/health` exposes pod/event connection status under `crash_watcher`. Existing
-read RBAC already grants `list` and `watch` for pods and events. Set
-`CRASH_WATCH_ENABLED=false` to keep only scheduled checks, or
-`MONITORING_ENABLED=false` to stop both.

@@ -894,10 +894,10 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         _slack_shutdown.set()
-        if _crash_watcher:
-            await _crash_watcher.stop()
-        if _scheduler:
-            await _scheduler.stop()
+        # Stop collectors together so watch timeouts do not delay the check
+        # drain. Both must finish before delivery and Postgres are closed.
+        await asyncio.gather(*(worker.stop() for worker in (_crash_watcher, _scheduler)
+                               if worker is not None))
         if _delivery is not None:
             await _delivery.stop()
         if _slack_handler is not None:
