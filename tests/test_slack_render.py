@@ -290,12 +290,12 @@ def test_recovered_container_events_are_visible_without_new_alert_eligibility(no
 def test_crash_alert_separates_summary_logs_and_context(notifier):
     notifier.send_alert("critical", "Pod Crash Detected",
         "Pod `worker`, container `app`: `Error`.\nTermination: Error (exit 42).\n"
-        "Recent Logs (Current Container):\n```\nfirst line\nsecond line\n```\n"
+        "Recent Logs (Current Container):\n```\nfirst line\nRecent Logs: application output\nsecond line\n```\n"
         "Recent Warning Events:\nBackOff: restarting failed container", namespace="apps")
     blocks = notifier._client.posted["attachments"][0]["blocks"]
     assert [b["type"] for b in blocks] == ["header", "section", "section", "section", "context"]
     assert "Termination: Error (exit 42)" in blocks[1]["text"]["text"]
-    assert blocks[2]["text"]["text"] == "*Recent Logs (Current Container)*\n```\nfirst line\nsecond line\n```"
+    assert blocks[2]["text"]["text"] == "*Recent Logs (Current Container)*\n```\nfirst line\nRecent Logs: application output\nsecond line\n```"
     assert "BackOff" in blocks[3]["text"]["text"]
     assert "Namespace: `apps`" in blocks[-1]["elements"][0]["text"]
 

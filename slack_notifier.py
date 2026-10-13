@@ -96,7 +96,14 @@ class SlackNotifier:
         color = SEVERITY_COLOR.get(severity.lower(), "#718096")
         blocks = [{"type": "header", "text": {"type": "plain_text", "text": f"{emoji} {title}"[:150]}}]
         # Give the crash summary, logs, and events separate reading surfaces.
-        sections = re.split(r"\n(?=Recent Logs|Recent Warning Events)", message)
+        sections = [""]
+        in_code = False
+        for line in message.splitlines():
+            if not in_code and line.startswith(("Recent Logs", "Recent Warning Events")) and sections[-1]:
+                sections.append("")
+            sections[-1] += ("\n" if sections[-1] else "") + line
+            if line.startswith("```"):
+                in_code = not in_code
         for section in sections:
             label, separator, detail = section.partition("\n")
             text = f"*{label.rstrip(':')}*\n{detail}" if separator and label.startswith("Recent ") else section
