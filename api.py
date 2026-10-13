@@ -123,6 +123,7 @@ _executor = ThreadPoolExecutor(max_workers=4)
 _notifier = None   # set in lifespan
 _agent = None      # set in lifespan
 _scheduler = None  # set in lifespan
+_crash_watcher = None
 _db = None         # set in lifespan (persistence.PostgresDatabase | NullDatabase)
 _delivery = None
 _slack_handler = None
@@ -813,7 +814,7 @@ from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _notifier, _agent, _scheduler, _db, _delivery, _slack_health, _slack_handler
+    global _notifier, _agent, _scheduler, _db, _delivery, _slack_health, _slack_handler, _crash_watcher
 
     from llm import validate_provider_credentials
     validate_provider_credentials()
@@ -864,6 +865,12 @@ async def lifespan(app: FastAPI):
     else:
         log.info("MONITORING_ENABLED is false — scheduled health checks not started")
 
+    from config import CRASH_WATCH_ENABLED
+    from crash_watcher import CrashWatcher
+    _crash_watcher = CrashWatcher(_db, _notifier, _delivery)
+    if MONITORING_ENABLED and CRASH_WATCH_ENABLED:
+        await _crash_watcher.start()
+
     if _notifier.enabled:
         from slack_notifier import dashboard_link
         _notifier.send_alert(
@@ -887,6 +894,8 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         _slack_shutdown.set()
+        if _crash_watcher:
+            await _crash_watcher.stop()
         if _scheduler:
             await _scheduler.stop()
         if _delivery is not None:
@@ -956,6 +965,7 @@ def health():
         "slack_enabled": _notifier.enabled if _notifier else False,
         "slack": _slack_health.status(),
         "scheduler_running": _scheduler._running if _scheduler else False,
+        "crash_watcher": _crash_watcher.status() if _crash_watcher else None,
         "state_backend": _db.kind if _db else "uninitialized",
         "durable_state": _db.available if _db else False,
         "approvals_restricted": bool(SLACK_APPROVER_IDS),

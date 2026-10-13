@@ -15,7 +15,7 @@ from schemas import HealthReport
 
 @pytest.fixture
 def api_state(monkeypatch):
-    for name in ("_notifier", "_agent", "_scheduler", "_db", "_delivery", "_slack_handler"):
+    for name in ("_notifier", "_agent", "_scheduler", "_db", "_delivery", "_slack_handler", "_crash_watcher"):
         monkeypatch.setattr(api, name, None)
     monkeypatch.setattr(api, "_slack_health", SlackRuntimeHealth())
     monkeypatch.setattr(api, "_slack_shutdown", threading.Event())
@@ -74,12 +74,14 @@ def test_status_failure_exposes_safe_error_type(api_state, monkeypatch, caplog):
 
 
 @pytest.mark.parametrize("durable", [False, True])
-def test_startup_injects_history_tools_and_manages_delivery(api_state, monkeypatch, durable):
+@pytest.mark.parametrize("monitoring,watch_enabled", [(True, True), (True, False), (False, True)])
+def test_startup_injects_history_tools_and_manages_delivery(api_state, monkeypatch, durable, monitoring, watch_enabled):
     import llm
     import persistence
     import scheduler
     import slack_notifier
     import notification_delivery
+    import crash_watcher
 
     monkeypatch.setattr(llm, "validate_provider_credentials", lambda: None)
     db = Mock(available=durable, kind="postgres" if durable else "memory")
@@ -108,14 +110,29 @@ def test_startup_injects_history_tools_and_manages_delivery(api_state, monkeypat
         async def start(self): self.started = True
         async def stop(self): self.stopped = True
     monkeypatch.setattr(notification_delivery, "NotificationDelivery", Delivery)
+    watchers = []
+    class Watcher:
+        def __init__(self, passed_db, passed_notifier, passed_delivery):
+            assert passed_db is db and passed_notifier is notifier
+            assert passed_delivery is (deliveries[0] if durable else None)
+            self.started = self.stopped = False
+            watchers.append(self)
+        async def start(self): self.started = True
+        async def stop(self): self.stopped = True
+    monkeypatch.setattr(crash_watcher, "CrashWatcher", Watcher)
+    monkeypatch.setattr(api, "MONITORING_ENABLED", monitoring)
+    import config
+    monkeypatch.setattr(config, "CRASH_WATCH_ENABLED", watch_enabled)
     monkeypatch.setattr(api, "threading", SimpleNamespace(Thread=Mock(return_value=Mock())))
     async def run():
         async with api.lifespan(api.app):
+            assert watchers[0].started is (monitoring and watch_enabled)
             names = {tool.name for tool in created["extra_tools"]}
             assert {"get_incident_history", "get_finding_history", "incident_timeline", "list_ignored_findings"} <= names
             assert make_scheduler.call_args.kwargs["delivery"] is (deliveries[0] if durable else None)
             if durable:
                 assert deliveries[0].started
+        assert watchers[0].stopped
         if durable:
             assert deliveries[0].stopped
         notifier.send_alert.assert_called_once_with(
