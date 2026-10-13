@@ -161,7 +161,7 @@ def test_severity_groups_are_ordered_and_complete(notifier):
     notifier.send_structured_report(report(*findings), source="scheduled", diff=diff)
     text = body(notifier)
     assert all(t in text for t in ("crit thing", "warn thing", "info thing"))
-    assert text.index("CRITICAL") < text.index("WARNING") < text.index("INFO")
+    assert text.index("*Critical*") < text.index("*Warning*") < text.index("*Info*")
     assert "Recommended Actions" in text
 
 
@@ -285,3 +285,26 @@ def test_recovered_container_events_are_visible_without_new_alert_eligibility(no
     assert "All Clear" in notifier._client.posted["text"]
     assert not diff.should_notify()
     assert "sre_ignore" not in text
+
+
+def test_crash_alert_separates_summary_logs_and_context(notifier):
+    notifier.send_alert("critical", "Pod Crash Detected",
+        "Pod `worker`, container `app`: `Error`.\nTermination: Error (exit 42).\n"
+        "Recent Logs (Current Container):\n```\nfirst line\nsecond line\n```\n"
+        "Recent Warning Events:\nBackOff: restarting failed container", namespace="apps")
+    blocks = notifier._client.posted["attachments"][0]["blocks"]
+    assert [b["type"] for b in blocks] == ["header", "section", "section", "section", "context"]
+    assert "Termination: Error (exit 42)" in blocks[1]["text"]["text"]
+    assert blocks[2]["text"]["text"] == "*Recent Logs (Current Container)*\n```\nfirst line\nsecond line\n```"
+    assert "BackOff" in blocks[3]["text"]["text"]
+    assert "Namespace: `apps`" in blocks[-1]["elements"][0]["text"]
+
+
+def test_all_clear_report_has_compact_summary(notifier):
+    healthy = report(severity="ok")
+    notifier.send_structured_report(healthy, source="scheduled digest", diff=diff_report(healthy, {}, NOW))
+    payload = notifier._client.posted
+    assert payload["blocks"][0]["type"] == "header"
+    assert payload["blocks"][1]["text"]["text"] == "No active findings in this check."
+    assert "scheduled digest" in body(notifier)
+    assert "sre_ack" not in body(notifier)

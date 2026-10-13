@@ -300,7 +300,7 @@ def test_evidence_reads_exact_main_or_init_container_logs(init, last):
     result = collect_crash_evidence(lambda: client, uid="pod-uid", namespace="apps",
         pod_name="worker-1", container=cs.name, now=NOW, observed_pod=snapshot)
     assert "Termination: Error (exit 1)" in result
-    assert "failure line" in result
+    assert "\n```\nfailure line\n```" in result
     assert client.read_namespaced_pod_log.call_args.kwargs == {
         "container": cs.name, "previous": last, "tail_lines": 6,
         "limit_bytes": 1400, "_request_timeout": (1, 1)}
@@ -309,6 +309,13 @@ def test_evidence_reads_exact_main_or_init_container_logs(init, last):
         "field_selector": "involvedObject.uid=pod-uid,type=Warning", "limit": 10,
         "_request_timeout": (1, 1)}
     client.api_client.close.assert_called_once()
+
+
+def test_log_code_block_cannot_be_closed_by_container_output():
+    result = collect(evidence_client(logs="first line\n```<!channel>\nlast line"))
+    assert result.count("```") == 2
+    assert "&lt;!channel&gt;" in result
+    assert result.endswith("last line\n```")
 
 
 def test_logs_use_latest_status_when_observed_termination_has_restarted():

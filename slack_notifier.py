@@ -94,17 +94,17 @@ class SlackNotifier:
 
         emoji = SEVERITY_EMOJI.get(severity.lower(), ":white_circle:")
         color = SEVERITY_COLOR.get(severity.lower(), "#718096")
-        ns_text = f" · `{namespace}`" if namespace else ""
-
-        blocks = [
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": f"{emoji} *{title}*{ns_text}\n{message}",
-                },
-            }
-        ]
+        blocks = [{"type": "header", "text": {"type": "plain_text", "text": f"{emoji} {title}"[:150]}}]
+        # Give the crash summary, logs, and events separate reading surfaces.
+        sections = re.split(r"\n(?=Recent Logs|Recent Warning Events)", message)
+        for section in sections:
+            label, separator, detail = section.partition("\n")
+            text = f"*{label.rstrip(':')}*\n{detail}" if separator and label.startswith("Recent ") else section
+            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": text[:2900]}})
+        context = [severity.title()]
+        if namespace:
+            context.append(f"Namespace: `{namespace}`")
+        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": " · ".join(context)}]})
         return self._post(blocks=blocks, color=color, text=f"{emoji} {title}",
                           notification_id=notification_id, raise_on_error=raise_on_error)
 
@@ -191,7 +191,7 @@ class SlackNotifier:
         # which avoids the title showing twice (once as text, once as the header).
         blocks = [
             {"type": "header", "text": {"type": "plain_text", "text": f"{emoji}  {title}"}},
-            {"type": "section", "text": {"type": "mrkdwn", "text": _trunc(summary, 2700)}},
+            {"type": "section", "text": {"type": "mrkdwn", "text": _trunc("No active findings in this check." if not (has_issues or unknown or ignored or recovered) else summary, 2700)}},
         ]
 
         attachments = []
@@ -264,14 +264,14 @@ class SlackNotifier:
                 f = item.finding if diff is not None else item
                 ns = f" · `{f.namespace}`" if f.namespace else ""
                 prefix = _status_prefix(item) if diff is not None else ""
-                lines.append(f"• {prefix}*{f.title}*{ns}: {f.detail}")
+                lines.append(f"*{f.title}*{ns}\n{prefix}{f.detail}")
             severity_blocks = [{"type": "section", "text": {
-                "type": "mrkdwn", "text": _trunc(f"{sev_emoji} *{sev.upper()}*\n" + "\n".join(lines), 2700)}}]
+                "type": "mrkdwn", "text": _trunc(f"{sev_emoji} *{sev.title()}*\n" + "\n\n".join(lines), 2700)}}]
             if report_id and diff is not None:
                 from finding_mutes import build_ignore_accessory
                 severity_blocks = []
                 for index, (item, line) in enumerate(zip(group, lines)):
-                    heading = f"{sev_emoji} *{sev.upper()}*\n" if index == 0 else ""
+                    heading = f"{sev_emoji} *{sev.title()}*\n" if index == 0 else ""
                     severity_blocks.append({"type": "section", "text": {
                         "type": "mrkdwn", "text": _trunc(heading + line, 2700)},
                         "accessory": build_ignore_accessory(report_id, item.fingerprint)})

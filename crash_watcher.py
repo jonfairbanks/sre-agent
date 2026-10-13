@@ -145,7 +145,7 @@ def collect_crash_evidence(client_factory, *, uid, namespace, pod_name, containe
         # while the redactor removes the entire secret.
         excerpt = "\n".join(safe_evidence(logs, limit=None).splitlines()[-6:])[:1400]
         source = "Previous Container" if previous else "Current Container"
-        parts.append(f"Recent Logs ({source}):\n{excerpt}")
+        parts.append(f"Recent Logs ({source}):\n```\n{excerpt}\n```")
     else:
         parts.append("Recent Logs: unavailable.")
     recent = [e for e in events if e.involved_object.uid == uid and e.type == "Warning"
