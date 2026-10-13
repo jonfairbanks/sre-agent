@@ -103,6 +103,9 @@ DATABASE_URL = os.getenv("DATABASE_URL", "")
 # ignored. Defaults to true to preserve that de-facto behaviour when unset.
 MONITORING_ENABLED = os.getenv("MONITORING_ENABLED", "true").lower() in ("1", "true", "yes")
 
+# Continuous read-only pod/event monitoring, alongside scheduled snapshots.
+CRASH_WATCH_ENABLED = os.getenv("CRASH_WATCH_ENABLED", "true").lower() in ("1", "true", "yes")
+
 # ---------------------------------------------------------------------------
 # Monitoring notification policy
 # ---------------------------------------------------------------------------

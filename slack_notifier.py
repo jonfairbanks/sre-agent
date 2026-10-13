@@ -83,6 +83,9 @@ class SlackNotifier:
         title: str,
         message: str,
         namespace: str = "",
+        *,
+        notification_id: str | None = None,
+        raise_on_error: bool = False,
     ) -> Optional[str]:
         """Send a severity-tagged alert. Returns message ts or None."""
         if not self.enabled:
@@ -102,7 +105,8 @@ class SlackNotifier:
                 },
             }
         ]
-        return self._post(blocks=blocks, color=color, text=f"{emoji} {title}")
+        return self._post(blocks=blocks, color=color, text=f"{emoji} {title}",
+                          notification_id=notification_id, raise_on_error=raise_on_error)
 
     def send_structured_report(
         self,
@@ -646,14 +650,17 @@ class SlackNotifier:
         blocks: list,
         color: str = "#718096",
         text: str = "SRE Bot notification",
+        *,
+        notification_id: str | None = None,
+        raise_on_error: bool = False,
     ) -> Optional[str]:
         """Post a message and return the ts."""
+        post_kwargs = {"channel": self.channel, "text": text,
+                       "attachments": [{"color": color, "blocks": blocks}]}
+        if notification_id:
+            post_kwargs["client_msg_id"] = notification_id
         try:
-            resp = self._client.chat_postMessage(
-                channel=self.channel,
-                text=text,
-                attachments=[{"color": color, "blocks": blocks}],
-            )
+            resp = self._client.chat_postMessage(**post_kwargs)
             self._channel_id = resp.get("channel") or self._channel_id
             message_ts = resp["ts"]
             self._record_outbound()
@@ -661,6 +668,8 @@ class SlackNotifier:
         except Exception as e:
             self._record_outbound(e)
             log.error("Slack post failed (%s)", safe_error_type(e))
+            if raise_on_error:
+                raise delivery_error(e) from None
             return None
 
 

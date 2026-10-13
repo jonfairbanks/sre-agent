@@ -146,6 +146,12 @@ CREATE TABLE IF NOT EXISTS notification_outbox (
     message_ts text,
     last_error_type text
 );
+CREATE TABLE IF NOT EXISTS crash_alert_dedup (
+    alert_key text PRIMARY KEY,
+    notification_id text NOT NULL UNIQUE,
+    created_at timestamptz NOT NULL
+);
+CREATE INDEX IF NOT EXISTS crash_alert_dedup_time_idx ON crash_alert_dedup (created_at);
 CREATE INDEX IF NOT EXISTS notification_outbox_due_idx
     ON notification_outbox (next_attempt_at) WHERE status <> 'delivered';
 """
@@ -214,6 +220,9 @@ class NullDatabase:
 
     def finding_history(self, fingerprint, limit=20):
         return []
+
+    def enqueue_crash_alert(self, key: str, payload: dict) -> bool:
+        return False
 
     def claim_pending_notifications(self, now, limit=10):
         return []
@@ -630,6 +639,7 @@ class PostgresDatabase:
             conn.execute('DELETE FROM finding_observations WHERE observed_at < %s', (cutoff,))
             conn.execute('DELETE FROM monitor_checks WHERE observed_at < %s', (cutoff,))
             conn.execute("DELETE FROM notification_outbox WHERE status='delivered' AND delivered_at < %s", (cutoff,))
+            self._prune_crash_alerts_on_connection(conn, now)
             # Keep report references for pending alerts, even after history retention.
             conn.execute('''DELETE FROM monitor_reports r WHERE created_at < %s
                             AND NOT EXISTS (SELECT 1 FROM notification_outbox o
@@ -657,6 +667,42 @@ class PostgresDatabase:
                 (self._canonical_fingerprint(conn, fingerprint),
                  self._canonical_fingerprint(conn, fingerprint), max(1, min(int(limit), 100))),
             ).fetchall()
+
+    @staticmethod
+    def _prune_crash_alerts_on_connection(conn, now):
+        cutoff = now - timedelta(days=30)
+        conn.execute("DELETE FROM notification_outbox WHERE status='delivered' AND delivered_at < %s", (cutoff,))
+        # Pending deliveries keep their identity until delivered and retained.
+        conn.execute(
+            """DELETE FROM crash_alert_dedup d WHERE created_at < %s
+               AND NOT EXISTS (SELECT 1 FROM notification_outbox o
+                               WHERE o.id=d.notification_id)""", (cutoff,),
+        )
+
+    def enqueue_crash_alert(self, key: str, payload: dict) -> bool:
+        """Atomically reserve one pod/container alert and queue its delivery."""
+        from psycopg.types.json import Jsonb
+
+        if not key:
+            raise ValueError("Crash alert key must not be empty")
+        now = datetime.now(timezone.utc)
+        notification_id = str(uuid.uuid4())
+        with self._pool.connection() as conn, conn.transaction():
+            self._prune_crash_alerts_on_connection(conn, now)
+            inserted = conn.execute(
+                """INSERT INTO crash_alert_dedup (alert_key,notification_id,created_at)
+                   VALUES (%s,%s,%s) ON CONFLICT (alert_key) DO NOTHING RETURNING alert_key""",
+                (key, notification_id, now),
+            ).fetchone()
+            if not inserted:
+                return False
+            conn.execute(
+                """INSERT INTO notification_outbox
+                   (id,session_id,payload,created_at,next_attempt_at) VALUES (%s,%s,%s,%s,%s)""",
+                (notification_id, f"crash-{notification_id}",
+                 Jsonb({**payload, "type": "crash_alert"}), now, now),
+            )
+        return True
 
     def claim_pending_notifications(self, now, limit=10):
         """Lease due work atomically; expired leases can be retried after a restart."""

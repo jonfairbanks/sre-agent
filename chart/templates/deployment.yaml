@@ -66,6 +66,8 @@ spec:
               value: {{ .Values.config.openaiSubagentModel | quote }}
             - name: MONITORING_ENABLED
               value: {{ .Values.config.monitoringEnabled | quote }}
+            - name: CRASH_WATCH_ENABLED
+              value: {{ .Values.config.crashWatchEnabled | quote }}
             - name: MONITOR_INTERVAL_MINUTES
               value: {{ .Values.config.monitorIntervalMinutes | quote }}
             - name: MONITOR_DIGEST_EVERY_N_CHECKS

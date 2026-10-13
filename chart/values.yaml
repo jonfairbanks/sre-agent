@@ -120,6 +120,7 @@ config:
   openaiSubagentModel: gpt-5.6-luna
 
   monitoringEnabled: true
+  crashWatchEnabled: true
   monitorIntervalMinutes: 60
   monitorDigestEveryNChecks: 12
   monitorNotifyOnResolved: true
