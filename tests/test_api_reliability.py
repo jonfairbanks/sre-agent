@@ -95,8 +95,9 @@ def test_startup_injects_history_tools_and_manages_delivery(api_state, monkeypat
         return Mock()
     monkeypatch.setitem(sys.modules, "agent", SimpleNamespace(create_sre_agent=create_agent))
     scheduled = Mock(_running=False)
+    shutdown_started = asyncio.Event()
     async def start(): pass
-    async def stop(): pass
+    async def stop(): shutdown_started.set()
     scheduled.start = start
     scheduled.stop = stop
     make_scheduler = Mock(return_value=scheduled)
@@ -118,7 +119,9 @@ def test_startup_injects_history_tools_and_manages_delivery(api_state, monkeypat
             self.started = self.stopped = False
             watchers.append(self)
         async def start(self): self.started = True
-        async def stop(self): self.stopped = True
+        async def stop(self):
+            await asyncio.wait_for(shutdown_started.wait(), timeout=1)
+            self.stopped = True
     monkeypatch.setattr(crash_watcher, "CrashWatcher", Watcher)
     monkeypatch.setattr(api, "MONITORING_ENABLED", monitoring)
     import config

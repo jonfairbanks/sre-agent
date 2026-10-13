@@ -8,7 +8,7 @@ import pytest
 from kubernetes import client as k
 from kubernetes.client.exceptions import ApiException
 
-from crash_watcher import CrashWatcher, pod_crashes
+from crash_watcher import CrashWatcher, collect_crash_evidence, pod_crashes, safe_evidence
 
 NOW = datetime(2026, 10, 13, 12, tzinfo=timezone.utc)
 
@@ -46,12 +46,13 @@ def event(*, uid="pod-uid", name="app", age_seconds=0, reason="BackOff",
         last_timestamp=NOW - timedelta(seconds=age_seconds))
 
 
-def watcher(*, durable=False, client=None, factory=None):
+def watcher(*, durable=False, client=None, factory=None, evidence=None):
     db = NS(available=durable, enqueue_crash_alert=Mock(return_value=True))
     notifier = NS(enabled=True, send_alert=Mock(return_value="slack-ts"))
     delivery = NS(wake=Mock())
     instance = CrashWatcher(db, notifier, delivery, clock=lambda: NOW,
-                            client_factory=lambda: client, watch_factory=factory)
+                            client_factory=lambda: client, watch_factory=factory,
+                            evidence_collector=evidence or Mock(return_value=""))
     return instance
 
 
@@ -115,7 +116,7 @@ def test_durable_delivery_uses_same_idempotency_key_and_wakes_on_duplicates():
     instance.notifier.send_alert.assert_not_called()
 
 
-def test_deleted_pod_backoff_event_alerts_without_pod_lookup():
+def test_deleted_pod_backoff_event_alerts_with_injected_evidence():
     instance = watcher(client=Mock())
     instance.handle_event(event(uid="already-deleted", field_path=False))
     instance.notifier.send_alert.assert_called_once()
@@ -274,3 +275,184 @@ def test_memory_retry_stops_before_sending_backlog():
     watcher._retry_memory()
     notifier.send_alert.assert_not_called()
     assert "uid/main" in watcher._pending
+
+
+
+def evidence_client(crashing=None, logs="failure line"):
+    return NS(read_namespaced_pod=Mock(return_value=crashing or pod(main=[container(reason="Error")])),
+              read_namespaced_pod_log=Mock(return_value=logs),
+              list_namespaced_event=Mock(return_value=NS(items=[])),
+              api_client=NS(close=Mock()))
+
+
+def collect(client, **kwargs):
+    return collect_crash_evidence(lambda: client, uid="pod-uid", namespace="apps",
+                                  pod_name="worker-1", container="app", now=NOW, **kwargs)
+
+
+@pytest.mark.parametrize("init", [False, True])
+@pytest.mark.parametrize("last", [False, True])
+def test_evidence_reads_exact_main_or_init_container_logs(init, last):
+    cs = container(name="init-worker" if init else "app", reason="Error", last=last)
+    cs.restart_count = 0 if not last else 2
+    snapshot = pod(init=[cs]) if init else pod(main=[cs])
+    client = evidence_client(snapshot)
+    result = collect_crash_evidence(lambda: client, uid="pod-uid", namespace="apps",
+        pod_name="worker-1", container=cs.name, now=NOW, observed_pod=snapshot)
+    assert "Termination: Error (exit 1)" in result
+    assert "failure line" in result
+    assert client.read_namespaced_pod_log.call_args.kwargs == {
+        "container": cs.name, "previous": last, "tail_lines": 6,
+        "limit_bytes": 1400, "_request_timeout": (1, 1)}
+    assert client.read_namespaced_pod.call_args.kwargs["_request_timeout"] == (1, 1)
+    assert client.list_namespaced_event.call_args.kwargs == {
+        "field_selector": "involvedObject.uid=pod-uid,type=Warning", "limit": 10,
+        "_request_timeout": (1, 1)}
+    client.api_client.close.assert_called_once()
+
+
+def test_logs_use_latest_status_when_observed_termination_has_restarted():
+    client = evidence_client(pod(main=[container(waiting="CrashLoopBackOff", reason="Error", last=True)]))
+    result = collect(client, observed_pod=pod(main=[container(reason="Error", exit_code=42)]))
+    assert client.read_namespaced_pod_log.call_args.kwargs["previous"] is True
+    assert "exit 42" in result
+
+
+@pytest.mark.parametrize("error", [ApiException(status=404, reason="private body"),
+                                    ApiException(status=403, reason="private body"),
+                                    TimeoutError("private body")])
+@pytest.mark.parametrize("method", ["read_namespaced_pod", "read_namespaced_pod_log", "list_namespaced_event"])
+def test_evidence_api_failures_do_not_prevent_alerts_or_leak_exception_bodies(error, method):
+    client = evidence_client()
+    getattr(client, method).side_effect = error
+    instance = watcher(evidence=lambda **kwargs: collect_crash_evidence(lambda: client, **kwargs))
+    instance.handle_pod(pod(main=[container(reason="Error", exit_code=42)]))
+    instance.notifier.send_alert.assert_called_once()
+    message = instance.notifier.send_alert.call_args.args[2]
+    assert "exit 42" in message and "private body" not in message
+    if method == "read_namespaced_pod":
+        client.read_namespaced_pod_log.assert_not_called()
+    if method != "list_namespaced_event":
+        assert "Recent Logs: unavailable" in message
+    else:
+        assert "Recent Warning Events: unavailable" in message
+
+
+def test_replacement_uid_is_never_used_for_logs():
+    client = evidence_client(pod(uid="replacement"))
+    result = collect(client)
+    client.read_namespaced_pod_log.assert_not_called()
+    assert "Recent Logs: unavailable" in result
+
+
+def test_deleted_pod_event_keeps_context_if_lookup_and_listing_fail():
+    client = evidence_client()
+    client.read_namespaced_pod.side_effect = ApiException(status=404)
+    client.list_namespaced_event.side_effect = ApiException(status=403)
+    instance = watcher(evidence=lambda **kwargs: collect_crash_evidence(lambda: client, **kwargs))
+    instance.handle_event(event())
+    message = instance.notifier.send_alert.call_args.args[2]
+    assert "Recent Logs: unavailable" in message
+    assert "BackOff: Back-off restarting failed container app" in message
+    client.read_namespaced_pod_log.assert_not_called()
+
+
+def test_event_context_is_recent_same_uid_warning_deduplicated_and_bounded():
+    client = evidence_client()
+    wrong_type = event(message="normal hidden")
+    wrong_type.type = "Normal"
+    client.list_namespaced_event.return_value.items = [
+        event(uid="different", message="wrong uid hidden"), event(age_seconds=301, message="old hidden"),
+        wrong_type, event(message="newest", age_seconds=0), event(message="newest", age_seconds=0),
+        event(message="second", age_seconds=1), event(message="third", age_seconds=2),
+        event(message="fourth hidden", age_seconds=3)]
+    result = collect(client)
+    assert "newest" in result and "second" in result and "third" in result
+    assert result.count("newest") == 1 and "hidden" not in result
+
+
+def test_log_lines_and_message_size_are_bounded():
+    client = evidence_client(logs="\n".join(f"line-{n} " + "a" * 400 for n in range(12)))
+    instance = watcher(evidence=lambda **kwargs: collect_crash_evidence(lambda: client, **kwargs))
+    instance.handle_pod(pod(main=[container(reason="Error")]))
+    message = instance.notifier.send_alert.call_args.args[2]
+    assert "line-5" not in message and "line-6" in message and len(message) < 2500
+
+
+@pytest.mark.parametrize("secret", [
+    '"token": "sensitive-token"', '"password":"sensitive-password"',
+    "API_KEY=sensitive-key", '"api-key": "sensitive-api-key"',
+    '"aws_secret_access_key": "sensitive-cloud-secret"',
+    "Authorization: Basic sensitive-basic", "Cookie: session=sensitive-cookie",
+    '"Authorization":"Basic sensitive-json-header"', '"Set-Cookie":"session=sensitive-cookie"',
+    "Bearer sensitive-bearer", "https://user:sensitive-uri@example.com",
+    "AKIA1234567890123456", "xoxb-sensitive-slack-token", "ghp_sensitivetoken",
+    "github_pat_sensitive_token", "sk-sensitiveopenaitoken123",
+    "-----BEGIN PRIVATE KEY-----\nsensitive-pem\n-----END PRIVATE KEY-----",
+])
+def test_evidence_redacts_common_credentials(secret):
+    result = safe_evidence(secret)
+    assert "sensitive" not in result and "AKIA" not in result
+    assert "REDACTED" in result
+
+
+def test_evidence_neutralizes_slack_mentions_and_code_fences():
+    result = safe_evidence("<!channel> <@U123> ```oops``` & here")
+    assert "<!" not in result and "<@" not in result and "```" not in result
+    assert "&lt;!channel&gt;" in result and "&amp;" in result
+
+
+@pytest.mark.parametrize("durable", [False, True])
+def test_duplicate_signals_fetch_evidence_only_once(durable):
+    collector = Mock(return_value="Recent Logs: app failed")
+    instance = watcher(durable=durable, evidence=collector)
+    instance.handle_pod(pod(main=[container(reason="Error")]))
+    instance.handle_event(event())
+    instance.handle_pod(pod(main=[container(waiting="CrashLoopBackOff")]))
+    collector.assert_called_once()
+    if durable:
+        assert instance.db.enqueue_crash_alert.call_count == 3
+        assert len({call.args[1]["message"] for call in instance.db.enqueue_crash_alert.call_args_list}) == 1
+    else:
+        instance.notifier.send_alert.assert_called_once()
+
+
+def test_collector_failure_still_delivers_alert():
+    instance = watcher(evidence=Mock(side_effect=RuntimeError("sensitive exception")))
+    instance.handle_event(event())
+    instance.notifier.send_alert.assert_called_once()
+    assert "sensitive" not in instance.notifier.send_alert.call_args.args[2]
+
+
+def test_failed_durable_enqueue_does_not_cache_or_drop_alert():
+    collector = Mock(return_value="failure context")
+    instance = watcher(durable=True, evidence=collector)
+    instance.db.enqueue_crash_alert.side_effect = [RuntimeError("offline"), True]
+    with pytest.raises(RuntimeError):
+        instance.handle_event(event())
+    assert instance._evidence_payloads == {}
+    instance.handle_event(event())
+    assert collector.call_count == 2
+    instance.delivery.wake.assert_called_once()
+
+
+
+def test_evidence_budget_skips_remaining_reads(monkeypatch):
+    ticks = iter([0, 0, 5, 5])
+    monkeypatch.setattr("crash_watcher.time.monotonic", lambda: next(ticks))
+    client = evidence_client()
+    result = collect(client)
+    client.read_namespaced_pod.assert_called_once()
+    client.read_namespaced_pod_log.assert_not_called()
+    client.list_namespaced_event.assert_not_called()
+    assert "Recent Logs: unavailable" in result
+    assert "Recent Warning Events: unavailable" in result
+
+
+
+def test_multiline_private_key_is_redacted_before_log_line_trimming():
+    client = evidence_client(logs="before\n-----BEGIN RSA PRIVATE KEY-----\n" +
+                             "sensitive-material\n" * 10 + "-----END RSA PRIVATE KEY-----\nafter")
+    result = collect(client)
+    assert "sensitive" not in result and "REDACTED PRIVATE KEY" in result
+    assert "after" in result

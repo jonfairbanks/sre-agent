@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 import logging
 import re
 import threading
+import time
 
 from kubernetes import watch
 from kubernetes.client.exceptions import ApiException
@@ -46,9 +47,127 @@ def pod_crashes(pod, now):
     return crashes
 
 
+_SECRET_ASSIGNMENT = re.compile(
+    r'(?i)(["\']?(?:[\w-]*(?:token|password|passwd|secret|api[_-]?key|access[_-]?key)[\w-]*)["\']?\s*[:=]\s*)("[^"\n]*"|\'[^\'\n]*\'|[^\s,;]+)')
+_TOKEN = re.compile(r"(?:AKIA|ASIA)[A-Z0-9]{16}|xox[baprs]-[A-Za-z0-9-]+|gh[pousr]_[A-Za-z0-9]+|github_pat_[A-Za-z0-9_]+|sk-[A-Za-z0-9_-]{16,}")
+
+
+def safe_evidence(value, limit=1400):
+    """Redact common secrets and prevent log text from issuing Slack mentions."""
+    text = str(value or "")
+    text = re.sub(r"-----BEGIN [^-]*PRIVATE KEY-----.*?(?:-----END [^-]*PRIVATE KEY-----|$)",
+                  "[REDACTED PRIVATE KEY]", text, flags=re.S)
+    text = re.sub(r"(?im)(\b(?:authorization|proxy-authorization|cookie|set-cookie)\s*:\s*).*$",
+                  r"\1[REDACTED]", text)
+    text = re.sub(r'(?i)(["\'](?:authorization|proxy-authorization|cookie|set-cookie)["\']\s*:\s*)("[^"\n]*"|\'[^\'\n]*\')',
+                  r"\1[REDACTED]", text)
+    text = _SECRET_ASSIGNMENT.sub(r"\1[REDACTED]", text)
+    text = re.sub(r"(?i)Bearer\s+[A-Za-z0-9._~+/-]+=*", "Bearer [REDACTED]", text)
+    text = re.sub(r"(\w+://)[^\s/:@]+:[^\s/@]+@", r"\1[REDACTED]@", text)
+    text = _TOKEN.sub("[REDACTED]", text)
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    text = text.replace("`", "'")
+    return text if limit is None else text[:limit]
+
+
+def _termination(pod, container):
+    if pod is None:
+        return None, True
+    for status in (pod.status.init_container_statuses or []) + (pod.status.container_statuses or []):
+        if status.name == container:
+            current = status.state.terminated if status.state else None
+            previous = status.last_state.terminated if status.last_state else None
+            return (current, False) if current else (previous, True)
+    return None, True
+
+
+def _event_stamp(event):
+    stamps = [event.last_timestamp, event.event_time, event.first_timestamp,
+              event.series.last_observed_time if event.series else None]
+    return max((stamp for stamp in stamps if stamp is not None), default=None)
+
+
+def collect_crash_evidence(client_factory, *, uid, namespace, pod_name, container,
+                           now, observed_pod=None, observed_event=None):
+    """Read a bounded snapshot. Missing evidence never blocks the crash alert."""
+    deadline = time.monotonic() + 4
+
+    def request_timeout():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.1:
+            raise TimeoutError("Evidence budget exhausted")
+        bound = min(1, remaining / 2)
+        return (bound, bound)
+
+    client = None
+    pod = None
+    logs = None
+    events_available = False
+    events = [observed_event] if observed_event is not None else []
+    try:
+        client = client_factory()
+        try:
+            candidate = client.read_namespaced_pod(pod_name, namespace, _request_timeout=request_timeout())
+            if candidate.metadata.uid == uid:
+                pod = candidate
+        except Exception:
+            pass
+        if pod is not None:
+            _, previous = _termination(pod, container)
+            try:
+                logs = client.read_namespaced_pod_log(
+                    pod_name, namespace, container=container, previous=previous,
+                    tail_lines=6, limit_bytes=1400, _request_timeout=request_timeout())
+            except Exception:
+                pass
+        try:
+            page = client.list_namespaced_event(
+                namespace, field_selector=f"involvedObject.uid={uid},type=Warning",
+                limit=10, _request_timeout=request_timeout())
+            events.extend(page.items)
+            events_available = True
+        except Exception:
+            pass
+    except Exception:
+        pass
+    finally:
+        if client is not None:
+            try:
+                client.api_client.close()
+            except Exception:
+                pass
+    term, _ = _termination(observed_pod or pod, container)
+    parts = []
+    if term:
+        parts.append(f"Termination: {safe_evidence(term.reason or 'Error', 80)} (exit {term.exit_code}).")
+    if isinstance(logs, str) and logs.strip():
+        # Redact before trimming lines so a long PEM block keeps its header
+        # while the redactor removes the entire secret.
+        excerpt = "\n".join(safe_evidence(logs, limit=None).splitlines()[-6:])[:1400]
+        source = "Previous Container" if previous else "Current Container"
+        parts.append(f"Recent Logs ({source}):\n{excerpt}")
+    else:
+        parts.append("Recent Logs: unavailable.")
+    recent = [e for e in events if e.involved_object.uid == uid and e.type == "Warning"
+              and _recent(_event_stamp(e), now)]
+    recent.sort(key=_event_stamp, reverse=True)
+    unique = []
+    for e in recent:
+        line = safe_evidence(f"{e.reason}: {e.message}", 200)
+        if line not in unique:
+            unique.append(line)
+        if len(unique) == 3:
+            break
+    if unique:
+        parts.append("Recent Warning Events:\n" + "\n".join(unique))
+    elif not events_available:
+        parts.append("Recent Warning Events: unavailable.")
+    return "\n".join(parts)[:2200]
+
+
 class CrashWatcher:
     def __init__(self, db, notifier, delivery=None, *, client_factory=core_v1,
-                 watch_factory=watch.Watch, clock=None):
+                 watch_factory=watch.Watch, clock=None, evidence_collector=None):
         self.db, self.notifier, self.delivery = db, notifier, delivery
         self.client_factory, self.watch_factory = client_factory, watch_factory
         self.clock = clock or (lambda: datetime.now(timezone.utc))
@@ -57,6 +176,9 @@ class CrashWatcher:
         self._threads = []
         self._seen = {}
         self._pending = {}
+        self._evidence_payloads = {}
+        self.evidence_collector = evidence_collector or (
+            lambda **kwargs: collect_crash_evidence(self.client_factory, **kwargs))
         self._connected = {"pods": False, "events": False}
 
     def status(self):
@@ -65,17 +187,37 @@ class CrashWatcher:
                 "events_connected": self._connected["events"],
                 "durable": self.db.available}
 
-    def _alert(self, uid, namespace, pod_name, container, reason, restarts=None):
+    def _alert(self, uid, namespace, pod_name, container, reason, restarts=None,
+               *, observed_pod=None, observed_event=None):
         if not uid or not container:
             return
         key = f"{uid}/{container}"
-        payload = {"type": "crash_alert", "severity": "critical",
-                   "title": "Pod Crash Detected", "namespace": namespace,
-                   "message": f"Pod `{pod_name}`, container `{container}`: `{reason}`."
-                   + (f" Restarts: {restarts}." if restarts is not None else "")}
         with self._lock:
+            cutoff = self.clock() - timedelta(days=30)
+            self._evidence_payloads = {k: v for k, v in self._evidence_payloads.items() if v[0] >= cutoff}
+            cached = self._evidence_payloads.get(key)
+            if cached:
+                payload = cached[1]
+            else:
+                message = (f"Pod `{safe_evidence(pod_name, 150)}`, container `{safe_evidence(container, 150)}`: "
+                           f"`{safe_evidence(reason, 80)}`."
+                           + (f" Restarts: {restarts}." if restarts is not None else ""))
+                try:
+                    evidence = self.evidence_collector(
+                        uid=uid, namespace=namespace, pod_name=pod_name, container=container,
+                        now=self.clock(), observed_pod=observed_pod, observed_event=observed_event)
+                except Exception:
+                    evidence = "Recent Logs: unavailable."
+                if evidence:
+                    message += "\n" + str(evidence)
+                payload = {"type": "crash_alert", "severity": "critical",
+                           "title": "Pod Crash Detected", "namespace": namespace,
+                           "message": message[:2499]}
+                # Cache only after durable enqueue succeeds below, so a failed
+                # enqueue remains retryable without marking the alert delivered.
             if self.db.available:
                 queued = self.db.enqueue_crash_alert(key, payload)
+                self._evidence_payloads[key] = (self.clock(), payload)
                 if queued:
                     log.info("Crash alert queued (namespace=%s, pod=%s, container=%s)",
                              namespace, pod_name, container)
@@ -88,6 +230,7 @@ class CrashWatcher:
                 self._seen = {k: v for k, v in self._seen.items() if v >= cutoff}
                 if key not in self._seen:
                     self._pending.setdefault(key, payload)
+                    self._evidence_payloads[key] = (self.clock(), payload)
                     self._retry_memory()
 
     def _retry_memory(self):
@@ -109,7 +252,7 @@ class CrashWatcher:
     def handle_pod(self, pod):
         for container, reason, restarts in pod_crashes(pod, self.clock()):
             self._alert(pod.metadata.uid, pod.metadata.namespace, pod.metadata.name,
-                        container, reason, restarts)
+                        container, reason, restarts, observed_pod=pod)
 
     def handle_event(self, event):
         ref = event.involved_object
@@ -119,12 +262,13 @@ class CrashWatcher:
         if ref.kind != "Pod" or event.type != "Warning" or not _recent(stamp, self.clock()):
             return
         # Generic BackOff also covers image pulls. Only failed-container restart
-        # events are crash evidence. Do not copy arbitrary event messages to Slack.
+        # events trigger alerts; context is bounded and redacted by the collector.
         match = _CONTAINER.search(ref.field_path or "")
         failed = _BACKOFF_CONTAINER.search(event.message or "")
         if event.reason == "BackOff" and failed:
             container = match.group(1) if match else failed.group(1)
-            self._alert(ref.uid, event.metadata.namespace, ref.name, container, "CrashLoopBackOff")
+            self._alert(ref.uid, event.metadata.namespace, ref.name, container, "CrashLoopBackOff",
+                        observed_event=event)
 
     def _consume(self, kind):
         client = None
