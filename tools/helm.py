@@ -1,6 +1,7 @@
 """Helm tools — read and write operations for Helm release management."""
 from __future__ import annotations
 import json
+import os
 import subprocess
 import traceback
 from langchain.tools import tool
@@ -11,7 +12,15 @@ def _helm(*args: str, timeout: int = 30) -> tuple[bool, str]:
     try:
         result = subprocess.run(
             ["helm", *args],
-            capture_output=True, text=True, timeout=timeout
+            capture_output=True, text=True, timeout=timeout,
+            env={**os.environ, **{
+                name: os.environ.get(name) or f"/tmp/sre-agent-helm/{directory}"
+                for name, directory in (
+                    ("HELM_CONFIG_HOME", "config"),
+                    ("HELM_CACHE_HOME", "cache"),
+                    ("HELM_DATA_HOME", "data"),
+                )
+            }},
         )
         if result.returncode != 0:
             return False, f"helm {' '.join(args)} failed:\n{result.stderr.strip()}"

@@ -31,62 +31,67 @@ def check_env():
         sys.exit(1)
 
 
-def handle_interrupt(result: dict) -> str | None:
-    """Display interrupt details and prompt user for approve/reject/edit decision.
-    Returns the decision type or None to cancel."""
-    interrupts = result.get("__interrupt__", [])
-    if not interrupts:
-        return None
-
-    for interrupt in interrupts:
-        console.print()
-        console.print(Panel(
-            str(interrupt),
-            title="[yellow bold]⚠ APPROVAL REQUIRED[/yellow bold]",
-            border_style="yellow",
-        ))
-
-    console.print("[dim]Options: [bold]y[/bold]=approve  [bold]n[/bold]=reject  [bold]e[/bold]=edit  [bold]q[/bold]=quit[/dim]")
+def handle_interrupt(action: dict) -> dict | None:
+    """Review one tool call and return its decision, or None to cancel."""
+    console.print()
+    console.print(Panel(
+        str(action),
+        title="[yellow bold]Approval Required[/yellow bold]",
+        border_style="yellow",
+    ))
+    console.print("[dim]y=approve  n=reject  e=edit  q=quit[/dim]")
     choice = Prompt.ask("Your decision", choices=["y", "n", "e", "q"], default="n")
-    return choice
+    if choice == "y":
+        return {"type": "approve"}
+    if choice == "n":
+        return {
+            "type": "reject",
+            "message": Prompt.ask("Reason for rejection (optional)", default=""),
+        }
+    if choice == "e":
+        console.print("[dim]Enter changed arguments as key=value pairs. Empty line to finish.[/dim]")
+        edited_args = dict(action.get("args", {}))
+        while True:
+            line = input("  ").strip()
+            if not line:
+                break
+            if "=" in line:
+                key, value = line.split("=", 1)
+                edited_args[key.strip()] = value.strip()
+        return {
+            "type": "edit",
+            "edited_action": {"name": action["name"], "args": edited_args},
+        }
+    return None
 
 
 def run_with_hitl(agent, messages: list[dict], config: dict) -> dict:
-    """Invoke agent and handle any HITL interrupts in a loop."""
+    """Review every pending action and route decisions to its interrupt."""
     result = agent.invoke({"messages": messages}, config=config)
-
-    while "__interrupt__" in result and result["__interrupt__"]:
-        choice = handle_interrupt(result)
-
-        if choice == "y":
-            result = agent.invoke(
-                Command(resume={"decisions": [{"type": "approve"}]}),
-                config=config,
-            )
-        elif choice == "n":
-            feedback = Prompt.ask("Reason for rejection (optional)", default="")
-            result = agent.invoke(
-                Command(resume={"decisions": [{"type": "reject", "message": feedback}]}),
-                config=config,
-            )
-        elif choice == "e":
-            console.print("[dim]Enter edited arguments as key=value pairs, one per line. Empty line to finish.[/dim]")
-            edited_args = {}
-            while True:
-                line = input("  ").strip()
-                if not line:
-                    break
-                if "=" in line:
-                    k, v = line.split("=", 1)
-                    edited_args[k.strip()] = v.strip()
-            result = agent.invoke(
-                Command(resume={"decisions": [{"type": "edit", "args": edited_args}]}),
-                config=config,
-            )
-        else:  # quit
-            console.print("[yellow]Cancelled.[/yellow]")
-            return result
-
+    while result.get("__interrupt__"):
+        interrupts = result["__interrupt__"]
+        resumes = {}
+        for interrupt in interrupts:
+            value = interrupt.value
+            actions = value.get("action_requests", []) if isinstance(value, dict) else []
+            if not actions:
+                console.print("[yellow]Cannot review an interrupt without action requests.[/yellow]")
+                return result
+            decisions = []
+            for action in actions:
+                decision = handle_interrupt(action)
+                if decision is None:
+                    console.print("[yellow]Cancelled.[/yellow]")
+                    return result
+                decisions.append(decision)
+            interrupt_id = getattr(interrupt, "id", None)
+            if not interrupt_id and len(interrupts) > 1:
+                console.print("[yellow]Cannot route multiple interrupts without IDs.[/yellow]")
+                return result
+            resumes[interrupt_id] = {"decisions": decisions}
+        # Current LangGraph routes by ID; older single interrupts accept a payload.
+        resume = resumes if None not in resumes else resumes[None]
+        result = agent.invoke(Command(resume=resume), config=config)
     return result
 
 
