@@ -21,6 +21,8 @@ rules:
       - configmaps
       - serviceaccounts
       - replicationcontrollers
+      - endpoints
+      - limitranges
     verbs: ["get", "list", "watch"]
 
   # Required for the kubelet Summary API used by the PVC-utilisation collector.
@@ -71,7 +73,19 @@ rules:
       - customresourcedefinitions
     verbs: ["get", "list", "watch"]
 
-  # Read all custom resource instances across all CRD groups
-  - apiGroups: ["*"]
-    resources: ["*"]
+  # Explicit custom-resource and RBAC observation permissions.
+  - apiGroups: ["argoproj.io"]
+    resources: ["applications"]
+    verbs: ["get", "list"]
+  - apiGroups: ["secrets.hashicorp.com"]
+    resources: ["vaultstaticsecrets", "vaultdynamicsecrets", "vaultauths", "vaultconnections"]
+    verbs: ["get", "list"]
+  - apiGroups: ["keda.sh"]
+    resources: ["scaledobjects"]
+    verbs: ["get"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterroles", "clusterrolebindings", "roles", "rolebindings"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get"]

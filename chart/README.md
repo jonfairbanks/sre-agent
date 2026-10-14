@@ -91,3 +91,17 @@ For private GitHub sources, add `GITOPS_GITHUB_TOKEN` to the existing Secret.
 Use a fine-grained token with Contents read-only permission for only the
 allowlisted repositories. HTTPS and GitHub SSH sources are supported; source
 reads and proposals never publish changes.
+
+## RBAC Scope
+
+Reader and optional writer roles use explicit API groups, resources, and verbs.
+Secret data and RBAC mutation are excluded. Writer creation stays disabled by
+default. Registered workload writes retain human approval when permissions are
+enabled. Arbitrary custom-resource operations are denied unless the operator
+adds the needed exact rules through `rbac.read.extraRules` or
+`rbac.write.extraRules`. Keep those extensions limited to required resource
+names and verbs; do not use wildcards.
+
+Helm release inspection uses Helm’s Secret-backed release store. These roles
+do not grant that access; separately scoped storage permissions are needed
+for those commands. Writable Helm cache paths do not change RBAC authority.

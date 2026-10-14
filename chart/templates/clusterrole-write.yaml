@@ -7,8 +7,14 @@ metadata:
     {{- include "sre-agent.labels" . | nindent 4 }}
 rules:
   - apiGroups: ["apps"]
-    resources: ["deployments", "deployments/scale", "statefulsets", "daemonsets"]
+    resources: ["deployments", "statefulsets", "daemonsets"]
+    verbs: ["create", "patch", "update", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale"]
     verbs: ["patch", "update"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["delete"]
   - apiGroups: ["autoscaling"]
     resources: ["horizontalpodautoscalers"]
     verbs: ["create", "patch", "update", "delete"]
@@ -24,7 +30,10 @@ rules:
   - apiGroups: [""]
     resources: ["configmaps", "services"]
     verbs: ["create", "patch", "update", "delete"]
-  - apiGroups: ["*"]
-    resources: ["*"]
-    verbs: ["create", "patch", "update", "delete"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["patch", "delete"]
+{{- with .Values.rbac.write.extraRules }}
+{{ toYaml . | indent 2 }}
+{{- end }}
 {{- end }}

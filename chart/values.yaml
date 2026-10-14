@@ -22,11 +22,15 @@ rbac:
   # The agent needs cluster-wide reads to inspect all namespaces and nodes.
   read:
     create: true
+    # Additional exact CRD permissions, configured by the cluster operator.
+    extraRules: []
   # This grants broad cluster-wide mutation rights. Every write remains subject
   # to the application's HITL gate, but production installs should enable this
   # only after configuring authenticated approval access.
   write:
     create: false
+    # Additional exact CRD permissions; does not enable writer creation.
+    extraRules: []
 
 podAnnotations: {}
 podLabels: {}
