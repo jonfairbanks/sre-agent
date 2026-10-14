@@ -82,10 +82,36 @@ class Session:
     slack_thread_ts: Optional[str] = None  # thread to reply in
     pending_hitl_actor: Optional[str] = None      # set on click, cleared on finalize
     pending_hitl_approved: Optional[bool] = None  # set on click, cleared on finalize
-    event_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
+    # Each connection owns a bounded queue, used only on the server event loop.
+    subscribers: set[asyncio.Queue] = field(default_factory=set, repr=False)
+    terminal_event: Optional[dict] = field(default=None, repr=False)
+
+    def subscribe(self) -> asyncio.Queue:
+        queue = asyncio.Queue(maxsize=32)
+        self.subscribers.add(queue)
+        # Reconnects recover the current outcome without consuming another
+        # connection's events. Running sessions wait for their next event.
+        if self.status == SessionStatus.DONE:
+            queue.put_nowait({"type": "done", "data": self.last_response})
+        elif self.status == SessionStatus.INTERRUPTED:
+            queue.put_nowait({"type": "interrupt", "data": self.interrupt_data})
+        elif self.status == SessionStatus.ERROR:
+            queue.put_nowait(self.terminal_event or {
+                "type": "error", "data": "The agent run failed. Start a new request.",
+            })
+        return queue
+
+    async def publish(self, event: dict) -> None:
+        """Broadcast without letting a slow connection block the agent."""
+        if event["type"] in ("done", "interrupt", "error"):
+            self.terminal_event = event
+        for queue in self.subscribers:
+            if queue.full():
+                queue.get_nowait()  # Drop oldest progress; keep the latest outcome.
+            queue.put_nowait(event)
 
     def to_row(self) -> dict:
-        """Durable fields only — event_queue is per-process and not persisted."""
+        """Durable fields only. Subscribers and event snapshots stay in memory."""
         return {
             "id": self.id,
             "thread_id": self.thread_id,
@@ -102,7 +128,7 @@ class Session:
 
     @classmethod
     def from_row(cls, row: dict) -> "Session":
-        """Rebuild a session from Postgres with a fresh event queue."""
+        """Rebuild a session from Postgres without active subscribers."""
         return cls(
             id=row["id"],
             thread_id=row["thread_id"],
@@ -260,7 +286,7 @@ def _finalize_hitl_message(session: Session, result_text: str = ""):
 
 
 def _handle_result(result: dict, session: Session, loop):
-    """Process an agent result — put events on the session queue and send Slack msgs."""
+    """Broadcast an agent result and send Slack messages."""
     # Resolve any in-flight HITL message before posting a new one
     _finalize_hitl_message(session)
 
@@ -287,7 +313,7 @@ def _handle_result(result: dict, session: Session, loop):
             _save(session)
 
         asyncio.run_coroutine_threadsafe(
-            session.event_queue.put({"type": "interrupt", "data": session.interrupt_data}),
+            session.publish({"type": "interrupt", "data": session.interrupt_data}),
             loop,
         )
     else:
@@ -309,16 +335,14 @@ def _handle_result(result: dict, session: Session, loop):
             )
             _notifier.send_health_report(response, has_issues=has_issues, source="scheduled")
 
-        asyncio.run_coroutine_threadsafe(
-            session.event_queue.put({"type": "done", "data": response}),
-            loop,
-        )
         todos = result.get("todos", [])
         if todos:
             asyncio.run_coroutine_threadsafe(
-                session.event_queue.put({"type": "todos", "data": todos}),
-                loop,
+                session.publish({"type": "todos", "data": todos}), loop,
             )
+        asyncio.run_coroutine_threadsafe(
+            session.publish({"type": "done", "data": response}), loop,
+        )
 
 
 def _run_agent_sync(agent, messages: list[dict], config: dict, session: Session, loop):
@@ -330,7 +354,7 @@ def _run_agent_sync(agent, messages: list[dict], config: dict, session: Session,
         session.status = SessionStatus.ERROR
         _save(session)
         asyncio.run_coroutine_threadsafe(
-            session.event_queue.put({"type": "error", "data": str(e)}), loop
+            session.publish({"type": "error", "data": str(e)}), loop
         )
 
 
@@ -343,7 +367,7 @@ def _resume_agent_sync(agent, command: Command, config: dict, session: Session, 
         session.status = SessionStatus.ERROR
         _save(session)
         asyncio.run_coroutine_threadsafe(
-            session.event_queue.put({"type": "error", "data": str(e)}), loop
+            session.publish({"type": "error", "data": str(e)}), loop
         )
 
 
@@ -351,7 +375,7 @@ def _do_approve(session: Session, loop):
     """Approve a HITL interrupt — usable from both API handlers and Slack Bolt threads."""
     session.status = SessionStatus.RUNNING
     _save(session)
-    session.event_queue = asyncio.Queue()
+    session.terminal_event = None
     config = make_agent_config(session.thread_id)
     loop.run_in_executor(
         _executor,
@@ -368,7 +392,7 @@ def _do_reject(session: Session, reason: str, loop):
     """Reject a HITL interrupt — usable from both API handlers and Slack Bolt threads."""
     session.status = SessionStatus.RUNNING
     _save(session)
-    session.event_queue = asyncio.Queue()
+    session.terminal_event = None
     config = make_agent_config(session.thread_id)
     loop.run_in_executor(
         _executor,
@@ -1092,7 +1116,7 @@ async def chat(req: ChatRequest):
 
     session.status = SessionStatus.RUNNING
     _save(session)
-    session.event_queue = asyncio.Queue()
+    session.terminal_event = None
     loop = asyncio.get_event_loop()
     loop.run_in_executor(
         _executor,
@@ -1112,16 +1136,18 @@ async def stream_events(session_id: str):
     session = _get_session(session_id)
 
     async def generator():
-        while True:
-            try:
-                event = await asyncio.wait_for(session.event_queue.get(), timeout=60.0)
-                yield json.dumps(event)
-                if event["type"] in ("done", "error"):
-                    break
-                if event["type"] == "interrupt":
-                    break
-            except asyncio.TimeoutError:
-                yield json.dumps({"type": "heartbeat"})
+        queue = session.subscribe()
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=60.0)
+                    yield json.dumps(event)
+                    if event["type"] in ("done", "error", "interrupt"):
+                        break
+                except asyncio.TimeoutError:
+                    yield json.dumps({"type": "heartbeat"})
+        finally:
+            session.subscribers.discard(queue)
 
     return EventSourceResponse(generator())
 
@@ -1181,7 +1207,7 @@ async def edit(req: EditRequest):
     _audit(session, "edit", actor="api-user", result=json.dumps(req.args)[:2000])
     session.status = SessionStatus.RUNNING
     _save(session)
-    session.event_queue = asyncio.Queue()
+    session.terminal_event = None
     loop = asyncio.get_event_loop()
     loop.run_in_executor(
         _executor,
