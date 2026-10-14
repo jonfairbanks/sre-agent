@@ -114,6 +114,19 @@ python api.py         # API + web UI at http://localhost:8080
 | `TOOL_OUTPUT_MAX_CHARS` | No | Max characters a single tool result may add to context (default: `12000`) |
 | `CORS_ALLOW_ORIGINS` | No | Comma-separated browser origins allowed to call `/api/*`. Empty (default) means none; the bundled UI is same-origin and needs no grant |
 
+### Session Event Streams
+
+`GET /api/sessions/{session_id}/events` supports multiple connections to the same
+session. Each receives its own events; disconnecting removes its subscription.
+Completed, interrupted, and failed sessions send their current outcome on
+reconnect and close the stream. Streams use the existing JSON `type`/`data`
+format, so native `EventSource` clients work without a replay cursor.
+
+Each connection buffers up to 32 events. A slow connection drops the oldest
+buffered progress when full, retaining the latest outcome. Progress history is
+not replayed. After a restart, stored session state restores completion or
+approval details; failed sessions return a generic error.
+
 ## Deploy to Kubernetes
 
 ### Helm (Recommended)
