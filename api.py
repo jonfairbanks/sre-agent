@@ -1202,6 +1202,11 @@ async def edit(req: EditRequest):
     session = _get_session(req.session_id)
     if session.status != SessionStatus.INTERRUPTED:
         raise HTTPException(409, f"Session not interrupted (status={session.status})")
+    if session.pending_decisions != 1 or len(session.pending_actions) != 1:
+        raise HTTPException(409, "Edit requires one pending action. Approve or reject the batch instead.")
+    action_name = session.pending_actions[0].get("name")
+    if not action_name:
+        raise HTTPException(409, "Pending action has no tool name. Reject it and start a new request.")
     # An edit is an approval with modified arguments — record what was actually
     # authorised, not just that something was.
     _audit(session, "edit", actor="api-user", result=json.dumps(req.args)[:2000])
@@ -1213,7 +1218,9 @@ async def edit(req: EditRequest):
         _executor,
         _resume_agent_sync,
         _agent,
-        Command(resume={"decisions": [{"type": "edit", "args": req.args}] * session.pending_decisions}),
+        Command(resume={"decisions": [{
+            "type": "edit", "edited_action": {"name": action_name, "args": req.args},
+        }]}),
         make_agent_config(session.thread_id),
         session,
         loop,

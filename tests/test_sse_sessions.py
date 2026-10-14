@@ -125,7 +125,8 @@ def test_agent_result_publishes_todos_before_completion():
 @pytest.mark.parametrize("resume", ["approve", "reject", "edit", "chat"])
 def test_starting_next_run_preserves_active_subscribers(monkeypatch, resume):
     async def scenario():
-        session = api.Session("resume", "resume", status=api.SessionStatus.INTERRUPTED)
+        session = api.Session("resume", "resume", status=api.SessionStatus.INTERRUPTED,
+                              pending_actions=[{"name": "kubectl_scale", "args": {"replicas": 2}}])
         api._sessions[session.id] = session
         queue = session.subscribe()
         queue.get_nowait()
