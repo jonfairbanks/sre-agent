@@ -205,14 +205,12 @@ printf '%s' 'sk-...'     | base64 # OPENAI_API_KEY (when LLM_PROVIDER=openai)
 echo -n "lsv2_..."  | base64   # LANGSMITH_API_KEY
 echo -n "xoxb-..."  | base64   # SLACK_BOT_TOKEN
 echo -n "xapp-..."  | base64   # SLACK_APP_TOKEN
-# POSTGRES_PASSWORD must be alphanumeric. deployment.yaml interpolates it into
-# DATABASE_URL, and a /, + or @ would corrupt the DSN.
-LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 40 | base64
+# Optional: add DATABASE_URL for an externally managed Postgres database.
+# URL-encode reserved characters in the DSN password.
 # Paste values into k8s/secret.yaml
 
-# 4. Apply (includes the Postgres StatefulSet backing durable state)
+# 4. Apply the raw manifests
 kubectl apply -k k8s/
-kubectl rollout status statefulset/sre-agent-postgres -n sre-agent
 
 # 5. Access the UI
 kubectl port-forward svc/sre-agent 8080:80 -n sre-agent
@@ -286,7 +284,6 @@ subagents/
   change_executor.py      Only subagent with write tools
 k8s/                  Kustomize manifests for cluster deployment
   secret.yaml.example   Template for the secret; copy to secret.yaml and fill in
-                      (postgres.yaml = StatefulSet + Service + NetworkPolicy)
 tests/
   test_monitor_state.py   Fingerprint stability and diff semantics
   test_slack_render.py    Block Kit rendering for every diff shape
@@ -298,19 +295,28 @@ evals/
   upload_online_evals.py    Script to register online evaluators
 ```
 
+### Helm Repository State
+
+Helm tools default their configuration, cache, and data directories to
+`/tmp/sre-agent-helm/{config,cache,data}`. This supports the read-only container
+filesystem. Set `HELM_CONFIG_HOME`, `HELM_CACHE_HOME`, and `HELM_DATA_HOME` to
+writable directories to override these defaults. Repository state is ephemeral
+with the default `/tmp` volume. Administrators can populate repositories before
+startup or supply repository configuration and cache through mounted directories.
+The default agent does not register the Helm repository write tools.
+
+
 ## Durable State
 
 Checkpoints, sessions, the HITL audit log, monitoring finding-state, finding
 ignores, check/history records, and the Slack delivery outbox live in
-Postgres (`k8s/postgres.yaml` deploys a StatefulSet into the `sre-agent`
-namespace). Without it, a pod restart stranded every pending approval. The Slack
-Approve button stayed live but the session behind it was gone, so the click
-dead-ended and the proposed change could neither be applied nor rejected.
+Postgres when `DATABASE_URL` is configured. Without it, state stays in memory
+and pending approvals do not survive a restart.
 
-`DATABASE_URL` is assembled in `k8s/deployment.yaml` from `POSTGRES_PASSWORD`
-via `$(VAR)` interpolation, so the credential lives in exactly one place. Use an
-alphanumeric password, because a `/`, `+`, or `@` would corrupt the DSN it is
-interpolated into.
+The raw manifests import optional `DATABASE_URL` from `sre-agent-secrets`.
+Provide a DSN for an externally managed Postgres database in that Secret.
+URL-encode reserved characters in the password. The repository does not deploy
+Postgres with the raw manifests.
 
 If Postgres is unreachable the process logs loudly and **degrades to in-memory
 state rather than refusing to boot**, so a cluster problem cannot also remove
@@ -489,8 +495,7 @@ TEST_DATABASE_URL=postgresql://sre_agent:testpw@127.0.0.1:55433/sre_agent \
 
 - `k8s/secret.yaml` is in `.gitignore`: never commit it
 - The container runs as a non-root user (`uid 1000`)
-- Postgres traffic is unencrypted cluster-internal traffic; a NetworkPolicy in
-  `k8s/postgres.yaml` restricts port 5432 to the `sre-agent` pod
+- Configure TLS and restrict access to the managed Postgres database to trusted clients
 - If you suspect keys were exposed, rotate them immediately via the respective provider dashboards
 
 ## License
