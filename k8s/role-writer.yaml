@@ -11,40 +11,29 @@ metadata:
     app.kubernetes.io/name: sre-agent
 rules:
   - apiGroups: ["apps"]
-    resources:
-      - deployments
-      - deployments/scale
-      - statefulsets
-      - daemonsets
+    resources: ["deployments", "statefulsets", "daemonsets"]
+    verbs: ["create", "patch", "update", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale"]
     verbs: ["patch", "update"]
-
-  - apiGroups: ["autoscaling"]
-    resources:
-      - horizontalpodautoscalers
-    verbs: ["create", "patch", "update", "delete"]
-
-  - apiGroups: ["networking.k8s.io"]
-    resources:
-      - ingresses
-    verbs: ["create", "patch", "update", "delete"]
-
-  - apiGroups: [""]
-    resources:
-      - pods
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
     verbs: ["delete"]
-
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["create", "patch", "update", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["create", "patch", "update", "delete"]
   - apiGroups: [""]
-    resources:
-      - nodes
+    resources: ["pods"]
+    verbs: ["delete"]
+  - apiGroups: [""]
+    resources: ["nodes"]
     verbs: ["patch", "update"]
-
   - apiGroups: [""]
-    resources:
-      - configmaps
-      - services
+    resources: ["configmaps", "services"]
     verbs: ["create", "patch", "update", "delete"]
-
-  # Custom resource writes — all CRD groups, gated by HITL
-  - apiGroups: ["*"]
-    resources: ["*"]
-    verbs: ["create", "patch", "update", "delete"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["patch", "delete"]

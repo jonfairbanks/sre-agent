@@ -17,6 +17,11 @@ rules:
       - persistentvolumeclaims
       - persistentvolumes
       - resourcequotas
+      - configmaps
+      - endpoints
+      - limitranges
+      - serviceaccounts
+      - replicationcontrollers
     verbs: ["get", "list", "watch"]
   # Required for the kubelet Summary API used by the PVC-utilisation collector.
   - apiGroups: [""]
@@ -56,4 +61,10 @@ rules:
   - apiGroups: ["rbac.authorization.k8s.io"]
     resources: ["clusterroles", "clusterrolebindings", "roles", "rolebindings"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get"]
+{{- with .Values.rbac.read.extraRules }}
+{{ toYaml . | indent 2 }}
+{{- end }}
 {{- end }}
