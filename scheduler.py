@@ -296,6 +296,28 @@ def _classify_pod(pod, now) -> tuple[bool, str, dict]:
     if phase == "Pending":
         return age_minutes > POD_STARTUP_GRACE_MINUTES, "Pending", extra
 
+    # Container completion can reach the API before the pod phase becomes
+    # Succeeded. Finished batch containers are no longer Ready by design.
+    spec = getattr(pod, "spec", None)
+    if phase == "Running" and getattr(spec, "restart_policy", None) in {"Never", "OnFailure"}:
+        expected = list(getattr(spec, "containers", None) or [])
+        expected_init = list(getattr(spec, "init_containers", None) or [])
+        init_statuses = list(getattr(pod.status, "init_container_statuses", None) or [])
+
+        def completed(containers, observed):
+            if {c.name for c in containers} != {cs.name for cs in observed}:
+                return False
+            return all(
+                (term := getattr(cs.state, "terminated", None)) is not None
+                and term.exit_code == 0
+                and term.reason not in FAILURE_TERMINATION_REASONS
+                and not getattr(term, "signal", None)
+                for cs in observed
+            )
+
+        if expected and completed(expected, statuses) and completed(expected_init, init_statuses):
+            return False, "Completed", extra
+
     # 4. Running but not ready past the grace period.
     if not ready and age_minutes > POD_STARTUP_GRACE_MINUTES:
         return True, "NotReady", extra
