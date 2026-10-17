@@ -150,6 +150,81 @@ def test_succeeded_pods_are_never_unhealthy():
     assert _classify_pod(p, NOW)[0] is False
 
 
+def completed_batch_pod(restart_policy="Never"):
+    p = pod(age_minutes=16, containers=[
+        container(ready=False, terminated=("Completed", 0, 0)),
+    ])
+    p.spec = NS(restart_policy=restart_policy, containers=[NS(name="app")], init_containers=[])
+    p.status.init_container_statuses = []
+    return p
+
+
+@pytest.mark.parametrize("restart_policy", ["Never", "OnFailure"])
+def test_batch_completion_before_phase_update_is_healthy(restart_policy):
+    p = completed_batch_pod(restart_policy)
+    unhealthy, status, extra = _classify_pod(p, NOW)
+    assert unhealthy is False
+    assert status == "Completed"
+    assert extra["ready"] is False
+    assert extra["current_termination_records"][0]["exit_code"] == 0
+
+
+def test_batch_completion_with_successful_init_is_healthy():
+    p = completed_batch_pod()
+    p.spec.init_containers = [NS(name="init")]
+    init = container(ready=False, terminated=("Completed", 0, 15))
+    init.name = "init"
+    p.status.init_container_statuses = [init]
+    assert _classify_pod(p, NOW)[:2] == (False, "Completed")
+
+
+@pytest.mark.parametrize("peer_state", ["running", "waiting", "failed", "missing"])
+def test_completed_container_does_not_hide_unfinished_or_failed_peer(peer_state):
+    p = completed_batch_pod()
+    p.spec.containers.append(NS(name="peer"))
+    if peer_state != "missing":
+        peer = container(ready=False)
+        peer.name = "peer"
+        if peer_state == "running":
+            peer.state.running = NS(started_at=NOW - timedelta(minutes=16))
+        elif peer_state == "waiting":
+            peer.state.waiting = NS(reason="CrashLoopBackOff")
+        else:
+            peer = container(ready=False, terminated=("Error", 1, 1))
+            peer.name = "peer"
+        p.status.container_statuses.append(peer)
+    assert _classify_pod(p, NOW)[0] is True
+
+
+@pytest.mark.parametrize("init_state", ["running", "waiting", "failed", "missing"])
+def test_completed_container_does_not_hide_unfinished_or_failed_init(init_state):
+    p = completed_batch_pod()
+    p.spec.init_containers = [NS(name="init")]
+    if init_state != "missing":
+        init = container(ready=False)
+        init.name = "init"
+        if init_state == "running":
+            init.state.running = NS(started_at=NOW - timedelta(minutes=16))
+        elif init_state == "waiting":
+            init.state.waiting = NS(reason="CrashLoopBackOff")
+        else:
+            init = container(ready=False, terminated=("Error", 1, 1))
+            init.name = "init"
+        p.status.init_container_statuses = [init]
+    assert _classify_pod(p, NOW)[0] is True
+
+
+def test_clean_exit_for_always_restart_policy_is_still_not_ready():
+    assert _classify_pod(completed_batch_pod("Always"), NOW)[:2] == (True, "NotReady")
+
+
+@pytest.mark.parametrize("termination", [("Error", 1, 0), ("OOMKilled", 0, 0), ("Completed", 1, 0)])
+def test_batch_failure_is_not_completion(termination):
+    p = completed_batch_pod()
+    p.status.container_statuses = [container(ready=False, terminated=termination)]
+    assert _classify_pod(p, NOW)[0] is True
+
+
 def test_recently_failed_pod_is_unhealthy_but_an_old_one_is_not():
     recent = pod(phase="Failed", containers=[container(ready=False, last_terminated=("Error", 1, 5))])
     old = pod(phase="Failed", containers=[
