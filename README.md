@@ -7,7 +7,7 @@ An autonomous Kubernetes SRE agent. It monitors cluster health, diagnoses issues
 - **Autonomous Health Audits**: pods, scaling, resources, logs, security, reliability, config hygiene, and batch jobs analyzed in parallel by specialized subagents
 - **Human-in-the-Loop (HITL)**: every write operation (restart, scale, patch, delete) pauses for explicit approval. Approving or rejecting in Slack confirms the decision inline (who decided, and the outcome) and removes the buttons, so an action can't be double-triggered
 - **Slack Integration**: alerts, health reports, and HITL approve/reject buttons via Socket Mode (no public ingress needed). Mention the bot in a channel and it replies in-thread
-- **Fast Interactive Health Checks**: a health-check mention uses direct cluster reads and one structured model call. It shares the scheduler's bounded path and avoids the orchestrator's recursion limit
+- **Fast Interactive Health Checks**: a top-level health-check mention uses direct cluster reads and one structured model call. Thread replies use the conversation agent with preceding thread context
 - **Custom Resource Support**: the change-executor can create, update, and delete CRD instances, so it can remove an operator's top-level custom resource (e.g. an `lgps.apps.langchain.ai`) instead of fighting the operator's reconciliation loop
 - **Anthropic and OpenAI Support**: select the provider with `LLM_PROVIDER`; each provider supports independent main and lower-cost worker model overrides
 - **Model Gateway Support**: route provider calls through a compatible gateway with `ANTHROPIC_BASE_URL` or `OPENAI_BASE_URL`; unset, calls go directly to the selected provider
@@ -444,6 +444,13 @@ read RBAC already grants `list` and `watch` for pods and events. Set
 `MONITORING_ENABLED=false` to stop both.
 
 ## Integration Status and Delivery
+
+Slack follow-ups include the parent report and preceding replies, including
+Block Kit and attachment text. The bot needs the history scope for each
+conversation type it reads: `channels:history`, `groups:history`, `im:history`,
+or `mpim:history`. Invite the bot to the channel and reinstall the Slack app
+after adding scopes. Thread retrieval is bounded; incomplete history is marked,
+and retrieval failures ask the user to retry or restate the resource.
 
 Slack Socket Mode receipt and outbound posting report separate health. A
 Socket Mode disconnect does not imply posting failed. `/health` keeps the
