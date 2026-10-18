@@ -463,3 +463,114 @@ def test_multiline_private_key_is_redacted_before_log_line_trimming():
     result = collect(client)
     assert "sensitive" not in result and "REDACTED PRIVATE KEY" in result
     assert "after" in result
+
+
+@pytest.mark.parametrize("error", [
+    ApiException(status=400, reason="private body"),
+    ApiException(status=404, reason="private body"),
+    ApiException(status=429, reason="private body"),
+    ApiException(status=503, reason="private body"),
+    ApiException(status=0, reason="private body"),
+    TimeoutError("private body"),
+])
+def test_transient_log_failure_recovers_without_leaking_errors(monkeypatch, error):
+    monkeypatch.setattr("crash_watcher.time.sleep", lambda _: None)
+    client = evidence_client()
+    client.read_namespaced_pod_log.side_effect = [error, "recovered traceback"]
+    result = collect(client)
+    assert "recovered traceback" in result and "unavailable" not in result
+    assert "private body" not in result
+    assert client.read_namespaced_pod.call_count == 2
+    assert client.read_namespaced_pod_log.call_count == 2
+    client.api_client.close.assert_called_once()
+
+
+@pytest.mark.parametrize("init", [False, True])
+def test_retry_refreshes_container_state_after_restart(monkeypatch, init):
+    monkeypatch.setattr("crash_watcher.time.sleep", lambda _: None)
+    current = container(reason="Error")
+    restarted = container(reason="Error", last=True, waiting="CrashLoopBackOff")
+    snapshots = [pod(init=[cs]) if init else pod(main=[cs]) for cs in (current, restarted)]
+    client = evidence_client()
+    client.read_namespaced_pod.side_effect = snapshots
+    client.read_namespaced_pod_log.side_effect = [ApiException(status=400), "crash traceback"]
+    result = collect(client, observed_pod=snapshots[0])
+    assert [call.kwargs["previous"] for call in client.read_namespaced_pod_log.call_args_list] == [False, True]
+    assert "Recent Logs (Previous Container)" in result
+
+
+def test_retry_never_reads_logs_from_replacement_pod(monkeypatch):
+    monkeypatch.setattr("crash_watcher.time.sleep", lambda _: None)
+    client = evidence_client()
+    client.read_namespaced_pod.side_effect = [pod(main=[container(reason="Error")]), pod(uid="replacement")]
+    client.read_namespaced_pod_log.side_effect = ApiException(status=400)
+    result = collect(client)
+    client.read_namespaced_pod_log.assert_called_once()
+    assert "pod was replaced" in result
+
+
+@pytest.mark.parametrize("status,reason", [(401, "authentication failed"), (403, "access denied")])
+def test_log_permission_errors_are_reported_without_retry(status, reason, caplog):
+    client = evidence_client()
+    client.read_namespaced_pod_log.side_effect = ApiException(status=status, reason="private body")
+    result = collect(client)
+    client.read_namespaced_pod_log.assert_called_once()
+    assert f"log read: {reason} (HTTP {status}) (1 attempt)" in result
+    assert reason in caplog.text and "private body" not in caplog.text
+    assert "private body" not in result
+
+
+@pytest.mark.parametrize("logs", ["", " \n\t"])
+def test_empty_logs_retry_then_report_no_output(monkeypatch, logs):
+    monkeypatch.setattr("crash_watcher.time.sleep", lambda _: None)
+    client = evidence_client(logs=logs)
+    result = collect(client)
+    assert client.read_namespaced_pod_log.call_count == 3
+    assert "log read returned no output (3 attempts)" in result
+    client.list_namespaced_event.assert_called_once()
+
+
+def test_empty_logs_can_become_available_on_retry(monkeypatch):
+    monkeypatch.setattr("crash_watcher.time.sleep", lambda _: None)
+    client = evidence_client()
+    client.read_namespaced_pod_log.side_effect = ["", "late traceback"]
+    assert "late traceback" in collect(client)
+    assert client.read_namespaced_pod_log.call_count == 2
+
+
+def test_transient_pod_lookup_failure_retries_before_reading_logs(monkeypatch):
+    monkeypatch.setattr("crash_watcher.time.sleep", lambda _: None)
+    client = evidence_client()
+    snapshot = client.read_namespaced_pod.return_value
+    client.read_namespaced_pod.side_effect = [TimeoutError("private body"), snapshot]
+    assert "failure line" in collect(client)
+    assert client.read_namespaced_pod.call_count == 2
+    client.read_namespaced_pod_log.assert_called_once()
+
+
+def test_retry_exhaustion_reports_safe_final_reason(monkeypatch, caplog):
+    monkeypatch.setattr("crash_watcher.time.sleep", lambda _: None)
+    client = evidence_client()
+    client.read_namespaced_pod_log.side_effect = ApiException(status=503, reason="private body")
+    result = collect(client)
+    assert client.read_namespaced_pod_log.call_count == 3
+    assert "log read: API request failed (HTTP 503) (3 attempts)" in result
+    assert "private body" not in result + caplog.text
+
+
+def test_retry_stops_when_shared_evidence_budget_expires(monkeypatch):
+    tick = [0.0]
+    monkeypatch.setattr("crash_watcher.time.monotonic", lambda: tick[0])
+    monkeypatch.setattr("crash_watcher.time.sleep", lambda _: pytest.fail("must not sleep past budget"))
+    client = evidence_client()
+
+    def failed_log_read(*args, **kwargs):
+        tick[0] = 4.0
+        raise TimeoutError("private body")
+
+    client.read_namespaced_pod_log.side_effect = failed_log_read
+    result = collect(client)
+    client.read_namespaced_pod.assert_called_once()
+    client.read_namespaced_pod_log.assert_called_once()
+    client.list_namespaced_event.assert_not_called()
+    assert "evidence time budget exhausted" in result
