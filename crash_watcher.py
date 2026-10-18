@@ -10,6 +10,7 @@ import time
 
 from kubernetes import watch
 from kubernetes.client.exceptions import ApiException
+from urllib3.exceptions import HTTPError
 from slack_health import safe_error_type
 from tools.k8s_client import core_v1
 
@@ -87,6 +88,29 @@ def _event_stamp(event):
     return max((stamp for stamp in stamps if stamp is not None), default=None)
 
 
+class _EvidenceBudgetExpired(TimeoutError):
+    pass
+
+
+def _log_read_failure(error, stage):
+    """Return a safe reason and retry policy without exposing API bodies."""
+    if isinstance(error, _EvidenceBudgetExpired):
+        return "evidence time budget exhausted", False
+    if isinstance(error, ApiException):
+        status = error.status
+        reasons = {401: "authentication failed", 403: "access denied",
+                   404: "not found", 400: "container logs not ready",
+                   429: "rate limited"}
+        detail = reasons.get(status, "API request failed")
+        if status == 400 and stage != "log read":
+            detail = "invalid request"
+        reason = f"{stage}: {detail} (HTTP {status})" if status else f"{stage}: connection failed"
+        retry = (status in (0, 429) or (isinstance(status, int) and 500 <= status <= 599)
+                 or (stage == "log read" and status in (400, 404)))
+        return reason, retry
+    return f"{stage}: {safe_error_type(error)}", isinstance(error, (OSError, HTTPError))
+
+
 def collect_crash_evidence(client_factory, *, uid, namespace, pod_name, container,
                            now, observed_pod=None, observed_event=None):
     """Read a bounded snapshot. Missing evidence never blocks the crash alert."""
@@ -95,31 +119,48 @@ def collect_crash_evidence(client_factory, *, uid, namespace, pod_name, containe
     def request_timeout():
         remaining = deadline - time.monotonic()
         if remaining <= 0.1:
-            raise TimeoutError("Evidence budget exhausted")
+            raise _EvidenceBudgetExpired("Evidence budget exhausted")
         bound = min(1, remaining / 2)
         return (bound, bound)
 
     client = None
     pod = None
     logs = None
+    failure = "collection failed"
+    attempts = 0
     events_available = False
     events = [observed_event] if observed_event is not None else []
     try:
         client = client_factory()
-        try:
-            candidate = client.read_namespaced_pod(pod_name, namespace, _request_timeout=request_timeout())
-            if candidate.metadata.uid == uid:
-                pod = candidate
-        except Exception:
-            pass
-        if pod is not None:
-            _, previous = _termination(pod, container)
+        for attempt in range(3):
+            stage = "pod lookup"
             try:
+                # Revalidate identity and container state after every transient failure.
+                timeout = request_timeout()
+                attempts += 1
+                candidate = client.read_namespaced_pod(pod_name, namespace, _request_timeout=timeout)
+                if candidate.metadata.uid != uid:
+                    failure = "pod was replaced; original container logs were not requested"
+                    break
+                pod = candidate
+                _, previous = _termination(pod, container)
+                stage = "log read"
                 logs = client.read_namespaced_pod_log(
                     pod_name, namespace, container=container, previous=previous,
                     tail_lines=6, limit_bytes=1400, _request_timeout=request_timeout())
-            except Exception:
-                pass
+                if isinstance(logs, str) and logs.strip():
+                    break
+                failure, retry = "log read returned no output", True
+            except Exception as error:
+                failure, retry = _log_read_failure(error, stage)
+            if not retry or attempt == 2:
+                break
+            # Leave the existing shared deadline in charge of all API reads.
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.2:
+                failure += "; evidence time budget exhausted"
+                break
+            time.sleep(min(0.1 * (attempt + 1), remaining - 0.1))
         try:
             page = client.list_namespaced_event(
                 namespace, field_selector=f"involvedObject.uid={uid},type=Warning",
@@ -128,8 +169,8 @@ def collect_crash_evidence(client_factory, *, uid, namespace, pod_name, containe
             events_available = True
         except Exception:
             pass
-    except Exception:
-        pass
+    except Exception as error:
+        failure, _ = _log_read_failure(error, "client setup")
     finally:
         if client is not None:
             try:
@@ -147,7 +188,10 @@ def collect_crash_evidence(client_factory, *, uid, namespace, pod_name, containe
         source = "Previous Container" if previous else "Current Container"
         parts.append(f"Recent Logs ({source}):\n```\n{excerpt}\n```")
     else:
-        parts.append("Recent Logs: unavailable.")
+        count = "attempt" if attempts == 1 else "attempts"
+        parts.append(f"Recent Logs: unavailable. {failure} ({attempts} {count}).")
+        log.warning("Crash log collection failed (namespace=%s, pod=%s, container=%s, attempts=%s): %s",
+                    namespace, pod_name, container, attempts, failure)
     recent = [e for e in events if e.involved_object.uid == uid and e.type == "Warning"
               and _recent(_event_stamp(e), now)]
     recent.sort(key=_event_stamp, reverse=True)
@@ -207,7 +251,7 @@ class CrashWatcher:
                         uid=uid, namespace=namespace, pod_name=pod_name, container=container,
                         now=self.clock(), observed_pod=observed_pod, observed_event=observed_event)
                 except Exception:
-                    evidence = "Recent Logs: unavailable."
+                    evidence = "Recent Logs: unavailable. Evidence collection failed."
                 if evidence:
                     message += "\n" + str(evidence)
                 payload = {"type": "crash_alert", "severity": "critical",
