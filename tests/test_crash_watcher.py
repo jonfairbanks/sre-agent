@@ -293,7 +293,8 @@ def collect(client, **kwargs):
 
 @pytest.mark.parametrize("init", [False, True])
 @pytest.mark.parametrize("last", [False, True])
-def test_evidence_reads_exact_main_or_init_container_logs(init, last):
+def test_evidence_reads_exact_main_or_init_container_logs(init, last, monkeypatch):
+    monkeypatch.setattr("crash_watcher.time.monotonic", lambda: 0)
     cs = container(name="init-worker" if init else "app", reason="Error", last=last)
     cs.restart_count = 0 if not last else 2
     snapshot = pod(init=[cs]) if init else pod(main=[cs])
