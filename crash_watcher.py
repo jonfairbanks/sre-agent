@@ -8,11 +8,11 @@ import re
 import threading
 import time
 
-from kubernetes import watch
+from kubernetes import client as k8s_client, watch
 from kubernetes.client.exceptions import ApiException
 from urllib3.exceptions import HTTPError
 from slack_health import safe_error_type
-from tools.k8s_client import core_v1
+from tools.k8s_client import core_v1, init_client
 
 log = logging.getLogger("sre-agent.crash-watcher")
 _CRASH_REASONS = {"Error", "OOMKilled", "ContainerCannotRun"}
@@ -111,102 +111,203 @@ def _log_read_failure(error, stage):
     return f"{stage}: {safe_error_type(error)}", isinstance(error, (OSError, HTTPError))
 
 
-def collect_crash_evidence(client_factory, *, uid, namespace, pod_name, container,
-                           now, observed_pod=None, observed_event=None):
-    """Read a bounded snapshot. Missing evidence never blocks the crash alert."""
-    deadline = time.monotonic() + 4
+class CrashEvidence(str):
+    """Rendered evidence plus safe, serializable collection state."""
 
-    def request_timeout():
+    def __new__(cls, value, *, logs_available, events_available, retryable, sections):
+        result = super().__new__(cls, value)
+        result.logs_available = logs_available
+        result.events_available = events_available
+        result.retryable = retryable
+        result.sections = sections
+        return result
+
+
+def evidence_core_v1():
+    """Keep transport retries out of the collector's explicit retry budget."""
+    init_client()
+    configuration = k8s_client.Configuration.get_default_copy()
+    configuration.retries = 0
+    return k8s_client.CoreV1Api(k8s_client.ApiClient(configuration=configuration))
+
+
+def _finished_at(term):
+    return term.finished_at.isoformat() if term and term.finished_at else None
+
+
+def _same_finished_at(actual, expected):
+    if not actual:
+        return False
+    try:
+        return datetime.fromisoformat(actual.replace("Z", "+00:00")) == datetime.fromisoformat(
+            expected.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return False
+
+
+def collect_crash_evidence(client_factory, *, uid, namespace, pod_name, container,
+                           now, observed_pod=None, observed_event=None,
+                           expected_finished_at=None):
+    """Capture independent event and log snapshots without mixing crashes."""
+    def request_timeout(deadline, maximum=2):
         remaining = deadline - time.monotonic()
         if remaining <= 0.1:
             raise _EvidenceBudgetExpired("Evidence budget exhausted")
-        bound = min(1, remaining / 2)
+        bound = min(maximum, remaining / 2)
         return (bound, bound)
 
+    original_term, _ = _termination(observed_pod, container)
+    expected_finished_at = expected_finished_at or _finished_at(original_term)
     client = None
     pod = None
     logs = None
+    previous = True
     failure = "collection failed"
     attempts = 0
+    log_retryable = False
+    events_retryable = False
     events_available = False
+    event_failure = "snapshot incomplete"
     events = [observed_event] if observed_event is not None else []
     try:
         client = client_factory()
+        # Capture events first under their own deadline. Kubelet log failures
+        # must not consume the API server's event collection opportunity.
+        event_deadline = time.monotonic() + 2
+        continuation = None
+        try:
+            for _ in range(5):
+                kwargs = {"_continue": continuation} if continuation else {}
+                page = client.list_namespaced_event(
+                    namespace, field_selector=f"involvedObject.uid={uid},type=Warning",
+                    limit=100, _request_timeout=request_timeout(event_deadline, 1), **kwargs)
+                events.extend(page.items)
+                continuation = getattr(getattr(page, "metadata", None), "_continue", None)
+                if not continuation:
+                    events_available = True
+                    break
+            events_retryable = not events_available
+        except Exception as error:
+            event_failure, events_retryable = _log_read_failure(error, "event lookup")
+            events_retryable = events_retryable or isinstance(error, _EvidenceBudgetExpired)
+
+        deadline = time.monotonic() + 10
         for attempt in range(3):
             stage = "pod lookup"
             try:
-                # Revalidate identity and container state after every transient failure.
-                timeout = request_timeout()
+                timeout = request_timeout(deadline)
                 attempts += 1
                 candidate = client.read_namespaced_pod(pod_name, namespace, _request_timeout=timeout)
                 if candidate.metadata.uid != uid:
                     failure = "pod was replaced; original container logs were not requested"
+                    log_retryable = False
                     break
                 pod = candidate
-                _, previous = _termination(pod, container)
-                stage = "log read"
-                logs = client.read_namespaced_pod_log(
-                    pod_name, namespace, container=container, previous=previous,
-                    tail_lines=6, limit_bytes=1400, _request_timeout=request_timeout())
-                if isinstance(logs, str) and logs.strip():
+                term, previous = _termination(pod, container)
+                finished_at = _finished_at(term)
+                if expected_finished_at and not _same_finished_at(finished_at, expected_finished_at):
+                    failure = "original termination is no longer available; later container logs were not requested"
+                    log_retryable = False
                     break
-                failure, retry = "log read returned no output", True
+                if not expected_finished_at and term and term.finished_at and term.finished_at > now:
+                    failure = "a later termination was observed; original container logs were not requested"
+                    log_retryable = False
+                    break
+                expected_finished_at = expected_finished_at or finished_at
+                stage = "log read"
+                captured_logs = client.read_namespaced_pod_log(
+                    pod_name, namespace, container=container, previous=previous,
+                    tail_lines=40, limit_bytes=16384, timestamps=True,
+                    _request_timeout=request_timeout(deadline))
+                if isinstance(captured_logs, str) and captured_logs.strip():
+                    # The container can restart while the log request is in
+                    # flight. Revalidate the selected incarnation before
+                    # accepting its output, including current/previous changes.
+                    stage = "pod validation"
+                    validated = client.read_namespaced_pod(
+                        pod_name, namespace, _request_timeout=request_timeout(deadline))
+                    if validated.metadata.uid != uid:
+                        failure = "pod was replaced; captured logs were discarded"
+                        log_retryable = False
+                        break
+                    validated_term, validated_previous = _termination(validated, container)
+                    if (validated_previous != previous
+                            or _finished_at(validated_term) != finished_at):
+                        failure, log_retryable = "container restarted during log read; captured logs were discarded", True
+                    else:
+                        logs = captured_logs
+                        log_retryable = False
+                        break
+                else:
+                    failure, log_retryable = "log read returned no output", True
             except Exception as error:
-                failure, retry = _log_read_failure(error, stage)
-            if not retry or attempt == 2:
+                failure, log_retryable = _log_read_failure(error, stage)
+                log_retryable = log_retryable or isinstance(error, _EvidenceBudgetExpired)
+            if not log_retryable or attempt == 2:
                 break
-            # Leave the existing shared deadline in charge of all API reads.
             remaining = deadline - time.monotonic()
             if remaining <= 0.2:
                 failure += "; evidence time budget exhausted"
                 break
             time.sleep(min(0.1 * (attempt + 1), remaining - 0.1))
-        try:
-            page = client.list_namespaced_event(
-                namespace, field_selector=f"involvedObject.uid={uid},type=Warning",
-                limit=10, _request_timeout=request_timeout())
-            events.extend(page.items)
-            events_available = True
-        except Exception:
-            pass
     except Exception as error:
-        failure, _ = _log_read_failure(error, "client setup")
+        failure, log_retryable = _log_read_failure(error, "client setup")
+        events_retryable = log_retryable
     finally:
         if client is not None:
             try:
                 client.api_client.close()
             except Exception:
                 pass
-    term, _ = _termination(observed_pod or pod, container)
-    parts = []
+
+    sections = {}
+    term = original_term or _termination(pod, container)[0]
+    if (not original_term and term
+            and ((expected_finished_at and not _same_finished_at(_finished_at(term), expected_finished_at))
+                 or (term.finished_at and term.finished_at > now))):
+        term = None
     if term:
-        parts.append(f"Termination: {safe_evidence(term.reason or 'Error', 80)} (exit {term.exit_code}).")
-    if isinstance(logs, str) and logs.strip():
-        # Redact before trimming lines so a long PEM block keeps its header
-        # while the redactor removes the entire secret.
-        excerpt = "\n".join(safe_evidence(logs, limit=None).splitlines()[-6:])[:1400]
+        detail = f"Termination: {safe_evidence(term.reason or 'Error', 80)} (exit {term.exit_code})."
+        if term.signal:
+            detail += f" Signal: {term.signal}."
+        if term.finished_at:
+            detail += f" Finished: {term.finished_at.isoformat()}."
+        if term.message:
+            detail += " " + safe_evidence(term.message, 250)
+        sections["termination"] = detail[:450]
+    logs_available = isinstance(logs, str) and bool(logs.strip())
+    if logs_available:
+        # Redact the complete response before trimming, preserving PEM headers
+        # for redaction and the final fatal line for diagnosis.
+        excerpt = "\n".join(safe_evidence(logs, limit=None).splitlines()[-6:])[-1050:]
         source = "Previous Container" if previous else "Current Container"
-        parts.append(f"Recent Logs ({source}):\n```\n{excerpt}\n```")
+        sections["logs"] = f"Recent Logs ({source}):\n```\n{excerpt}\n```"
     else:
         count = "attempt" if attempts == 1 else "attempts"
-        parts.append(f"Recent Logs: unavailable. {failure} ({attempts} {count}).")
+        sections["logs"] = f"Recent Logs: unavailable. {failure} ({attempts} {count})."
         log.warning("Crash log collection failed (namespace=%s, pod=%s, container=%s, attempts=%s): %s",
                     namespace, pod_name, container, attempts, failure)
     recent = [e for e in events if e.involved_object.uid == uid and e.type == "Warning"
               and _recent(_event_stamp(e), now)]
     recent.sort(key=_event_stamp, reverse=True)
     unique = []
-    for e in recent:
-        line = safe_evidence(f"{e.reason}: {e.message}", 200)
+    for event in recent:
+        line = safe_evidence(f"{event.reason}: {event.message}", 160)
         if line not in unique:
             unique.append(line)
         if len(unique) == 3:
             break
     if unique:
-        parts.append("Recent Warning Events:\n" + "\n".join(unique))
-    elif not events_available:
-        parts.append("Recent Warning Events: unavailable.")
-    return "\n".join(parts)[:2200]
+        sections["events"] = "Recent Warning Events:\n" + "\n".join(unique)
+    elif events_available:
+        sections["events"] = "Recent Warning Events: none in crash window."
+    else:
+        sections["events"] = f"Recent Warning Events: unavailable. {event_failure}."
+    result = CrashEvidence("\n".join(sections.values())[:2200],
+                           logs_available=logs_available, events_available=events_available,
+                           retryable=log_retryable or events_retryable, sections=sections)
+    result.expected_finished_at = expected_finished_at
+    return result
 
 
 class CrashWatcher:
@@ -222,7 +323,8 @@ class CrashWatcher:
         self._pending = {}
         self._evidence_payloads = {}
         self.evidence_collector = evidence_collector or (
-            lambda **kwargs: collect_crash_evidence(self.client_factory, **kwargs))
+            lambda **kwargs: collect_crash_evidence(
+                evidence_core_v1 if self.client_factory is core_v1 else self.client_factory, **kwargs))
         self._connected = {"pods": False, "events": False}
 
     def status(self):
@@ -246,17 +348,35 @@ class CrashWatcher:
                 message = (f"Pod `{safe_evidence(pod_name, 150)}`, container `{safe_evidence(container, 150)}`: "
                            f"`{safe_evidence(reason, 80)}`."
                            + (f" Restarts: {restarts}." if restarts is not None else ""))
+                summary = message
+                captured_at = self.clock()
                 try:
                     evidence = self.evidence_collector(
                         uid=uid, namespace=namespace, pod_name=pod_name, container=container,
-                        now=self.clock(), observed_pod=observed_pod, observed_event=observed_event)
+                        now=captured_at, observed_pod=observed_pod, observed_event=observed_event)
                 except Exception:
-                    evidence = "Recent Logs: unavailable. Evidence collection failed."
+                    sections = {
+                        "logs": "Recent Logs: unavailable. Evidence collection failed.",
+                        "events": "Recent Warning Events: unavailable.",
+                    }
+                    evidence = CrashEvidence("\n".join(sections.values()), logs_available=False,
+                                             events_available=False, retryable=True, sections=sections)
                 if evidence:
                     message += "\n" + str(evidence)
                 payload = {"type": "crash_alert", "severity": "critical",
                            "title": "Pod Crash Detected", "namespace": namespace,
                            "message": message[:2499]}
+                if isinstance(evidence, CrashEvidence) and evidence.retryable:
+                    term, _ = _termination(observed_pod, container)
+                    payload["crash_evidence"] = {
+                        "uid": uid, "namespace": namespace, "pod_name": pod_name,
+                        "container": container, "now": captured_at.isoformat(),
+                        "expected_finished_at": _finished_at(term) or getattr(evidence, "expected_finished_at", None),
+                        "sections": evidence.sections,
+                        "logs_available": evidence.logs_available,
+                        "events_available": evidence.events_available,
+                        "summary": summary, "capture_count": 0,
+                    }
                 # Cache only after durable enqueue succeeds below, so a failed
                 # enqueue remains retryable without marking the alert delivered.
             if self.db.available:

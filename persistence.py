@@ -224,6 +224,12 @@ class NullDatabase:
     def enqueue_crash_alert(self, key: str, payload: dict) -> bool:
         return False
 
+    def defer_crash_evidence(self, notification_id, payload, now, delay, *, attempts):
+        return False
+
+    def save_crash_evidence_payload(self, notification_id, payload, *, attempts):
+        return False
+
     def claim_pending_notifications(self, now, limit=10):
         return []
 
@@ -703,6 +709,31 @@ class PostgresDatabase:
                  Jsonb({**payload, "type": "crash_alert"}), now, now),
             )
         return True
+
+    def defer_crash_evidence(self, notification_id, payload, now, delay, *, attempts):
+        """Persist capture progress and the posted Slack identity under the lease."""
+        from psycopg.types.json import Jsonb
+
+        with self._pool.connection() as conn:
+            row = conn.execute(
+                """UPDATE notification_outbox SET payload=%s, status='pending',
+                   next_attempt_at=%s, lease_until=NULL, last_error_type='EvidencePending'
+                   WHERE id=%s AND status='sending' AND attempts=%s RETURNING id""",
+                (Jsonb(payload), now + timedelta(seconds=delay), notification_id, attempts),
+            ).fetchone()
+        return row is not None
+
+    def save_crash_evidence_payload(self, notification_id, payload, *, attempts):
+        """Keep recovered context even when its Slack update needs another try."""
+        from psycopg.types.json import Jsonb
+
+        with self._pool.connection() as conn:
+            row = conn.execute(
+                """UPDATE notification_outbox SET payload=%s
+                   WHERE id=%s AND status='sending' AND attempts=%s RETURNING id""",
+                (Jsonb(payload), notification_id, attempts),
+            ).fetchone()
+        return row is not None
 
     def claim_pending_notifications(self, now, limit=10):
         """Lease due work atomically; expired leases can be retried after a restart."""

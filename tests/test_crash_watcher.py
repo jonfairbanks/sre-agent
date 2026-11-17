@@ -8,7 +8,8 @@ import pytest
 from kubernetes import client as k
 from kubernetes.client.exceptions import ApiException
 
-from crash_watcher import CrashWatcher, collect_crash_evidence, pod_crashes, safe_evidence
+from crash_watcher import (CrashEvidence, CrashWatcher, collect_crash_evidence,
+                           evidence_core_v1, pod_crashes, safe_evidence)
 
 NOW = datetime(2026, 10, 13, 12, tzinfo=timezone.utc)
 
@@ -292,7 +293,8 @@ def collect(client, **kwargs):
 
 @pytest.mark.parametrize("init", [False, True])
 @pytest.mark.parametrize("last", [False, True])
-def test_evidence_reads_exact_main_or_init_container_logs(init, last):
+def test_evidence_reads_exact_main_or_init_container_logs(init, last, monkeypatch):
+    monkeypatch.setattr("crash_watcher.time.monotonic", lambda: 0)
     cs = container(name="init-worker" if init else "app", reason="Error", last=last)
     cs.restart_count = 0 if not last else 2
     snapshot = pod(init=[cs]) if init else pod(main=[cs])
@@ -302,12 +304,13 @@ def test_evidence_reads_exact_main_or_init_container_logs(init, last):
     assert "Termination: Error (exit 1)" in result
     assert "\n```\nfailure line\n```" in result
     assert client.read_namespaced_pod_log.call_args.kwargs == {
-        "container": cs.name, "previous": last, "tail_lines": 6,
-        "limit_bytes": 1400, "_request_timeout": (1, 1)}
-    assert client.read_namespaced_pod.call_args.kwargs["_request_timeout"] == (1, 1)
-    assert client.list_namespaced_event.call_args.kwargs == {
-        "field_selector": "involvedObject.uid=pod-uid,type=Warning", "limit": 10,
-        "_request_timeout": (1, 1)}
+        "container": cs.name, "previous": last, "tail_lines": 40,
+        "limit_bytes": 16384, "timestamps": True, "_request_timeout": (2, 2)}
+    assert client.read_namespaced_pod.call_args.kwargs["_request_timeout"] == (2, 2)
+    event_kwargs = dict(client.list_namespaced_event.call_args.kwargs)
+    assert event_kwargs.pop("_request_timeout") == pytest.approx((1, 1))
+    assert event_kwargs == {
+        "field_selector": "involvedObject.uid=pod-uid,type=Warning", "limit": 100}
     client.api_client.close.assert_called_once()
 
 
@@ -315,7 +318,7 @@ def test_log_code_block_cannot_be_closed_by_container_output():
     result = collect(evidence_client(logs="first line\n```<!channel>\nlast line"))
     assert result.count("```") == 2
     assert "&lt;!channel&gt;" in result
-    assert result.endswith("last line\n```")
+    assert "last line\n```" in result
 
 
 def test_logs_use_latest_status_when_observed_termination_has_restarted():
@@ -383,7 +386,7 @@ def test_log_lines_and_message_size_are_bounded():
     instance = watcher(evidence=lambda **kwargs: collect_crash_evidence(lambda: client, **kwargs))
     instance.handle_pod(pod(main=[container(reason="Error")]))
     message = instance.notifier.send_alert.call_args.args[2]
-    assert "line-5" not in message and "line-6" in message and len(message) < 2500
+    assert "line-5" not in message and "line-11" in message and len(message) < 2500
 
 
 @pytest.mark.parametrize("secret", [
@@ -445,15 +448,15 @@ def test_failed_durable_enqueue_does_not_cache_or_drop_alert():
 
 
 def test_evidence_budget_skips_remaining_reads(monkeypatch):
-    ticks = iter([0, 0, 5, 5])
+    ticks = iter([0, 0, 0, 0, 11, 11])
     monkeypatch.setattr("crash_watcher.time.monotonic", lambda: next(ticks))
     client = evidence_client()
     result = collect(client)
     client.read_namespaced_pod.assert_called_once()
     client.read_namespaced_pod_log.assert_not_called()
-    client.list_namespaced_event.assert_not_called()
+    client.list_namespaced_event.assert_called_once()
     assert "Recent Logs: unavailable" in result
-    assert "Recent Warning Events: unavailable" in result
+    assert "Recent Warning Events: none in crash window." in result
 
 
 
@@ -480,7 +483,7 @@ def test_transient_log_failure_recovers_without_leaking_errors(monkeypatch, erro
     result = collect(client)
     assert "recovered traceback" in result and "unavailable" not in result
     assert "private body" not in result
-    assert client.read_namespaced_pod.call_count == 2
+    assert client.read_namespaced_pod.call_count == 3
     assert client.read_namespaced_pod_log.call_count == 2
     client.api_client.close.assert_called_once()
 
@@ -492,7 +495,7 @@ def test_retry_refreshes_container_state_after_restart(monkeypatch, init):
     restarted = container(reason="Error", last=True, waiting="CrashLoopBackOff")
     snapshots = [pod(init=[cs]) if init else pod(main=[cs]) for cs in (current, restarted)]
     client = evidence_client()
-    client.read_namespaced_pod.side_effect = snapshots
+    client.read_namespaced_pod.side_effect = snapshots + [snapshots[-1]]
     client.read_namespaced_pod_log.side_effect = [ApiException(status=400), "crash traceback"]
     result = collect(client, observed_pod=snapshots[0])
     assert [call.kwargs["previous"] for call in client.read_namespaced_pod_log.call_args_list] == [False, True]
@@ -542,9 +545,9 @@ def test_transient_pod_lookup_failure_retries_before_reading_logs(monkeypatch):
     monkeypatch.setattr("crash_watcher.time.sleep", lambda _: None)
     client = evidence_client()
     snapshot = client.read_namespaced_pod.return_value
-    client.read_namespaced_pod.side_effect = [TimeoutError("private body"), snapshot]
+    client.read_namespaced_pod.side_effect = [TimeoutError("private body"), snapshot, snapshot]
     assert "failure line" in collect(client)
-    assert client.read_namespaced_pod.call_count == 2
+    assert client.read_namespaced_pod.call_count == 3
     client.read_namespaced_pod_log.assert_called_once()
 
 
@@ -565,12 +568,237 @@ def test_retry_stops_when_shared_evidence_budget_expires(monkeypatch):
     client = evidence_client()
 
     def failed_log_read(*args, **kwargs):
-        tick[0] = 4.0
+        tick[0] = 10.0
         raise TimeoutError("private body")
 
     client.read_namespaced_pod_log.side_effect = failed_log_read
     result = collect(client)
     client.read_namespaced_pod.assert_called_once()
     client.read_namespaced_pod_log.assert_called_once()
-    client.list_namespaced_event.assert_not_called()
+    client.list_namespaced_event.assert_called_once()
     assert "evidence time budget exhausted" in result
+
+
+
+def test_termination_context_survives_total_api_failure():
+    snapshot = pod(main=[container(reason="Error", exit_code=137)])
+    term = snapshot.status.container_statuses[0].state.terminated
+    term.signal = 9
+    term.message = "fatal configuration failure: password=private-value"
+    client = evidence_client()
+    client.read_namespaced_pod.side_effect = ApiException(status=403)
+    client.list_namespaced_event.side_effect = ApiException(status=403)
+    result = collect(client, observed_pod=snapshot)
+    assert "exit 137" in result and "Signal: 9" in result
+    assert "Finished: " + NOW.isoformat() in result
+    assert "fatal configuration failure" in result and "private-value" not in result
+    assert not result.logs_available and not result.events_available
+    assert not result.retryable
+
+
+def test_independent_event_snapshot_survives_slow_log_failure(monkeypatch):
+    tick = [0.0]
+    monkeypatch.setattr("crash_watcher.time.monotonic", lambda: tick[0])
+    client = evidence_client()
+    client.list_namespaced_event.return_value.items = [event(message="probe failed")]
+
+    def slow_logs(*args, **kwargs):
+        tick[0] += 10
+        raise TimeoutError("private error body")
+
+    client.read_namespaced_pod_log.side_effect = slow_logs
+    result = collect(client)
+    assert "probe failed" in result
+    assert result.events_available and not result.logs_available and result.retryable
+    assert "private error body" not in result
+
+
+def test_later_crash_logs_are_never_substituted():
+    client = evidence_client(pod(main=[container(reason="Error", age_seconds=-10)]))
+    result = collect(client, expected_finished_at=NOW.isoformat())
+    client.read_namespaced_pod_log.assert_not_called()
+    assert "later container logs were not requested" in result
+    assert not result.retryable
+
+
+def test_matching_previous_termination_selects_previous_logs():
+    client = evidence_client(pod(main=[container(reason="Error", last=True, ready=True)]))
+    result = collect(client, expected_finished_at=NOW.isoformat())
+    assert result.logs_available
+    assert client.read_namespaced_pod_log.call_args.kwargs["previous"] is True
+
+
+def test_fatal_last_line_survives_large_log_output():
+    result = collect(evidence_client(logs="preamble\n" + "x" * 15000 + "\nfatal: final error"))
+    assert "fatal: final error\n```" in result
+    assert len(result) <= 2200
+    assert len(result.sections["logs"]) < 1150
+
+
+def test_partial_capture_retains_structured_evidence_and_retry_metadata(monkeypatch):
+    monkeypatch.setattr("crash_watcher.time.sleep", lambda _: None)
+    client = evidence_client()
+    client.read_namespaced_pod_log.side_effect = ApiException(status=503)
+    client.list_namespaced_event.return_value.items = [event(message="initial warning")]
+    instance = watcher(durable=True, evidence=lambda **kwargs: collect_crash_evidence(lambda: client, **kwargs))
+    instance.handle_pod(pod(main=[container(reason="Error")]))
+    payload = instance.db.enqueue_crash_alert.call_args.args[1]
+    metadata = payload["crash_evidence"]
+    assert metadata["uid"] == "pod-uid"
+    assert metadata["expected_finished_at"] == NOW.isoformat()
+    assert metadata["now"] == NOW.isoformat()
+    assert metadata["capture_count"] == 0
+    assert metadata["events_available"] and not metadata["logs_available"]
+    assert "initial warning" in metadata["sections"]["events"]
+    assert metadata["summary"].startswith("Pod `worker-1`")
+
+
+def test_successful_capture_is_a_string_without_retry_metadata():
+    result = collect(evidence_client())
+    assert isinstance(result, str) and isinstance(result, CrashEvidence)
+    assert result.logs_available and result.events_available and not result.retryable
+    assert result.sections["events"] == "Recent Warning Events: none in crash window."
+
+
+def test_event_failure_can_retry_when_logs_have_terminal_permission_failure():
+    client = evidence_client()
+    client.read_namespaced_pod_log.side_effect = ApiException(status=403)
+    client.list_namespaced_event.side_effect = TimeoutError()
+    result = collect(client)
+    assert result.retryable and not result.logs_available and not result.events_available
+
+
+def test_event_pagination_keeps_latest_warning():
+    client = evidence_client()
+    client.list_namespaced_event.side_effect = [
+        NS(items=[event(age_seconds=600)], metadata=NS(_continue="next-page")),
+        NS(items=[event(message="latest warning")], metadata=NS(_continue=None)),
+    ]
+    result = collect(client)
+    assert result.events_available and "latest warning" in result
+    assert client.list_namespaced_event.call_args.kwargs["_continue"] == "next-page"
+
+
+def test_evidence_client_disables_transport_retries_without_changing_defaults(monkeypatch):
+    saved_default = k.Configuration.get_default_copy()
+    original = k.Configuration.get_default_copy()
+    original.retries = 3
+    k.Configuration.set_default(original)
+    monkeypatch.setattr("crash_watcher.init_client", lambda: None)
+    try:
+        client = evidence_core_v1()
+        assert client.api_client.configuration.retries == 0
+        assert client.api_client.rest_client.pool_manager.connection_pool_kw["retries"].total == 0
+        assert k.Configuration.get_default_copy().retries == 3
+        client.api_client.close()
+    finally:
+        k.Configuration.set_default(saved_default)
+
+
+
+def test_slow_transport_uses_one_bounded_attempt(monkeypatch):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import threading
+    import time
+    from urllib3.exceptions import HTTPError
+
+    requests = []
+
+    class SlowAPI(BaseHTTPRequestHandler):
+        def do_GET(self):
+            requests.append(self.path)
+            time.sleep(0.3)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), SlowAPI)
+    worker = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.01), daemon=True)
+    worker.start()
+    saved_default = k.Configuration.get_default_copy()
+    configuration = k.Configuration(host=f"http://127.0.0.1:{server.server_port}")
+    configuration.retries = 3
+    k.Configuration.set_default(configuration)
+    monkeypatch.setattr("crash_watcher.init_client", lambda: None)
+    client = evidence_core_v1()
+    started = time.monotonic()
+    try:
+        with pytest.raises(HTTPError):
+            client.read_namespaced_pod_log("worker", "apps", _request_timeout=(0.05, 0.05))
+        elapsed = time.monotonic() - started
+        assert len(requests) == 1
+        assert elapsed < 0.25
+    finally:
+        client.api_client.close()
+        k.Configuration.set_default(saved_default)
+        server.shutdown()
+        server.server_close()
+        worker.join(timeout=1)
+
+
+
+def test_transient_max_retry_error_recovers_with_explicit_retry(monkeypatch):
+    from urllib3.exceptions import MaxRetryError, ReadTimeoutError
+
+    monkeypatch.setattr("crash_watcher.time.sleep", lambda _: None)
+    client = evidence_client()
+    client.read_namespaced_pod_log.side_effect = [
+        MaxRetryError(None, "/logs", ReadTimeoutError(None, "/logs", "private body")),
+        "recovered fatal context",
+    ]
+    result = collect(client)
+    assert result.logs_available and not result.retryable
+    assert "recovered fatal context" in result and "private body" not in result
+    assert client.read_namespaced_pod_log.call_count == 2
+
+
+def test_expected_timestamp_accepts_equivalent_iso_utc():
+    client = evidence_client()
+    result = collect(client, expected_finished_at=NOW.isoformat().replace("+00:00", "Z"))
+    assert result.logs_available
+
+
+def test_unknown_previous_termination_never_substitutes_current_running_logs():
+    client = evidence_client(pod(main=[container(ready=True)]))
+    result = collect(client, expected_finished_at=NOW.isoformat())
+    client.read_namespaced_pod_log.assert_not_called()
+    assert "original termination is no longer available" in result
+
+
+
+def test_restart_during_log_read_discards_new_current_logs_and_fetches_previous(monkeypatch):
+    monkeypatch.setattr("crash_watcher.time.sleep", lambda _: None)
+    terminated = pod(main=[container(reason="Error")])
+    restarted = pod(main=[container(reason="Error", last=True, ready=True)])
+    client = evidence_client()
+    client.read_namespaced_pod.side_effect = [terminated, restarted, restarted, restarted]
+    client.read_namespaced_pod_log.side_effect = ["new current startup logs", "original fatal error"]
+    result = collect(client, observed_pod=terminated)
+    assert result.logs_available and "original fatal error" in result
+    assert "new current startup logs" not in result
+    assert [call.kwargs["previous"] for call in client.read_namespaced_pod_log.call_args_list] == [False, True]
+
+
+def test_replacement_during_log_read_discards_captured_logs():
+    client = evidence_client()
+    client.read_namespaced_pod.side_effect = [pod(main=[container(reason="Error")]), pod(uid="replacement")]
+    result = collect(client)
+    assert not result.logs_available and not result.retryable
+    assert "failure line" not in result and "captured logs were discarded" in result
+
+
+def test_failed_post_log_validation_never_delivers_unverified_logs(monkeypatch):
+    monkeypatch.setattr("crash_watcher.time.sleep", lambda _: None)
+    client = evidence_client()
+    current = pod(main=[container(reason="Error")])
+    client.read_namespaced_pod.side_effect = [current, TimeoutError()] * 3
+    result = collect(client)
+    assert not result.logs_available and result.retryable
+    assert "failure line" not in result
+
+
+def test_retry_without_original_timestamp_refuses_a_later_crash():
+    client = evidence_client(pod(main=[container(reason="Error", age_seconds=-10)]))
+    result = collect(client)
+    client.read_namespaced_pod_log.assert_not_called()
+    assert "a later termination was observed" in result

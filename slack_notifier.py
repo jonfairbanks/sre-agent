@@ -86,6 +86,8 @@ class SlackNotifier:
         *,
         notification_id: str | None = None,
         raise_on_error: bool = False,
+        message_ts: str | None = None,
+        message_channel: str | None = None,
     ) -> Optional[str]:
         """Send a severity-tagged alert. Returns message ts or None."""
         if not self.enabled:
@@ -114,7 +116,8 @@ class SlackNotifier:
         if context:
             blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": " · ".join(context)}]})
         return self._post(blocks=blocks, color=color, text=f"{emoji} {title}",
-                          notification_id=notification_id, raise_on_error=raise_on_error, top_level=True)
+                          notification_id=notification_id, raise_on_error=raise_on_error,
+                          top_level=True, message_ts=message_ts, message_channel=message_channel)
 
     def send_structured_report(
         self,
@@ -662,6 +665,8 @@ class SlackNotifier:
         notification_id: str | None = None,
         raise_on_error: bool = False,
         top_level: bool = False,
+        message_ts: str | None = None,
+        message_channel: str | None = None,
     ) -> Optional[str]:
         """Post a message and return the ts."""
         post_kwargs = {"channel": self.channel, "text": text,
@@ -669,10 +674,15 @@ class SlackNotifier:
         if top_level:
             post_kwargs.pop("attachments")
             post_kwargs["blocks"] = blocks
-        if notification_id:
+        if notification_id and not message_ts:
             post_kwargs["client_msg_id"] = notification_id
         try:
-            resp = self._client.chat_postMessage(**post_kwargs)
+            if message_ts:
+                post_kwargs["channel"] = message_channel or self._channel_id or self.channel
+                post_kwargs["ts"] = message_ts
+                resp = self._client.chat_update(**post_kwargs)
+            else:
+                resp = self._client.chat_postMessage(**post_kwargs)
             self._channel_id = resp.get("channel") or self._channel_id
             message_ts = resp["ts"]
             self._record_outbound()
