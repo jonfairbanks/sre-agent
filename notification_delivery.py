@@ -11,6 +11,7 @@ import math
 from monitor_state import deserialize_diff
 from schemas import HealthReport
 from slack_health import SlackDeliveryError, safe_error_type
+from crash_evidence_delivery import enrich_crash_payload, evidence_retry_delay
 
 log = logging.getLogger("sre-agent.notifications")
 
@@ -43,12 +44,48 @@ class NotificationDelivery:
                 payload = row["payload"]
                 if isinstance(payload, str):
                     payload = json.loads(payload)
-                if payload.get("type") == "crash_alert":
+                if payload.get("type") == "crash_evidence":
+                    updated, evidence_pending = enrich_crash_payload(payload)
+                    # Save recovered evidence before Slack can fail or the
+                    # container log can rotate away.
+                    if not self.db.save_crash_evidence_payload(
+                        row["id"], updated, attempts=row["attempts"],
+                    ):
+                        break
+                    message_ts = self.notifier.send_alert(
+                        updated["severity"], updated["title"], updated["message"],
+                        namespace=updated.get("namespace", ""),
+                        message_ts=payload["message_ts"], raise_on_error=True,
+                        message_channel=payload.get("message_channel"),
+                    )
+                    if not message_ts:
+                        raise SlackDeliveryError("NoMessageTimestamp")
+                    if evidence_pending:
+                        if not self.db.defer_crash_evidence(
+                            row["id"], updated, self.clock(), evidence_retry_delay(updated),
+                            attempts=row["attempts"],
+                        ):
+                            break
+                        delivered += 1
+                        continue
+                elif payload.get("type") == "crash_alert":
                     message_ts = self.notifier.send_alert(
                         payload["severity"], payload["title"], payload["message"],
                         namespace=payload.get("namespace", ""),
                         notification_id=row["id"], raise_on_error=True,
                     )
+                    if message_ts and payload.get("crash_evidence"):
+                        updated = {**payload, "type": "crash_evidence", "message_ts": message_ts}
+                        channel = getattr(self.notifier, "_channel_id", None)
+                        if isinstance(channel, str) and channel:
+                            updated["message_channel"] = channel
+                        if not self.db.defer_crash_evidence(
+                            row["id"], updated, self.clock(), evidence_retry_delay(updated),
+                            attempts=row["attempts"],
+                        ):
+                            break
+                        delivered += 1
+                        continue
                 else:
                     report = HealthReport.model_validate(payload["report"])
                     diff = deserialize_diff(payload["diff"]) if payload.get("diff") is not None else None

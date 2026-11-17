@@ -67,6 +67,28 @@ def test_failed_outbox_insert_does_not_reserve_identity(db):
     assert db.enqueue_crash_alert("uid/laya", PAYLOAD)
 
 
+def test_evidence_progress_survives_restart_and_rejects_stale_lease(db):
+    assert db.enqueue_crash_alert("uid/main", PAYLOAD)
+    now = datetime.now(timezone.utc)
+    row = db.claim_pending_notifications(now)[0]
+    updated = {**row["payload"], "type": "crash_evidence", "message_ts": "1.2",
+               "crash_evidence": {"sections": {"logs": "captured context"}}}
+    assert not db.defer_crash_evidence(row["id"], updated, now, 15, attempts=row["attempts"] + 1)
+    assert db.defer_crash_evidence(row["id"], updated, now, 15, attempts=row["attempts"])
+    assert db.claim_pending_notifications(now) == []
+    restarted = PostgresDatabase(db._pool)
+    recovered = restarted.claim_pending_notifications(now + timedelta(seconds=16))[0]
+    assert recovered["payload"] == updated
+    assert recovered["attempts"] == row["attempts"] + 1
+    saved = {**updated, "message": "recovered logs"}
+    assert not db.save_crash_evidence_payload(row["id"], saved, attempts=row["attempts"])
+    assert db.save_crash_evidence_payload(row["id"], saved, attempts=recovered["attempts"])
+    with db._pool.connection() as conn:
+        assert conn.execute("SELECT payload FROM notification_outbox WHERE id=%s", (row["id"],)).fetchone()["payload"] == saved
+    assert not db.mark_notification_delivered(row["id"], "1.2", now, attempts=row["attempts"])
+    assert db.mark_notification_delivered(row["id"], "1.2", now, attempts=recovered["attempts"])
+
+
 def test_retention_removes_old_delivered_identity_but_keeps_pending(db):
     assert db.enqueue_crash_alert("old-delivered/laya", PAYLOAD)
     assert db.enqueue_crash_alert("old-pending/laya", PAYLOAD)
